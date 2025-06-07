@@ -6,7 +6,7 @@ from aiopath import AsyncPath
 from typing import Union, Dict, List, Any, Optional
 
 from enums import SekaiServerRegion, SekaiEventStatus, SekaiEventType
-from modules.tracker.schema import WorldBloomChapterStatus, EventStatus
+from modules.schema.data_parser import WorldBloomChapterStatus, EventStatus
 
 
 class EventDataParser:
