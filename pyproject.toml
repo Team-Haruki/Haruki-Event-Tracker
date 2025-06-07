@@ -1,0 +1,14 @@
+[project]
+name = "Haruki-Event-Tracker"
+version = "0.1.0"
+description = "Haruki sekai event tracker and API."
+requires-python = ">=3.12"
+dependencies = [
+    "aiohttp>=3.12.9",
+    "aiomysql>=0.2.0",
+    "pydantic>=2.11.5",
+    "quart>=0.20.0",
+    "redis>=6.2.0",
+    "sqlalchemy>=2.0.41",
+    "uvloop>=0.21.0",
+]
