@@ -19,6 +19,8 @@ class DatabaseEngine:
     async def create_tables(self, table_classes: list[Type[Base]]) -> None:
         async with self._engine.begin() as conn:
             for cls in table_classes:
+                if cls is None:
+                    continue
                 table = cast(Table, cls.__table__)
                 await conn.run_sync(table.create, checkfirst=True)
 

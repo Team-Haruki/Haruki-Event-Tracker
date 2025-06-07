@@ -18,5 +18,5 @@ class EventStatus(BaseModel):
     event_status: SekaiEventStatus
     remain: str
     assetbundle_name: str
-    chapter_statuses: Optional[List[WorldBloomChapterStatus]] = None
+    chapter_statuses: Optional[Dict[int, WorldBloomChapterStatus]] = None
     detail: Dict[str, Any]

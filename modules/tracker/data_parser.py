@@ -83,10 +83,10 @@ class EventDataParser:
     async def load_world_link_chapter_data(self) -> Union[Dict[str, Any], List[Dict[str, Any]]]:
         return await self.load_data(AsyncPath(self.master_dir / "worldBlooms.json"))
 
-    async def get_world_bloom_character_statuses(self, event_id: int) -> List[WorldBloomChapterStatus]:
+    async def get_world_bloom_character_statuses(self, event_id: int) -> Dict[int, WorldBloomChapterStatus]:
         data = await self.load_world_link_chapter_data()
         now = int(round(time.time() * 1000))
-        result = []
+        result = {}
         for chapter in data:
             character_id = chapter["characterId"]
             if chapter["eventId"] == event_id:
@@ -98,10 +98,8 @@ class EventDataParser:
                     chapter_status = SekaiEventStatus.ONGOING
                 else:
                     chapter_status = SekaiEventStatus.NOT_STARTED
-                result.append(
-                    WorldBloomChapterStatus(
-                        server=self.server, event_id=event_id, character_id=character_id, chapter_status=chapter_status
-                    )
+                result[character_id] = WorldBloomChapterStatus(
+                    server=self.server, event_id=event_id, character_id=character_id, chapter_status=chapter_status
                 )
         return result
 
