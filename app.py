@@ -95,9 +95,7 @@ async def get_normal_ranking_by_rank(server: str, event_id: int, rank: int) -> R
     summary="获取指定玩家指定World Link活动指定角色单榜最新排名数据",
     description="返回指定玩家在指定World Link活动指定角色单榜中的最新一条排名记录及玩家信息",
 )
-async def get_world_bloom_ranking_by_user_id(
-    server: str, event_id: int, character_id: int, user_id: str
-) -> Response:
+async def get_world_bloom_ranking_by_user_id(server: str, event_id: int, character_id: int, user_id: str) -> Response:
     engine, table_cls = await get_db_context(server, event_id, get_world_bloom_table_class)
     return await query_rank_data(
         engine,
@@ -118,9 +116,7 @@ async def get_world_bloom_ranking_by_user_id(
     summary="获取指定排名指定World Link活动指定角色单榜最新排名数据",
     description="返回指定排名在指定World Link活动指定角色单榜中的最新一条排名记录及玩家信息",
 )
-async def get_world_bloom_ranking_by_rank(
-    server: str, event_id: int, character_id: int, rank: int
-) -> Response:
+async def get_world_bloom_ranking_by_rank(server: str, event_id: int, character_id: int, rank: int) -> Response:
     engine, table_cls = await get_db_context(server, event_id, get_world_bloom_table_class)
     return await query_rank_data(
         engine,
@@ -206,9 +202,7 @@ async def get_all_world_bloom_ranking_by_user_id(
     summary="获取指定排名指定World Link活动指定角色单榜的所有已记录的排名数据",
     description="返回指定排名在指定World Link活动指定角色单榜中的所有已记录的排名数据（时间升序）",
 )
-async def get_all_world_bloom_ranking_by_rank(
-    server: str, event_id: int, character_id: int, rank: int
-) -> Response:
+async def get_all_world_bloom_ranking_by_rank(server: str, event_id: int, character_id: int, rank: int) -> Response:
     engine, table_cls = await get_db_context(server, event_id, get_world_bloom_table_class)
     return await query_rank_data(
         engine,

@@ -170,17 +170,13 @@ class EventTracker:
             if session.bind.dialect.name == "mysql":
                 stmt = mysql_insert(self.event_names_table).values(name_rows)
                 stmt = stmt.on_duplicate_key_update(
-                    name=stmt.inserted.name,
-                    cheerful_team_id=stmt.inserted.cheerful_team_id
+                    name=stmt.inserted.name, cheerful_team_id=stmt.inserted.cheerful_team_id
                 )
             elif session.bind.dialect.name == "sqlite":
                 stmt = sqlite_insert(self.event_names_table).values(name_rows)
                 stmt = stmt.on_conflict_do_update(
                     index_elements=["user_id"],
-                    set_={
-                        "name": stmt.excluded.name,
-                        "cheerful_team_id": stmt.excluded.cheerful_team_id
-                    }
+                    set_={"name": stmt.excluded.name, "cheerful_team_id": stmt.excluded.cheerful_team_id},
                 )
             await session.execute(stmt)
             await session.commit()

@@ -29,9 +29,7 @@ async def fetch_ranking_rows(session, table, filters, latest_only: bool = False)
     return result.scalars().all()
 
 
-async def generate_response(
-    rows, schema_class, latest_only: bool, user_data
-) -> JSONResponse:
+async def generate_response(rows, schema_class, latest_only: bool, user_data) -> JSONResponse:
     if not rows:
         return JSONResponse(content={"error": "not found"}, status_code=404)
     rank_data = schema_class.model_validate(rows[0]) if latest_only else [schema_class.model_validate(r) for r in rows]
