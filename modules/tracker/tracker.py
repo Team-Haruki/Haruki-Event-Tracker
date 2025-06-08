@@ -25,8 +25,6 @@ from modules.sql.tables import (
 )
 from modules.tracker.call_api import HarukiSekaiAPIClient
 
-logger = AsyncLogger(__name__, level="DEBUG")
-
 
 class EventTracker:
     def __init__(
@@ -39,9 +37,11 @@ class EventTracker:
         api_client: HarukiSekaiAPIClient,
         world_link_statuses: Optional[Dict[int, WorldBloomChapterStatus]] = None,
     ) -> None:
+        self.logger = AsyncLogger(__name__, level="DEBUG")
         self.server: SekaiServerRegion = server
         self.event_id: int = event_id
         self.event_type: SekaiEventType = event_type
+        self.is_event_ended: bool = False
         self.world_link_statuses: Optional[Dict[int, WorldBloomChapterStatus]] = (
             world_link_statuses if event_type == SekaiEventType.WORLD_BLOOM else None
         )
@@ -59,10 +59,11 @@ class EventTracker:
             self.is_world_link_chapter_ended = None
 
     async def init(self) -> None:
-        await logger.info(f"Initializing {self.server.value.upper()} {self.event_id} event tracker...")
+        await self.logger.start()
+        await self.logger.info(f"Initializing {self.server.value.upper()} {self.event_id} event tracker...")
         tables = [self.event_table, self.world_link_table, self.event_names_table]
         await self.engine.create_tables(tables)
-        await logger.info(f"Initialized {self.server.value.upper()} {self.event_id} event tracker.")
+        await self.logger.info(f"Initialized {self.server.value.upper()} {self.event_id} event tracker.")
 
     async def detect_cache(self, key: str, new_data: List) -> bool:
         cached_data = orjson.loads(await self.redis.get(key) or "[]")
@@ -86,7 +87,7 @@ class EventTracker:
         border = await self.api_client.get_border(self.event_id, self.server)
 
         if not top100:
-            await logger.warning("It seems that Haruki Sekai API occurred error. skipping tracking...")
+            await self.logger.warning("It seems that Haruki Sekai API occurred error. skipping tracking...")
 
         current_time = int(time.time())
         main_top100_rankings = top100.rankings
@@ -128,7 +129,7 @@ class EventTracker:
             record_time=current_time, rankings=rankings, world_link_rankings=wl_rankings, character_id=character_id
         )
 
-    async def record_ranking_data_concurrently(self) -> None:
+    async def record_ranking_data_concurrently(self, is_only_record_world_bloom: bool = False) -> None:
         data = await self.handle_ranking_data()
         if not data:
             return
@@ -160,11 +161,12 @@ class EventTracker:
             if r.user_id not in seen_ids and not seen_ids.add(r.user_id)
         ]
         async with self.engine.session() as session:
-            await logger.info(f"{self.server.value.upper()} server tracker started inserting ranking data...")
-            await session.execute(insert(self.event_table), event_rows)
+            await self.logger.info(f"{self.server.value.upper()} server tracker started inserting ranking data...")
+            if not is_only_record_world_bloom:
+                await session.execute(insert(self.event_table), event_rows)
             if self.world_link_table and wl_rows:
                 await session.execute(insert(self.world_link_table), wl_rows)
             if name_rows:
                 await session.execute(insert(self.event_names_table).prefix_with("IGNORE"), name_rows)
             await session.commit()
-            await logger.info(f"{self.server.value.upper()} server tracker finished inserting ranking data.")
+            await self.logger.info(f"{self.server.value.upper()} server tracker finished inserting ranking data.")

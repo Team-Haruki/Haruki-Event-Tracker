@@ -3,7 +3,7 @@ from aioredis import StrictRedis
 from typing import Optional, Dict, List
 
 
-class RedisClient:
+class RedisClient(object):
     def __init__(self, host: str, port: int, password: Optional[str] = None) -> None:
         self._pool = StrictRedis(host=host, port=port, password=password, decode_responses=True)
 
