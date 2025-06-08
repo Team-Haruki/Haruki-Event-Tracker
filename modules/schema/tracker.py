@@ -25,4 +25,4 @@ class HandledRankingDataSchema(BaseModel):
     record_time: int
     rankings: List[PlayerRankingSchema]
     character_id: Optional[int] = None
-    world_link_rankings: Optional[List[PlayerRankingSchema]] = None
+    world_bloom_rankings: Optional[List[PlayerRankingSchema]] = None

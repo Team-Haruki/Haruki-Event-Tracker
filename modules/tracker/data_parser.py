@@ -5,7 +5,7 @@ from pathlib import Path
 from aiopath import AsyncPath
 from typing import Union, Dict, List, Any, Optional
 
-from enums import SekaiServerRegion, SekaiEventStatus, SekaiEventType
+from modules.enums import SekaiServerRegion, SekaiEventStatus, SekaiEventType
 from modules.schema.data_parser import WorldBloomChapterStatus, EventStatus
 
 
@@ -80,11 +80,11 @@ class EventDataParser:
     async def load_event_data(self) -> Union[Dict[str, Any], List[Dict[str, Any]]]:
         return await self.load_data(AsyncPath(self.master_dir / "events.json"))
 
-    async def load_world_link_chapter_data(self) -> Union[Dict[str, Any], List[Dict[str, Any]]]:
+    async def load_world_bloom_chapter_data(self) -> Union[Dict[str, Any], List[Dict[str, Any]]]:
         return await self.load_data(AsyncPath(self.master_dir / "worldBlooms.json"))
 
     async def get_world_bloom_character_statuses(self, event_id: int) -> Dict[int, WorldBloomChapterStatus]:
-        data = await self.load_world_link_chapter_data()
+        data = await self.load_world_bloom_chapter_data()
         now = int(round(time.time() * 1000))
         result = {}
         for chapter in data:
@@ -114,7 +114,7 @@ class EventDataParser:
             if not start_at < now < end_at:
                 continue
             event_id = data[i]["id"]
-            event_type = SekaiEventType[data[i]["eventType"]]
+            event_type = SekaiEventType(data[i]["eventType"])
             if data[i]["startAt"] < now < data[i]["aggregateAt"]:
                 status = SekaiEventStatus.ONGOING
                 remain = self.event_time_remain(remain_time=(data[i]["aggregateAt"] - now) / 1000, server=self.server)

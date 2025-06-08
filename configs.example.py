@@ -1,6 +1,6 @@
 from aiopath import AsyncPath
 from typing import Dict, Optional
-from enums import SekaiServerRegion
+from modules.enums import SekaiServerRegion
 
 REDIS_HOST: str = "localhost"
 REDIS_PORT: int = 6379

@@ -1,7 +1,9 @@
-from aiohttp import ClientSession, ClientResponse
+import orjson
+import traceback
 from typing import Optional
+from aiohttp import ClientSession, ClientResponse
 
-from enums import SekaiServerRegion
+from modules.enums import SekaiServerRegion
 from ..schema.call_api import Top100RankingResponse, BorderRankingResponse
 
 
@@ -17,10 +19,11 @@ class HarukiSekaiAPIClient:
     async def close(self) -> None:
         await self.session.close()
 
-    async def _request(self, url: str) -> Optional[ClientResponse]:
-        async with self.session.get(url, headers=self.headers) as response:
+    async def _request(self, url: str) -> Optional[bytes]:
+        async with self.session.get(url, headers=self.headers, timeout=20) as response:
+            response.raise_for_status()
             if response.status == 200:
-                return response
+                return await response.read()
             else:
                 return None
 
@@ -28,14 +31,16 @@ class HarukiSekaiAPIClient:
         try:
             url = f"{self.api_endpoint}/{server.value}/user/%user_id/event/{event_id}/ranking?rankingViewType=top100"
             response = await self._request(url)
-            return Top100RankingResponse(**await response.json())
+            return Top100RankingResponse(**orjson.loads(response))
         except Exception:
+            traceback.print_exc()
             return None
 
     async def get_border(self, event_id: int, server: SekaiServerRegion) -> Optional[BorderRankingResponse]:
         try:
             url = f"{self.api_endpoint}/{server.value}/event/{event_id}/ranking-border"
             response = await self._request(url)
-            return BorderRankingResponse(**await response.json())
+            return BorderRankingResponse(**orjson.loads(response))
         except Exception:
+            traceback.print_exc()
             return None

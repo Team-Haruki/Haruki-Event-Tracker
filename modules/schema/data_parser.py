@@ -1,7 +1,7 @@
 from pydantic import BaseModel
-from typing import Optional, List, Dict, Any
+from typing import Optional, Dict, Any
 
-from enums import SekaiServerRegion, SekaiEventType, SekaiEventStatus
+from modules.enums import SekaiServerRegion, SekaiEventType, SekaiEventStatus
 
 
 class WorldBloomChapterStatus(BaseModel):

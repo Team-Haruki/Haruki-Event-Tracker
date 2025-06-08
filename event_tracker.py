@@ -1,8 +1,8 @@
 import asyncio
 from typing import Optional, Dict
 
-from configs import ENABLE_SERVERS
-from enums import SekaiServerRegion, SekaiEventStatus, SekaiEventType
+from configs import ENABLE_SERVERS, MASTER_DATA_DIRS
+from modules.enums import SekaiServerRegion, SekaiEventStatus, SekaiEventType
 from utils import db_engines, redis_client, api_client
 from modules.logger import AsyncLogger
 from modules.tracker.data_parser import EventDataParser
@@ -13,7 +13,7 @@ trackers: Dict[SekaiServerRegion, Optional[EventTracker]] = {
     server: None for server, value in ENABLE_SERVERS.items() if value
 }
 data_parsers: Dict[SekaiServerRegion, Optional[EventDataParser]] = {
-    server: None for server, value in ENABLE_SERVERS.items() if value
+    server: EventDataParser(server, MASTER_DATA_DIRS.get(server)) for server, value in ENABLE_SERVERS.items() if value
 }
 
 
@@ -60,7 +60,7 @@ async def track_ranking_data(server: SekaiServerRegion, tracker: Optional[EventT
             for character, detail in current_event_data.chapter_statuses.items():
                 if detail.chapter_status == SekaiEventStatus.NOT_STARTED:
                     continue
-                elif detail.chapter_status == SekaiEventStatus.ENDED and not tracker.is_world_link_chapter_ended.get(
+                elif detail.chapter_status == SekaiEventStatus.ENDED and not tracker.is_world_bloom_chapter_ended.get(
                     character
                 ):
                     await logger.info(
@@ -68,7 +68,7 @@ async def track_ranking_data(server: SekaiServerRegion, tracker: Optional[EventT
                         f"{character}'s chapter is ended, finishing tracking..."
                     )
                     await tracker.record_ranking_data_concurrently(is_only_record_world_bloom=True)
-                    tracker.is_world_link_chapter_ended.update({character: True})
+                    tracker.is_world_bloom_chapter_ended.update({character: True})
                     break
                 elif detail.chapter_status == SekaiEventStatus.AGGREGATING:
                     await logger.info(

@@ -1,13 +1,13 @@
 import orjson
-from aioredis import StrictRedis
-from typing import Optional, Dict, List
+from redis.asyncio import StrictRedis
+from typing import Optional, Dict, List, Union
 
 
 class RedisClient(object):
     def __init__(self, host: str, port: int, password: Optional[str] = None) -> None:
         self._pool = StrictRedis(host=host, port=port, password=password, decode_responses=True)
 
-    async def get(self, key: str) -> Optional[Dict, List]:
+    async def get(self, key: str) -> Optional[Union[Dict, List]]:
         raw = await self._pool.get(key)
         if raw is None:
             return None
