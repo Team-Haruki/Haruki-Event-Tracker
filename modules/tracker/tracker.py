@@ -181,3 +181,5 @@ class EventTracker:
             await session.execute(stmt)
             await session.commit()
             await self.logger.info(f"{self.server.value.upper()} server tracker finished inserting ranking data.")
+
+        await self.redis.clear_fastapi_cache("event_ranking")

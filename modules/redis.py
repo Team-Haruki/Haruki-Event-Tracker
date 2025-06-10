@@ -22,5 +22,11 @@ class RedisClient(object):
     async def keys(self, pattern: str) -> List[str]:
         return await self._pool.keys(pattern)
 
+    async def clear_fastapi_cache(self, namespace: str) -> None:
+        pattern = f"fastapi-cache:{namespace}:*"
+        keys = await self._pool.keys(pattern)
+        if keys:
+            await self._pool.delete(*keys)
+
     async def close(self) -> None:
         await self._pool.close()

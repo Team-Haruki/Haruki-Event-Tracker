@@ -5,7 +5,9 @@
 
 ## Requirements
 
-Before using this project, make sure you have a working instance of [Haruki-Sekai-API](https://github.com/Team-Haruki/Haruki-Sekai-API).
++ `MySQL` or `SQLite`
++ `Redis`
++ a working instance of [Haruki-Sekai-API](https://github.com/Team-Haruki/Haruki-Sekai-API)
 
 ## How to Use
 

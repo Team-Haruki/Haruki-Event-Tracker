@@ -1,11 +1,16 @@
 from typing import List
+from redis.asyncio import Redis
+from fastapi_cache import FastAPICache
+from fastapi_cache.decorator import cache
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Response, APIRouter
 from apscheduler.triggers.cron import CronTrigger
+from fastapi_cache.backends.redis import RedisBackend
 
 from event_tracker import track_event_data
-from event_tracker import logger as event_tracker_logger
 from modules.enums import SekaiEventRankingLines
+from event_tracker import logger as event_tracker_logger
+from modules.cache_helpers import ORJsonCoder, cache_key_builder
 from modules.sql.tables import get_event_table_class, get_world_bloom_table_class, get_event_names_table_class
 from modules.schema.api import (
     RecordedRankingSchema,
@@ -26,10 +31,14 @@ from utils import (
     get_ranking_growth_over_interval,
     get_latest_ranking_lines,
 )
-
+from configs import REDIS_HOST, REDIS_PORT, REDIS_PASSWORD
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
+    redis_client = Redis(
+        host=REDIS_HOST, port=REDIS_PORT, password=REDIS_PASSWORD, decode_responses=False, encoding="utf-8"
+    )
+    FastAPICache.init(RedisBackend(redis_client), prefix="fastapi-cache")
     await api_client.init()
     await event_tracker_logger.start()
     for db_engine in db_engines:
@@ -53,6 +62,7 @@ api = APIRouter(prefix="/event/{server}/{event_id}")
     summary="获取指定活动指定玩家最新排名数据",
     description="返回指定玩家在指定活动中的最新一条排名记录及玩家信息",
 )
+@cache(expire=60, namespace="event_ranking", coder=ORJsonCoder, key_builder=cache_key_builder) # type: ignore
 async def get_normal_ranking_by_user_id(server: str, event_id: int, user_id: str) -> Response:
     engine, table_cls = await get_db_context(server, event_id, get_event_table_class)
     return await query_rank_data(
@@ -74,6 +84,7 @@ async def get_normal_ranking_by_user_id(server: str, event_id: int, user_id: str
     summary="获取指定活动指定排名最新排名数据",
     description="返回指定活动中指定排名的最新一条排名记录及玩家信息",
 )
+@cache(expire=60, namespace="event_ranking", coder=ORJsonCoder, key_builder=cache_key_builder) # type: ignore
 async def get_normal_ranking_by_rank(server: str, event_id: int, rank: int) -> Response:
     engine, table_cls = await get_db_context(server, event_id, get_event_table_class)
     return await query_rank_data(
@@ -95,6 +106,7 @@ async def get_normal_ranking_by_rank(server: str, event_id: int, rank: int) -> R
     summary="获取指定玩家指定World Link活动指定角色单榜最新排名数据",
     description="返回指定玩家在指定World Link活动指定角色单榜中的最新一条排名记录及玩家信息",
 )
+@cache(expire=60, namespace="event_ranking", coder=ORJsonCoder, key_builder=cache_key_builder) # type: ignore
 async def get_world_bloom_ranking_by_user_id(server: str, event_id: int, character_id: int, user_id: str) -> Response:
     engine, table_cls = await get_db_context(server, event_id, get_world_bloom_table_class)
     return await query_rank_data(
@@ -116,6 +128,7 @@ async def get_world_bloom_ranking_by_user_id(server: str, event_id: int, charact
     summary="获取指定排名指定World Link活动指定角色单榜最新排名数据",
     description="返回指定排名在指定World Link活动指定角色单榜中的最新一条排名记录及玩家信息",
 )
+@cache(expire=60, namespace="event_ranking", coder=ORJsonCoder, key_builder=cache_key_builder) # type: ignore
 async def get_world_bloom_ranking_by_rank(server: str, event_id: int, character_id: int, rank: int) -> Response:
     engine, table_cls = await get_db_context(server, event_id, get_world_bloom_table_class)
     return await query_rank_data(
@@ -137,6 +150,7 @@ async def get_world_bloom_ranking_by_rank(server: str, event_id: int, character_
     summary="获取指定活动指定玩家的所有已记录的排名数据",
     description="返回指定玩家在指定活动中的所有已记录的排名数据（时间升序）及玩家信息",
 )
+@cache(expire=60, namespace="event_ranking", coder=ORJsonCoder, key_builder=cache_key_builder) # type: ignore
 async def get_all_normal_ranking_by_user_id(server: str, event_id: int, user_id: str) -> Response:
     engine, table_cls = await get_db_context(server, event_id, get_event_table_class)
     return await query_rank_data(
@@ -158,6 +172,7 @@ async def get_all_normal_ranking_by_user_id(server: str, event_id: int, user_id:
     summary="获取指定活动指定排名的所有已记录的排名数据",
     description="返回指定排名在指定活动中的所有已记录的排名数据（时间升序）",
 )
+@cache(expire=60, namespace="event_ranking", coder=ORJsonCoder, key_builder=cache_key_builder) # type: ignore
 async def get_all_normal_ranking_by_rank(server: str, event_id: int, rank: int) -> Response:
     engine, table_cls = await get_db_context(server, event_id, get_event_table_class)
     return await query_rank_data(
@@ -179,6 +194,7 @@ async def get_all_normal_ranking_by_rank(server: str, event_id: int, rank: int) 
     summary="获取指定玩家指定World Link活动指定角色单榜的所有已记录的排名数据",
     description="返回指定玩家在指定World Link活动指定角色单榜中的所有已记录的排名数据（时间升序）及玩家信息",
 )
+@cache(expire=60, namespace="event_ranking", coder=ORJsonCoder, key_builder=cache_key_builder) # type: ignore
 async def get_all_world_bloom_ranking_by_user_id(
     server: str, event_id: int, character_id: int, user_id: str
 ) -> Response:
@@ -202,6 +218,7 @@ async def get_all_world_bloom_ranking_by_user_id(
     summary="获取指定排名指定World Link活动指定角色单榜的所有已记录的排名数据",
     description="返回指定排名在指定World Link活动指定角色单榜中的所有已记录的排名数据（时间升序）",
 )
+@cache(expire=60, namespace="event_ranking", coder=ORJsonCoder, key_builder=cache_key_builder) # type: ignore
 async def get_all_world_bloom_ranking_by_rank(server: str, event_id: int, character_id: int, rank: int) -> Response:
     engine, table_cls = await get_db_context(server, event_id, get_world_bloom_table_class)
     return await query_rank_data(
@@ -223,6 +240,7 @@ async def get_all_world_bloom_ranking_by_rank(server: str, event_id: int, charac
     summary="获取指定用户的基础信息",
     description="返回指定用户的用户名与欢乐嘉年华(5v5)队伍ID",
 )
+@cache(expire=60, namespace="event_ranking", coder=ORJsonCoder, key_builder=cache_key_builder) # type: ignore
 async def get_user_data_by_user_id(server: str, event_id: int, user_id: str) -> Response:
     engine, table_cls = await get_db_context(server, event_id, get_event_names_table_class)
     return await query_rank_data(
@@ -244,6 +262,7 @@ async def get_user_data_by_user_id(server: str, event_id: int, user_id: str) -> 
     summary="获取指定活动最新分数线",
     description="根据指定活动获取所有固定排名的最新分数",
 )
+@cache(expire=60, namespace="event_ranking", coder=ORJsonCoder, key_builder=cache_key_builder) # type: ignore
 async def get_ranking_lines(server: str, event_id: int) -> List[RankingLineScoreSchema]:
     return await get_latest_ranking_lines(
         server,
@@ -259,6 +278,7 @@ async def get_ranking_lines(server: str, event_id: int) -> List[RankingLineScore
     summary="获取指定活动排名的分数增长速度",
     description="根据指定活动获取所有固定排名在特定时间内的分数增长速度",
 )
+@cache(expire=60, namespace="event_ranking", coder=ORJsonCoder, key_builder=cache_key_builder) # type: ignore
 async def get_ranking_score_growths(server: str, event_id: int, interval: int) -> List[RankingScoreGrowthSchema]:
     return await get_ranking_growth_over_interval(
         server,
@@ -275,6 +295,7 @@ async def get_ranking_score_growths(server: str, event_id: int, interval: int) -
     summary="获取指定World Link活动指定角色单榜排名最新分数线",
     description="根据指定World Link活动指定角色单榜获取所有固定排名的最新分数",
 )
+@cache(expire=60, namespace="event_ranking", coder=ORJsonCoder, key_builder=cache_key_builder) # type: ignore
 async def get_world_bloom_ranking_lines(server: str, event_id: int, character_id: int) -> List[RankingLineScoreSchema]:
     return await get_latest_ranking_lines(
         server,
@@ -291,6 +312,7 @@ async def get_world_bloom_ranking_lines(server: str, event_id: int, character_id
     summary="获取指定World Link活动指定角色单榜排名的分数增长速度",
     description="根据指定World Link活动指定角色单榜获取所有固定排名在特定时间内的分数增长速度",
 )
+@cache(expire=60, namespace="event_ranking", coder=ORJsonCoder, key_builder=cache_key_builder) # type: ignore
 async def get_world_bloom_ranking_score_growths(
     server: str, event_id: int, character_id: int, interval: int
 ) -> List[RankingScoreGrowthSchema]:

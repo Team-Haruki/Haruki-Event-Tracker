@@ -11,7 +11,7 @@ class HarukiSekaiAPIClient:
     def __init__(self, api_endpoint: str) -> None:
         self.api_endpoint = api_endpoint
         self.session: Optional[ClientSession] = None
-        self.headers = {"User-Agent": "Haruki Event Tracker / v1.0.0"}
+        self.headers = {"User-Agent": "Haruki Event Tracker / v1.1.0"}
 
     async def init(self) -> None:
         self.session = ClientSession()
