@@ -32,7 +32,7 @@
 7. If you need to change the listening address or other server settings, edit the `hypercorn.toml` file. If you have installed uvloop, uncomment the `worker_class` line in `hypercorn.toml` to enable it.
 8. Finally, run the server using:
    ```bash
-   hypercorn app:app --config hypercorn.toml
+   uv run hypercorn app:app --config hypercorn.toml
    ```
 
 ## License
