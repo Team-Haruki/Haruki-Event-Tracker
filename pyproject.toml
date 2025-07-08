@@ -1,21 +1,21 @@
 [project]
 name = "Haruki-Event-Tracker"
-version = "1.1.0"
+version = "1.2.0"
 description = "Haruki sekai event tracker and API."
 requires-python = ">=3.12"
 dependencies = [
-    "aiohttp>=3.12.11",
+    "aiohttp>=3.12.13",
     "aiopath>=0.7.7",
     "apscheduler>=3.11.0",
     "coloredlogs>=15.0.1",
-    "fastapi>=0.115.12",
+    "fastapi>=0.116.0",
     "fastapi-cache2>=0.2.2",
     "greenlet>=3.2.3",
     "hypercorn>=0.17.3",
     "orjson>=3.10.18",
-    "pydantic>=2.11.5",
+    "pydantic>=2.11.7",
     "redis>=6.2.0",
-    "ruff>=0.11.13",
+    "ruff>=0.12.2",
     "sqlalchemy>=2.0.41",
 ]
 

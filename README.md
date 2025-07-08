@@ -21,16 +21,20 @@
    ```bash
    uv add aiomysql
    ```
-5. (Optional) If you plan to use SQLite via aiosqlite, install:
+5. (Optional) If you plan to use MySQL via asyncmy, install:
+   ```bash
+   uv add asyncmy
+   ```
+6. (Optional) If you plan to use SQLite via aiosqlite, install:
    ```bash
    uv add aiosqlite
    ```
-6. (Optional) If you're on **Linux/macOS**, it's recommended to install [uvloop](https://github.com/MagicStack/uvloop) for better performance:
+7. (Optional) If you're on **Linux/macOS**, it's recommended to install [uvloop](https://github.com/MagicStack/uvloop) for better performance:
    ```bash
    uv add uvloop
    ```
-7. If you need to change the listening address or other server settings, edit the `hypercorn.toml` file. If you have installed uvloop, uncomment the `worker_class` line in `hypercorn.toml` to enable it.
-8. Finally, run the server using:
+8. If you need to change the listening address or other server settings, edit the `hypercorn.toml` file. If you have installed uvloop, uncomment the `worker_class` line in `hypercorn.toml` to enable it.
+9. Finally, run the server using:
    ```bash
    uv run hypercorn app:app --config hypercorn.toml
    ```

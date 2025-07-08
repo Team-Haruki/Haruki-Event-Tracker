@@ -1,4 +1,6 @@
 import time
+from datetime import datetime
+
 from sqlalchemy import insert
 from typing import Optional, Dict, List, Type
 from sqlalchemy.dialects.mysql import insert as mysql_insert
@@ -58,6 +60,7 @@ class EventTracker:
             self.is_world_bloom_chapter_ended = {character_id: False for character_id in world_bloom_statuses}
         else:
             self.is_world_bloom_chapter_ended = None
+        self.last_update_time: Optional[datetime] = None
 
     async def init(self) -> None:
         await self.logger.start()
@@ -132,16 +135,26 @@ class EventTracker:
 
     async def record_ranking_data_concurrently(self, is_only_record_world_bloom: bool = False) -> None:
         data = await self.handle_ranking_data()
+        current_time_minute = datetime.fromtimestamp(time.time()).strftime("%m/%d %H:%M")
         if not data:
             return
         rankings = data.rankings or []
         world_bloom_rankings = data.world_bloom_rankings or []
         character_id = data.character_id
+        if current_time_minute != self.last_update_time:
+            filter_func = lambda r: True
+            self.last_update_time = current_time_minute
+        else:
+            filter_func = lambda r: r.rank == 1
         event_rows = [
             RecordPlayerRankingSchemaBase(
-                timestamp=data.record_time, user_id=r.userId, score=r.score, rank=r.rank
+                timestamp=data.record_time,
+                user_id=r.userId,
+                score=r.score,
+                rank=r.rank,
             ).model_dump()
             for r in rankings
+            if filter_func(r)
         ]
         wl_rows = []
         if self.world_bloom_table and world_bloom_rankings:
