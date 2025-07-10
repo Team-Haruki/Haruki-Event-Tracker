@@ -1,17 +1,19 @@
 import orjson
 import traceback
 from typing import Optional
-from aiohttp import ClientSession, ClientResponse
+from aiohttp import ClientSession
 
 from modules.enums import SekaiServerRegion
 from ..schema.call_api import Top100RankingResponse, BorderRankingResponse
 
 
 class HarukiSekaiAPIClient:
-    def __init__(self, api_endpoint: str) -> None:
+    def __init__(self, api_endpoint: str, authorization: str) -> None:
         self.api_endpoint = api_endpoint
         self.session: Optional[ClientSession] = None
-        self.headers = {"User-Agent": "Haruki Event Tracker / v1.1.0"}
+        self.headers = {"User-Agent": "Haruki Event Tracker / v1.3.0"}
+        if authorization:
+            self.headers["Authorization"] = f"Bearer {authorization}"
 
     async def init(self) -> None:
         self.session = ClientSession()

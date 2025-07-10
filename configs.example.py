@@ -6,6 +6,7 @@ REDIS_HOST: str = "localhost"
 REDIS_PORT: int = 6379
 REDIS_PASSWORD: Optional[str] = None
 HARUKI_SEKAI_API_ENDPOINT: str = "https://event.haruki.example.com/api"
+HARUKI_SEKAI_API_TOKEN = "<PASSWORD>"
 BASE_MASTER_DATA_DIR: AsyncPath = AsyncPath(__file__).parent / "Data" / "master"
 ENABLE_SERVERS: Dict[SekaiServerRegion, bool] = {
     SekaiServerRegion.JP: True,

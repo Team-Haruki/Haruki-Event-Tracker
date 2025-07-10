@@ -16,6 +16,7 @@ from configs import (
     REDIS_PORT,
     REDIS_PASSWORD,
     HARUKI_SEKAI_API_ENDPOINT,
+    HARUKI_SEKAI_API_TOKEN,
 )
 from modules.tracker.call_api import HarukiSekaiAPIClient
 from modules.schema.api import (
@@ -29,7 +30,7 @@ db_engines: Dict[SekaiServerRegion, DatabaseEngine] = {
     server: DatabaseEngine(EVENT_DB_SCHEMA + DATABASES.get(server)) for server, value in ENABLE_SERVERS.items() if value
 }
 redis_client: RedisClient = RedisClient(REDIS_HOST, REDIS_PORT, REDIS_PASSWORD)
-api_client: HarukiSekaiAPIClient = HarukiSekaiAPIClient(HARUKI_SEKAI_API_ENDPOINT)
+api_client: HarukiSekaiAPIClient = HarukiSekaiAPIClient(HARUKI_SEKAI_API_ENDPOINT, HARUKI_SEKAI_API_TOKEN)
 
 
 async def get_db_context(
