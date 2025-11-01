@@ -21,7 +21,7 @@ type HarukiSekaiAPIClient struct {
 func NewHarukiSekaiAPIClient(apiEndpoint, authorization string) *HarukiSekaiAPIClient {
 	client := resty.New().
 		SetTimeout(20*time.Second).
-		SetHeader("User-Agent", fmt.Sprintf("Haruki Event Tracker/%s", config.Version))
+		SetHeader("User-Agent", fmt.Sprintf("Haruki-Event-Tracker/%s", config.Version))
 	if authorization != "" {
 		client.SetHeader("X-Haruki-Sekai-Token", authorization)
 	}

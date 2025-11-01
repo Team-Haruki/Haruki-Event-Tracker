@@ -1,6 +1,5 @@
 package model
 
-// SekaiServerRegion represents the server region
 type SekaiServerRegion string
 
 const (
@@ -11,7 +10,6 @@ const (
 	SekaiServerRegionCN SekaiServerRegion = "cn"
 )
 
-// SekaiEventType represents the event type
 type SekaiEventType string
 
 const (
@@ -20,7 +18,13 @@ const (
 	SekaiEventTypeWorldBloom       SekaiEventType = "world_bloom"       // 世界连接 (World Link)
 )
 
-// SekaiEventStatus represents the event status
+type SekaiWorldBloomType string
+
+const (
+	SekaiWorldBloomTypeGameCharacter SekaiWorldBloomType = "game_character"
+	SekaiWorldBloomTypeFinale        SekaiWorldBloomType = "finale"
+)
+
 type SekaiEventStatus string
 
 const (
@@ -30,7 +34,6 @@ const (
 	SekaiEventStatusEnded       SekaiEventStatus = "ended"       // 已结束
 )
 
-// SekaiEventSpeedType represents the event speed type
 type SekaiEventSpeedType string
 
 const (
@@ -39,7 +42,17 @@ const (
 	SekaiEventSpeedTypeDaily     SekaiEventSpeedType = "daily"
 )
 
-// SekaiEventRankingLinesNormal represents the normal event ranking lines
+type SekaiUnit string
+
+const (
+	SekaiUnitNone                SekaiUnit = "none"
+	SekaiUnitLeoneed             SekaiUnit = "light_sound"
+	SekaiUnitMoreMoreJump        SekaiUnit = "idol"
+	SekaiUnitVividBadSquad       SekaiUnit = "street"
+	SekaiUnitWonderlandsShowtime SekaiUnit = "theme_park"
+	SekaiUnitNightcord           SekaiUnit = "school_refusal"
+)
+
 var SekaiEventRankingLinesNormal = []int{
 	10, 20, 30, 40, 50, 100, 200, 300, 400, 500,
 	1000, 1500, 2000, 2500, 3000, 4000, 5000,
@@ -47,7 +60,6 @@ var SekaiEventRankingLinesNormal = []int{
 	100000, 200000, 300000,
 }
 
-// SekaiEventRankingLinesWorldBloom represents the world bloom event ranking lines
 var SekaiEventRankingLinesWorldBloom = []int{
 	10, 20, 30, 40, 50, 100, 200, 300, 400, 500,
 	1000, 2000, 3000, 4000, 5000, 7000,

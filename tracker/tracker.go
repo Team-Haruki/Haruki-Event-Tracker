@@ -58,7 +58,7 @@ func NewEventTracker(
 // Init initializes the event tracker and creates necessary database tables
 func (t *EventTracker) Init(ctx context.Context) error {
 	t.logger.Infof("Initializing %s %d event tracker...", t.server, t.eventID)
-	if err := t.engine.CreateEventTables(ctx, t.eventID); err != nil {
+	if err := t.engine.CreateEventTables(ctx, t.server, t.eventID); err != nil {
 		return fmt.Errorf("failed to create event tables: %w", err)
 	}
 	t.logger.Infof("Initialized %s %d event tracker.", t.server, t.eventID)
@@ -209,76 +209,59 @@ func (t *EventTracker) RecordRankingData(ctx context.Context, isOnlyRecordWorldB
 	}
 
 	// Prepare event ranking records
-	eventRows := make([]*gorm.EventTable, 0)
+	eventRows := make([]*model.PlayerEventRankingRecordSchema, 0)
 	for i := range data.Rankings {
 		r := &data.Rankings[i]
 		if !filterFunc(r) {
 			continue
 		}
 
-		if r.UserID == nil || r.Score == nil || r.Rank == nil {
+		if r.UserID == nil || r.Score == nil || r.Rank == nil || r.Name == nil {
 			continue
 		}
-
-		eventRows = append(eventRows, &gorm.EventTable{
-			Timestamp: data.RecordTime,
-			UserID:    fmt.Sprintf("%d", *r.UserID),
-			Score:     *r.Score,
-			Rank:      *r.Rank,
-		})
-	}
-
-	// Prepare World Bloom records
-	var wlRows []*gorm.WorldBloomTable
-	if len(data.WorldBloomRankings) > 0 && data.CharacterID != nil {
-		wlRows = make([]*gorm.WorldBloomTable, 0)
-		for i := range data.WorldBloomRankings {
-			r := &data.WorldBloomRankings[i]
-			if r.UserID == nil || r.Score == nil || r.Rank == nil {
-				continue
-			}
-
-			wlRows = append(wlRows, &gorm.WorldBloomTable{
-				Timestamp:   data.RecordTime,
-				UserID:      fmt.Sprintf("%d", *r.UserID),
-				CharacterID: *data.CharacterID,
-				Score:       *r.Score,
-				Rank:        *r.Rank,
-			})
-		}
-	}
-
-	// Prepare name records (deduplicate by user ID)
-	seenIDs := make(map[int]bool)
-	nameRows := make([]*gorm.EventNamesTable, 0)
-
-	allRankings := data.Rankings
-	if len(data.WorldBloomRankings) > 0 {
-		allRankings = append(allRankings, data.WorldBloomRankings...)
-	}
-
-	for i := range allRankings {
-		r := &allRankings[i]
-		if r.UserID == nil || r.Name == nil {
-			continue
-		}
-
-		userID := *r.UserID
-		if seenIDs[userID] {
-			continue
-		}
-		seenIDs[userID] = true
 
 		var cheerfulTeamID *int
 		if r.UserCheerfulCarnival != nil && r.UserCheerfulCarnival.CheerfulCarnivalTeamID != nil {
 			cheerfulTeamID = r.UserCheerfulCarnival.CheerfulCarnivalTeamID
 		}
 
-		nameRows = append(nameRows, &gorm.EventNamesTable{
-			UserID:         fmt.Sprintf("%d", userID),
+		eventRows = append(eventRows, &model.PlayerEventRankingRecordSchema{
+			Timestamp:      data.RecordTime,
+			UserID:         fmt.Sprintf("%d", *r.UserID),
 			Name:           *r.Name,
+			Score:          *r.Score,
+			Rank:           *r.Rank,
 			CheerfulTeamID: cheerfulTeamID,
 		})
+	}
+
+	// Prepare World Bloom records
+	var wlRows []*model.PlayerWorldBloomRankingRecordSchema
+	if len(data.WorldBloomRankings) > 0 && data.CharacterID != nil {
+		wlRows = make([]*model.PlayerWorldBloomRankingRecordSchema, 0)
+		for i := range data.WorldBloomRankings {
+			r := &data.WorldBloomRankings[i]
+			if r.UserID == nil || r.Score == nil || r.Rank == nil || r.Name == nil {
+				continue
+			}
+
+			var cheerfulTeamID *int
+			if r.UserCheerfulCarnival != nil && r.UserCheerfulCarnival.CheerfulCarnivalTeamID != nil {
+				cheerfulTeamID = r.UserCheerfulCarnival.CheerfulCarnivalTeamID
+			}
+
+			wlRows = append(wlRows, &model.PlayerWorldBloomRankingRecordSchema{
+				PlayerEventRankingRecordSchema: model.PlayerEventRankingRecordSchema{
+					Timestamp:      data.RecordTime,
+					UserID:         fmt.Sprintf("%d", *r.UserID),
+					Name:           *r.Name,
+					Score:          *r.Score,
+					Rank:           *r.Rank,
+					CheerfulTeamID: cheerfulTeamID,
+				},
+				CharacterID: *data.CharacterID,
+			})
+		}
 	}
 
 	// Insert data into database
@@ -286,22 +269,15 @@ func (t *EventTracker) RecordRankingData(ctx context.Context, isOnlyRecordWorldB
 
 	// Insert event rankings
 	if !isOnlyRecordWorldBloom && len(eventRows) > 0 {
-		if err := gorm.BatchInsertEventRankings(ctx, t.engine, t.eventID, eventRows); err != nil {
+		if err := gorm.BatchInsertEventRankings(ctx, t.engine, t.server, t.eventID, eventRows); err != nil {
 			return fmt.Errorf("failed to insert event rankings: %w", err)
 		}
 	}
 
 	// Insert World Bloom rankings
 	if len(wlRows) > 0 {
-		if err := gorm.BatchInsertWorldBloomRankings(ctx, t.engine, t.eventID, wlRows); err != nil {
+		if err := gorm.BatchInsertWorldBloomRankings(ctx, t.engine, t.server, t.eventID, wlRows); err != nil {
 			return fmt.Errorf("failed to insert world bloom rankings: %w", err)
-		}
-	}
-
-	// Upsert name records
-	for _, nameRow := range nameRows {
-		if err := gorm.UpsertEventName(ctx, t.engine, t.eventID, nameRow); err != nil {
-			t.logger.Infof("Warning: Failed to upsert name for user %s: %v", nameRow.UserID, err)
 		}
 	}
 
