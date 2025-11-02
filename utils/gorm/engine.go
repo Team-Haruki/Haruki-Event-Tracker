@@ -126,12 +126,31 @@ func (e *DatabaseEngine) CreateTables(ctx context.Context, models ...interface{}
 	return nil
 }
 
-func (e *DatabaseEngine) CreateEventTables(ctx context.Context, server model.SekaiServerRegion, eventID int) error {
+func (e *DatabaseEngine) CreateEventTables(ctx context.Context, server model.SekaiServerRegion, eventID int, isWorldBloom bool) error {
 	timeIDTable := GetTimeIDTableModel(server, eventID)
 	eventUsersTable := GetEventUsersTableModel(server, eventID)
 	eventTable := GetEventTableModel(server, eventID)
-	worldBloomTable := GetWorldBloomTableModel(server, eventID)
-	return e.CreateTables(ctx, timeIDTable, eventUsersTable, eventTable, worldBloomTable)
+	tables := []struct {
+		model     interface{}
+		tableName string
+	}{
+		{&TimeIDTable{}, timeIDTable.TableName()},
+		{&EventUsersTable{}, eventUsersTable.TableName()},
+		{&EventTable{}, eventTable.TableName()},
+	}
+	if isWorldBloom {
+		worldBloomTable := GetWorldBloomTableModel(server, eventID)
+		tables = append(tables, struct {
+			model     interface{}
+			tableName string
+		}{&WorldBloomTable{}, worldBloomTable.TableName()})
+	}
+	for _, tbl := range tables {
+		if err := e.db.WithContext(ctx).Table(tbl.tableName).AutoMigrate(tbl.model); err != nil {
+			return fmt.Errorf("failed to create table %s: %w", tbl.tableName, err)
+		}
+	}
+	return nil
 }
 
 func (e *DatabaseEngine) DB() *gorm.DB {

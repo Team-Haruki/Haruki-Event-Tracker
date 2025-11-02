@@ -87,7 +87,7 @@ func InitAPIUtils(cfg config.Config) error {
 		cronExpr := serverCfg.TrackerCron
 		sekaiAPIUtilsLogger.Infof("Registering tracker cron job for %s with expression: %s", server, cronExpr)
 		_, err = sekaiScheduler.NewJob(
-			gocron.CronJob(cronExpr, false),
+			gocron.CronJob(cronExpr, serverCfg.UseSecondLevelTrackerCron),
 			gocron.NewTask(func(s model.SekaiServerRegion) {
 				daemon := sekaiTrackerDaemons[s]
 				if daemon == nil {

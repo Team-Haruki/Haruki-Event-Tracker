@@ -81,7 +81,7 @@ func worldBloomStatusesEqual(a, b map[int]model.WorldBloomChapterStatus) bool {
 
 func (t *EventTrackerBase) Init(ctx context.Context) error {
 	t.logger.Infof("Initializing %s %d event tracker...", t.server, t.eventID)
-	if err := t.dbEngine.CreateEventTables(ctx, t.server, t.eventID); err != nil {
+	if err := t.dbEngine.CreateEventTables(ctx, t.server, t.eventID, t.eventType == model.SekaiEventTypeWorldBloom); err != nil {
 		return fmt.Errorf("failed to create event tables: %w", err)
 	}
 	t.logger.Infof("Initialized %s %d event tracker.", t.server, t.eventID)

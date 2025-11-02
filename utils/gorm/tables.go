@@ -129,7 +129,7 @@ func GetTimeIDTableModel(server model.SekaiServerRegion, eventID int) *DynamicTi
 		return table
 	}
 	table := &DynamicTimeIDTable{
-		tableName: fmt.Sprintf("%s_event_%d_time_id", server, eventID),
+		tableName: fmt.Sprintf("event_%d_time_id", eventID),
 	}
 	cache.timeIDTableCache[eventID] = table
 	return table
@@ -149,7 +149,7 @@ func GetEventUsersTableModel(server model.SekaiServerRegion, eventID int) *Dynam
 		return table
 	}
 	table := &DynamicEventUsersTable{
-		tableName: fmt.Sprintf("%s_event_%d_users", server, eventID),
+		tableName: fmt.Sprintf("event_%d_users", eventID),
 	}
 	cache.eventUsersTableCache[eventID] = table
 	return table
@@ -169,7 +169,7 @@ func GetEventTableModel(server model.SekaiServerRegion, eventID int) *DynamicEve
 		return table
 	}
 	table := &DynamicEventTable{
-		tableName: fmt.Sprintf("%s_event_%d", server, eventID),
+		tableName: fmt.Sprintf("event_%d", eventID),
 	}
 	cache.eventTableCache[eventID] = table
 	return table
@@ -189,7 +189,7 @@ func GetWorldBloomTableModel(server model.SekaiServerRegion, eventID int) *Dynam
 		return table
 	}
 	table := &DynamicWorldBloomTable{
-		tableName: fmt.Sprintf("%s_wl_%d", server, eventID),
+		tableName: fmt.Sprintf("wl_%d", eventID),
 	}
 	cache.worldBloomTableCache[eventID] = table
 	return table

@@ -37,10 +37,11 @@ type BackendConfig struct {
 }
 
 type ServerConfig struct {
-	Enabled       bool             `yaml:"enabled"`
-	MasterDataDir string           `yaml:"master_data_dir"`
-	TrackerCron   string           `yaml:"tracker_cron"`
-	GormConfig    model.GormConfig `yaml:"gorm_config"`
+	Enabled                   bool             `yaml:"enabled"`
+	MasterDataDir             string           `yaml:"master_data_dir"`
+	UseSecondLevelTrackerCron bool             `yaml:"use_second_level_tracker_cron,omitempty"`
+	TrackerCron               string           `yaml:"tracker_cron"`
+	GormConfig                model.GormConfig `yaml:"gorm_config"`
 }
 
 type Config struct {
