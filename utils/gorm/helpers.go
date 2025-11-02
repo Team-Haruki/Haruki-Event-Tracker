@@ -299,12 +299,14 @@ func FetchRankingScoreGrowths(ctx context.Context, engine *DatabaseEngine, serve
 			earlier := records[0]
 			latest := records[len(records)-1]
 			growth := latest.Score - earlier.Score
+			diff := latest.Timestamp - earlier.Timestamp
 			result = append(result, &model.RankingScoreGrowthSchema{
 				Rank:             rank,
 				TimestampLatest:  latest.Timestamp,
 				ScoreLatest:      latest.Score,
 				TimestampEarlier: &earlier.Timestamp,
 				ScoreEarlier:     &earlier.Score,
+				TimeDiff:         &diff,
 				Growth:           &growth,
 			})
 		}
@@ -368,12 +370,14 @@ func FetchWorldBloomRankingScoreGrowths(ctx context.Context, engine *DatabaseEng
 			earlier := records[0]
 			latest := records[len(records)-1]
 			growth := latest.Score - earlier.Score
+			diff := latest.Timestamp - earlier.Timestamp
 			result = append(result, &model.RankingScoreGrowthSchema{
 				Rank:             rank,
 				TimestampLatest:  latest.Timestamp,
 				ScoreLatest:      latest.Score,
 				TimestampEarlier: &earlier.Timestamp,
 				ScoreEarlier:     &earlier.Score,
+				TimeDiff:         &diff,
 				Growth:           &growth,
 			})
 		}

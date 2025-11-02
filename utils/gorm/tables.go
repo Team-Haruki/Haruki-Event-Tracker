@@ -7,13 +7,11 @@ import (
 	"haruki-tracker/utils/model"
 )
 
-// TimeIDTable maps timestamps to integer IDs to reduce storage
 type TimeIDTable struct {
 	TimeID    int   `gorm:"primaryKey;autoIncrement;column:time_id"`
 	Timestamp int64 `gorm:"uniqueIndex;column:timestamp;not null"`
 }
 
-// EventUsersTable stores user information and maps user IDs to integer keys
 type EventUsersTable struct {
 	UserIDKey      int    `gorm:"primaryKey;autoIncrement;column:user_id_key"`
 	UserID         string `gorm:"uniqueIndex;column:user_id;type:varchar(30);not null"`
@@ -21,10 +19,6 @@ type EventUsersTable struct {
 	CheerfulTeamID *int   `gorm:"column:cheerful_team_id"`
 }
 
-// EventTable stores event ranking data
-// Foreign key relationships (enforced at application level for performance):
-//   - TimeID references TimeIDTable.TimeID
-//   - UserIDKey references EventUsersTable.UserIDKey
 type EventTable struct {
 	TimeID    int `gorm:"primaryKey;column:time_id"`
 	UserIDKey int `gorm:"primaryKey;column:user_id_key"`
@@ -32,10 +26,6 @@ type EventTable struct {
 	Rank      int `gorm:"column:rank;not null"`
 }
 
-// WorldBloomTable stores world bloom ranking data
-// Foreign key relationships (enforced at application level for performance):
-//   - TimeID references TimeIDTable.TimeID
-//   - UserIDKey references EventUsersTable.UserIDKey
 type WorldBloomTable struct {
 	TimeID      int `gorm:"primaryKey;column:time_id"`
 	UserIDKey   int `gorm:"primaryKey;column:user_id_key"`
