@@ -16,7 +16,6 @@ FROM alpine:latest
 RUN apk --no-cache add ca-certificates tzdata
 WORKDIR /app
 COPY --from=builder /app/haruki-event-tracker .
-COPY --from=builder /app/Data ./Data
 RUN mkdir -p logs
 EXPOSE 8080
 ENV TZ=Asia/Shanghai
