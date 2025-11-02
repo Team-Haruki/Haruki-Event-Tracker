@@ -1,7 +1,9 @@
 package api
 
 import (
+	"context"
 	"fmt"
+	"strconv"
 
 	"haruki-tracker/utils/gorm"
 	"haruki-tracker/utils/model"
@@ -9,17 +11,44 @@ import (
 	"github.com/gofiber/fiber/v2"
 )
 
-// getEngine retrieves the database engine for a server from the global sekaiDBs
-func getEngine(server string) (*gorm.DatabaseEngine, error) {
+type commonParams struct {
+	ctx          context.Context
+	engine       *gorm.DatabaseEngine
+	serverRegion model.SekaiServerRegion
+	eventID      int
+	userID       string
+	rank         int
+	characterID  int
+	interval     int64
+}
+
+func parseCommonParams(c *fiber.Ctx) (*commonParams, error) {
+	server := c.Params("server")
 	serverRegion := model.SekaiServerRegion(server)
 	engine, exists := sekaiDBs[serverRegion]
 	if !exists {
 		return nil, fmt.Errorf("invalid server: %s", server)
 	}
-	return engine, nil
+	eventID, _ := strconv.Atoi(c.Params("event_id"))
+	params := &commonParams{
+		ctx:          context.Background(),
+		engine:       engine,
+		serverRegion: serverRegion,
+		eventID:      eventID,
+		userID:       c.Params("user_id"),
+	}
+	if rank := c.Params("rank"); rank != "" {
+		params.rank, _ = strconv.Atoi(rank)
+	}
+	if characterID := c.Params("character_id"); characterID != "" {
+		params.characterID, _ = strconv.Atoi(characterID)
+	}
+	if interval := c.Params("interval"); interval != "" {
+		params.interval, _ = strconv.ParseInt(interval, 10, 64)
+	}
+	return params, nil
 }
 
-// RegisterRoutes registers all API routes to the Fiber app
 func RegisterRoutes(app *fiber.App) {
 	eventAPI := app.Group("/event/:server/:event_id")
 	eventAPI.Get("/latest-ranking/user/:user_id", GetNormalRankingByUserID)
@@ -37,80 +66,239 @@ func RegisterRoutes(app *fiber.App) {
 	eventAPI.Get("/world-bloom-ranking-score-growth/character/:character_id/interval/:interval", GetWorldBloomRankingScoreGrowths)
 }
 
-// GetNormalRankingByUserID 获取指定活动指定玩家最新排名数据
 func GetNormalRankingByUserID(c *fiber.Ctx) error {
-	// TODO: 待实现
-	return c.Status(501).JSON(fiber.Map{"error": "not implemented"})
+	p, err := parseCommonParams(c)
+	if err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
+	}
+	ranking, err := gorm.FetchLatestRanking(p.ctx, p.engine, p.serverRegion, p.eventID, p.userID)
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": err.Error()})
+	}
+	userData, _ := gorm.GetUserData(p.ctx, p.engine, p.serverRegion, p.eventID, p.userID)
+	if ranking == nil && userData == nil {
+		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "not found"})
+	}
+	return c.JSON(model.UserLatestRankingQueryResponseSchema{
+		RankData: ranking,
+		UserData: userData,
+	})
 }
 
-// GetNormalRankingByRank 获取指定活动指定排名最新排名数据
 func GetNormalRankingByRank(c *fiber.Ctx) error {
-	// TODO: 待实现
-	return c.Status(501).JSON(fiber.Map{"error": "not implemented"})
+	p, err := parseCommonParams(c)
+	if err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
+	}
+	ranking, err := gorm.FetchLatestRankingByRank(p.ctx, p.engine, p.serverRegion, p.eventID, p.rank)
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": err.Error()})
+	}
+	if ranking == nil {
+		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "not found"})
+	}
+	userData, _ := gorm.GetUserData(p.ctx, p.engine, p.serverRegion, p.eventID, ranking.UserID)
+	return c.JSON(model.UserLatestRankingQueryResponseSchema{
+		RankData: ranking,
+		UserData: userData,
+	})
 }
 
-// GetWorldBloomRankingByUserID 获取指定玩家指定World Link活动指定角色单榜最新排名数据
 func GetWorldBloomRankingByUserID(c *fiber.Ctx) error {
-	// TODO: 待实现
-	return c.Status(501).JSON(fiber.Map{"error": "not implemented"})
+	p, err := parseCommonParams(c)
+	if err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
+	}
+	ranking, err := gorm.FetchLatestWorldBloomRanking(p.ctx, p.engine, p.serverRegion, p.eventID, p.userID, p.characterID)
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": err.Error()})
+	}
+	userData, _ := gorm.GetUserData(p.ctx, p.engine, p.serverRegion, p.eventID, p.userID)
+	if ranking == nil && userData == nil {
+		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "not found"})
+	}
+	return c.JSON(model.UserLatestRankingQueryResponseSchema{
+		RankData: ranking,
+		UserData: userData,
+	})
 }
 
-// GetWorldBloomRankingByRank 获取指定排名指定World Link活动指定角色单榜最新排名数据
 func GetWorldBloomRankingByRank(c *fiber.Ctx) error {
-	// TODO: 待实现
-	return c.Status(501).JSON(fiber.Map{"error": "not implemented"})
+	p, err := parseCommonParams(c)
+	if err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
+	}
+	ranking, err := gorm.FetchLatestWorldBloomRankingByRank(p.ctx, p.engine, p.serverRegion, p.eventID, p.rank, p.characterID)
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": err.Error()})
+	}
+	if ranking == nil {
+		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "not found"})
+	}
+	userData, _ := gorm.GetUserData(p.ctx, p.engine, p.serverRegion, p.eventID, ranking.UserID)
+	return c.JSON(model.UserLatestRankingQueryResponseSchema{
+		RankData: ranking,
+		UserData: userData,
+	})
 }
 
-// GetAllNormalRankingByUserID 获取指定活动指定玩家的所有已记录的排名数据
 func GetAllNormalRankingByUserID(c *fiber.Ctx) error {
-	// TODO: 待实现
-	return c.Status(501).JSON(fiber.Map{"error": "not implemented"})
+	p, err := parseCommonParams(c)
+	if err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
+	}
+	rankings, err := gorm.FetchAllRankings(p.ctx, p.engine, p.serverRegion, p.eventID, p.userID)
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": err.Error()})
+	}
+	userData, _ := gorm.GetUserData(p.ctx, p.engine, p.serverRegion, p.eventID, p.userID)
+	if len(rankings) == 0 && userData == nil {
+		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "not found"})
+	}
+	rankData := make([]interface{}, len(rankings))
+	for i, r := range rankings {
+		rankData[i] = r
+	}
+	return c.JSON(model.UserAllRankingDataQueryResponseSchema{
+		RankData: rankData,
+		UserData: userData,
+	})
 }
 
-// GetAllNormalRankingByRank 获取指定活动指定排名的所有已记录的排名数据
 func GetAllNormalRankingByRank(c *fiber.Ctx) error {
-	// TODO: 待实现
-	return c.Status(501).JSON(fiber.Map{"error": "not implemented"})
+	p, err := parseCommonParams(c)
+	if err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
+	}
+	rankings, err := gorm.FetchAllRankingsByRank(p.ctx, p.engine, p.serverRegion, p.eventID, p.rank)
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": err.Error()})
+	}
+	if len(rankings) == 0 {
+		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "not found"})
+	}
+	rankData := make([]interface{}, len(rankings))
+	for i, r := range rankings {
+		rankData[i] = r
+	}
+	return c.JSON(model.UserAllRankingDataQueryResponseSchema{
+		RankData: rankData,
+		UserData: nil,
+	})
 }
 
-// GetAllWorldBloomRankingByUserID 获取指定玩家指定World Link活动指定角色单榜的所有已记录的排名数据
 func GetAllWorldBloomRankingByUserID(c *fiber.Ctx) error {
-	// TODO: 待实现
-	return c.Status(501).JSON(fiber.Map{"error": "not implemented"})
+	p, err := parseCommonParams(c)
+	if err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
+	}
+	rankings, err := gorm.FetchAllWorldBloomRankings(p.ctx, p.engine, p.serverRegion, p.eventID, p.userID, p.characterID)
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": err.Error()})
+	}
+	userData, _ := gorm.GetUserData(p.ctx, p.engine, p.serverRegion, p.eventID, p.userID)
+	if len(rankings) == 0 && userData == nil {
+		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "not found"})
+	}
+	rankData := make([]interface{}, len(rankings))
+	for i, r := range rankings {
+		rankData[i] = r
+	}
+	return c.JSON(model.UserAllRankingDataQueryResponseSchema{
+		RankData: rankData,
+		UserData: userData,
+	})
 }
 
-// GetAllWorldBloomRankingByRank 获取指定排名指定World Link活动指定角色单榜的所有已记录的排名数据
 func GetAllWorldBloomRankingByRank(c *fiber.Ctx) error {
-	// TODO: 待实现
-	return c.Status(501).JSON(fiber.Map{"error": "not implemented"})
+	p, err := parseCommonParams(c)
+	if err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
+	}
+	rankings, err := gorm.FetchAllWorldBloomRankingsByRank(p.ctx, p.engine, p.serverRegion, p.eventID, p.rank, p.characterID)
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": err.Error()})
+	}
+	if len(rankings) == 0 {
+		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "not found"})
+	}
+	rankData := make([]interface{}, len(rankings))
+	for i, r := range rankings {
+		rankData[i] = r
+	}
+	return c.JSON(model.UserAllRankingDataQueryResponseSchema{
+		RankData: rankData,
+		UserData: nil,
+	})
 }
 
-// GetUserDataByUserID 获取指定用户的基础信息
 func GetUserDataByUserID(c *fiber.Ctx) error {
-	// TODO: 待实现
-	return c.Status(501).JSON(fiber.Map{"error": "not implemented"})
+	p, err := parseCommonParams(c)
+	if err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
+	}
+	userData, err := gorm.GetUserData(p.ctx, p.engine, p.serverRegion, p.eventID, p.userID)
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": err.Error()})
+	}
+	if userData == nil {
+		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "not found"})
+	}
+	return c.JSON(userData)
 }
 
-// GetRankingLines 获取指定活动最新分数线
 func GetRankingLines(c *fiber.Ctx) error {
-	// TODO: 待实现
-	return c.Status(501).JSON(fiber.Map{"error": "not implemented"})
+	p, err := parseCommonParams(c)
+	if err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
+	}
+
+	result, err := gorm.FetchRankingLines(p.ctx, p.engine, p.serverRegion, p.eventID, model.SekaiEventRankingLinesNormal)
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": err.Error()})
+	}
+
+	return c.JSON(result)
 }
 
-// GetRankingScoreGrowths 获取指定活动排名的分数增长速度
 func GetRankingScoreGrowths(c *fiber.Ctx) error {
-	// TODO: 待实现
-	return c.Status(501).JSON(fiber.Map{"error": "not implemented"})
+	p, err := parseCommonParams(c)
+	if err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
+	}
+	currentTime := c.Context().Time().Unix()
+	startTime := currentTime - p.interval
+	result, err := gorm.FetchRankingScoreGrowths(p.ctx, p.engine, p.serverRegion, p.eventID, model.SekaiEventRankingLinesNormal, startTime)
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": err.Error()})
+	}
+	return c.JSON(result)
 }
 
-// GetWorldBloomRankingLines 获取指定World Link活动指定角色单榜排名最新分数线
 func GetWorldBloomRankingLines(c *fiber.Ctx) error {
-	// TODO: 待实现
-	return c.Status(501).JSON(fiber.Map{"error": "not implemented"})
+	p, err := parseCommonParams(c)
+	if err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
+	}
+
+	result, err := gorm.FetchWorldBloomRankingLines(p.ctx, p.engine, p.serverRegion, p.eventID, p.characterID, model.SekaiEventRankingLinesWorldBloom)
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": err.Error()})
+	}
+
+	return c.JSON(result)
 }
 
-// GetWorldBloomRankingScoreGrowths 获取指定World Link活动指定角色单榜排名的分数增长速度
 func GetWorldBloomRankingScoreGrowths(c *fiber.Ctx) error {
-	// TODO: 待实现
-	return c.Status(501).JSON(fiber.Map{"error": "not implemented"})
+	p, err := parseCommonParams(c)
+	if err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
+	}
+	currentTime := c.Context().Time().Unix()
+	startTime := currentTime - p.interval
+	result, err := gorm.FetchWorldBloomRankingScoreGrowths(p.ctx, p.engine, p.serverRegion, p.eventID, p.characterID, model.SekaiEventRankingLinesWorldBloom, startTime)
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": err.Error()})
+	}
+	return c.JSON(result)
 }

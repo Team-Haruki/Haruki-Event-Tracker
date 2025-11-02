@@ -36,20 +36,27 @@ func FetchLatestRanking(ctx context.Context, engine *DatabaseEngine, server mode
 	timeIDTable := GetTimeIDTableModel(server, eventID)
 	usersTable := GetEventUsersTableModel(server, eventID)
 	var result model.RecordedRankingSchema
+	query := fmt.Sprintf(`SELECT t.timestamp, u.user_id, e.score, e.rank 
+		FROM %s AS e 
+		INNER JOIN %s AS t ON e.time_id = t.time_id 
+		INNER JOIN %s AS u ON e.user_id_key = u.user_id_key 
+		WHERE u.user_id = ? 
+		ORDER BY t.timestamp DESC 
+		LIMIT 1`,
+		engine.db.Statement.Quote(eventTable.TableName()),
+		engine.db.Statement.Quote(timeIDTable.TableName()),
+		engine.db.Statement.Quote(usersTable.TableName()))
 	err := engine.WithContext(ctx).
-		Table(eventTable.TableName()+" AS e").
-		Select("t.timestamp, u.user_id, e.score, e.rank").
-		Joins("INNER JOIN "+timeIDTable.TableName()+" AS t ON e.time_id = t.time_id").
-		Joins("INNER JOIN "+usersTable.TableName()+" AS u ON e.user_id_key = u.user_id_key").
-		Where("u.user_id = ?", userID).
-		Order("t.timestamp DESC").
-		Limit(1).
-		First(&result).Error
+		Raw(query, userID).
+		Scan(&result).Error
 	if err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			return nil, nil
 		}
 		return nil, fmt.Errorf("failed to fetch latest ranking: %w", err)
+	}
+	if result.UserID == "" {
+		return nil, nil
 	}
 	return &result, nil
 }
@@ -59,14 +66,18 @@ func FetchAllRankings(ctx context.Context, engine *DatabaseEngine, server model.
 	timeIDTable := GetTimeIDTableModel(server, eventID)
 	usersTable := GetEventUsersTableModel(server, eventID)
 	var results []*model.RecordedRankingSchema
+	query := fmt.Sprintf(`SELECT t.timestamp, u.user_id, e.score, e.rank 
+		FROM %s AS e 
+		INNER JOIN %s AS t ON e.time_id = t.time_id 
+		INNER JOIN %s AS u ON e.user_id_key = u.user_id_key 
+		WHERE u.user_id = ? 
+		ORDER BY t.timestamp ASC`,
+		engine.db.Statement.Quote(eventTable.TableName()),
+		engine.db.Statement.Quote(timeIDTable.TableName()),
+		engine.db.Statement.Quote(usersTable.TableName()))
 	err := engine.WithContext(ctx).
-		Table(eventTable.TableName()+" AS e").
-		Select("t.timestamp, u.user_id, e.score, e.rank").
-		Joins("INNER JOIN "+timeIDTable.TableName()+" AS t ON e.time_id = t.time_id").
-		Joins("INNER JOIN "+usersTable.TableName()+" AS u ON e.user_id_key = u.user_id_key").
-		Where("u.user_id = ?", userID).
-		Order("t.timestamp ASC").
-		Find(&results).Error
+		Raw(query, userID).
+		Scan(&results).Error
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch all rankings: %w", err)
 	}
@@ -78,20 +89,27 @@ func FetchLatestWorldBloomRanking(ctx context.Context, engine *DatabaseEngine, s
 	timeIDTable := GetTimeIDTableModel(server, eventID)
 	usersTable := GetEventUsersTableModel(server, eventID)
 	var result model.RecordedWorldBloomRankingSchema
+	query := fmt.Sprintf(`SELECT t.timestamp, u.user_id, w.score, w.rank, w.character_id 
+		FROM %s AS w 
+		INNER JOIN %s AS t ON w.time_id = t.time_id 
+		INNER JOIN %s AS u ON w.user_id_key = u.user_id_key 
+		WHERE u.user_id = ? AND w.character_id = ? 
+		ORDER BY t.timestamp DESC 
+		LIMIT 1`,
+		engine.db.Statement.Quote(wlTable.TableName()),
+		engine.db.Statement.Quote(timeIDTable.TableName()),
+		engine.db.Statement.Quote(usersTable.TableName()))
 	err := engine.WithContext(ctx).
-		Table(wlTable.TableName()+" AS w").
-		Select("t.timestamp, u.user_id, w.score, w.rank, w.character_id").
-		Joins("INNER JOIN "+timeIDTable.TableName()+" AS t ON w.time_id = t.time_id").
-		Joins("INNER JOIN "+usersTable.TableName()+" AS u ON w.user_id_key = u.user_id_key").
-		Where("u.user_id = ? AND w.character_id = ?", userID, characterID).
-		Order("t.timestamp DESC").
-		Limit(1).
-		First(&result).Error
+		Raw(query, userID, characterID).
+		Scan(&result).Error
 	if err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			return nil, nil
 		}
 		return nil, fmt.Errorf("failed to fetch latest world bloom ranking: %w", err)
+	}
+	if result.UserID == "" {
+		return nil, nil
 	}
 	return &result, nil
 }
@@ -101,129 +119,266 @@ func FetchAllWorldBloomRankings(ctx context.Context, engine *DatabaseEngine, ser
 	timeIDTable := GetTimeIDTableModel(server, eventID)
 	usersTable := GetEventUsersTableModel(server, eventID)
 	var results []*model.RecordedWorldBloomRankingSchema
+	query := fmt.Sprintf(`SELECT t.timestamp, u.user_id, w.score, w.rank, w.character_id 
+		FROM %s AS w 
+		INNER JOIN %s AS t ON w.time_id = t.time_id 
+		INNER JOIN %s AS u ON w.user_id_key = u.user_id_key 
+		WHERE u.user_id = ? AND w.character_id = ? 
+		ORDER BY t.timestamp ASC`,
+		engine.db.Statement.Quote(wlTable.TableName()),
+		engine.db.Statement.Quote(timeIDTable.TableName()),
+		engine.db.Statement.Quote(usersTable.TableName()))
 	err := engine.WithContext(ctx).
-		Table(wlTable.TableName()+" AS w").
-		Select("t.timestamp, u.user_id, w.score, w.rank, w.character_id").
-		Joins("INNER JOIN "+timeIDTable.TableName()+" AS t ON w.time_id = t.time_id").
-		Joins("INNER JOIN "+usersTable.TableName()+" AS u ON w.user_id_key = u.user_id_key").
-		Where("u.user_id = ? AND w.character_id = ?", userID, characterID).
-		Order("t.timestamp ASC").
-		Find(&results).Error
+		Raw(query, userID, characterID).
+		Scan(&results).Error
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch all world bloom rankings: %w", err)
 	}
 	return results, nil
 }
 
-func GetOrCreateTimeID(ctx context.Context, engine *DatabaseEngine, server model.SekaiServerRegion, eventID int, timestamp int64) (int, error) {
-	timeIDTable := GetTimeIDTableModel(server, eventID)
-	var result TimeIDTable
-	err := engine.WithContext(ctx).
-		Table(timeIDTable.TableName()).
-		Where("timestamp = ?", timestamp).
-		First(&result).Error
-	if err == nil {
-		return result.TimeID, nil
-	}
-	if !errors.Is(err, gorm.ErrRecordNotFound) {
-		return 0, fmt.Errorf("failed to query time_id: %w", err)
-	}
-	newRecord := &TimeIDTable{Timestamp: timestamp}
-	err = engine.WithContext(ctx).
-		Table(timeIDTable.TableName()).
-		Create(newRecord).Error
-	if err != nil {
-		return 0, fmt.Errorf("failed to create time_id: %w", err)
-	}
-	return newRecord.TimeID, nil
-}
-
-func GetOrCreateUserIDKey(ctx context.Context, engine *DatabaseEngine, server model.SekaiServerRegion, eventID int, userID string, name string, cheerfulTeamID *int) (int, error) {
-	usersTable := GetEventUsersTableModel(server, eventID)
-	var result EventUsersTable
-	err := engine.WithContext(ctx).
-		Table(usersTable.TableName()).
-		Where("user_id = ?", userID).
-		First(&result).Error
-	if err == nil {
-		if result.Name != name || (cheerfulTeamID != nil && (result.CheerfulTeamID == nil || *result.CheerfulTeamID != *cheerfulTeamID)) {
-			result.Name = name
-			result.CheerfulTeamID = cheerfulTeamID
-			err = engine.WithContext(ctx).
-				Table(usersTable.TableName()).
-				Save(&result).Error
-			if err != nil {
-				return 0, fmt.Errorf("failed to update user: %w", err)
-			}
-		}
-		return result.UserIDKey, nil
-	}
-	if !errors.Is(err, gorm.ErrRecordNotFound) {
-		return 0, fmt.Errorf("failed to query user_id_key: %w", err)
-	}
-	newRecord := &EventUsersTable{
-		UserID:         userID,
-		Name:           name,
-		CheerfulTeamID: cheerfulTeamID,
-	}
-	err = engine.WithContext(ctx).
-		Table(usersTable.TableName()).
-		Create(newRecord).Error
-	if err != nil {
-		return 0, fmt.Errorf("failed to create user: %w", err)
-	}
-	return newRecord.UserIDKey, nil
-}
-
-func InsertEventRanking(ctx context.Context, engine *DatabaseEngine, server model.SekaiServerRegion, eventID int, timestamp int64, userID string, name string, score int, rank int, cheerfulTeamID *int) error {
-	timeID, err := GetOrCreateTimeID(ctx, engine, server, eventID, timestamp)
-	if err != nil {
-		return err
-	}
-	userIDKey, err := GetOrCreateUserIDKey(ctx, engine, server, eventID, userID, name, cheerfulTeamID)
-	if err != nil {
-		return err
-	}
+func FetchLatestRankingByRank(ctx context.Context, engine *DatabaseEngine, server model.SekaiServerRegion, eventID int, rank int) (*model.RecordedRankingSchema, error) {
 	eventTable := GetEventTableModel(server, eventID)
-	record := &EventTable{
-		TimeID:    timeID,
-		UserIDKey: userIDKey,
-		Score:     score,
-		Rank:      rank,
-	}
-	err = engine.WithContext(ctx).
-		Table(eventTable.TableName()).
-		Create(record).Error
+	timeIDTable := GetTimeIDTableModel(server, eventID)
+	usersTable := GetEventUsersTableModel(server, eventID)
+	var result model.RecordedRankingSchema
+	query := fmt.Sprintf(`SELECT t.timestamp, u.user_id, e.score, e.rank 
+		FROM %s AS e 
+		INNER JOIN %s AS t ON e.time_id = t.time_id 
+		INNER JOIN %s AS u ON e.user_id_key = u.user_id_key 
+		WHERE e.rank = ? 
+		ORDER BY t.timestamp DESC 
+		LIMIT 1`,
+		engine.db.Statement.Quote(eventTable.TableName()),
+		engine.db.Statement.Quote(timeIDTable.TableName()),
+		engine.db.Statement.Quote(usersTable.TableName()))
+	err := engine.WithContext(ctx).
+		Raw(query, rank).
+		Scan(&result).Error
 	if err != nil {
-		return fmt.Errorf("failed to insert event ranking: %w", err)
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("failed to fetch latest ranking by rank: %w", err)
 	}
-	return nil
+	if result.UserID == "" {
+		return nil, nil
+	}
+	return &result, nil
 }
 
-func InsertWorldBloomRanking(ctx context.Context, engine *DatabaseEngine, server model.SekaiServerRegion, eventID int, timestamp int64, userID string, name string, characterID int, score int, rank int, cheerfulTeamID *int) error {
-	timeID, err := GetOrCreateTimeID(ctx, engine, server, eventID, timestamp)
+func FetchAllRankingsByRank(ctx context.Context, engine *DatabaseEngine, server model.SekaiServerRegion, eventID int, rank int) ([]*model.RecordedRankingSchema, error) {
+	eventTable := GetEventTableModel(server, eventID)
+	timeIDTable := GetTimeIDTableModel(server, eventID)
+	usersTable := GetEventUsersTableModel(server, eventID)
+	var results []*model.RecordedRankingSchema
+	query := fmt.Sprintf(`SELECT t.timestamp, u.user_id, e.score, e.rank 
+		FROM %s AS e 
+		INNER JOIN %s AS t ON e.time_id = t.time_id 
+		INNER JOIN %s AS u ON e.user_id_key = u.user_id_key 
+		WHERE e.rank = ? 
+		ORDER BY t.timestamp ASC`,
+		engine.db.Statement.Quote(eventTable.TableName()),
+		engine.db.Statement.Quote(timeIDTable.TableName()),
+		engine.db.Statement.Quote(usersTable.TableName()))
+	err := engine.WithContext(ctx).
+		Raw(query, rank).
+		Scan(&results).Error
 	if err != nil {
-		return err
+		return nil, fmt.Errorf("failed to fetch all rankings by rank: %w", err)
 	}
-	userIDKey, err := GetOrCreateUserIDKey(ctx, engine, server, eventID, userID, name, cheerfulTeamID)
-	if err != nil {
-		return err
-	}
+	return results, nil
+}
+
+func FetchLatestWorldBloomRankingByRank(ctx context.Context, engine *DatabaseEngine, server model.SekaiServerRegion, eventID int, rank int, characterID int) (*model.RecordedWorldBloomRankingSchema, error) {
 	wlTable := GetWorldBloomTableModel(server, eventID)
-	record := &WorldBloomTable{
-		TimeID:      timeID,
-		UserIDKey:   userIDKey,
-		CharacterID: characterID,
-		Score:       score,
-		Rank:        rank,
-	}
-	err = engine.WithContext(ctx).
-		Table(wlTable.TableName()).
-		Create(record).Error
+	timeIDTable := GetTimeIDTableModel(server, eventID)
+	usersTable := GetEventUsersTableModel(server, eventID)
+	var result model.RecordedWorldBloomRankingSchema
+	query := fmt.Sprintf(`SELECT t.timestamp, u.user_id, w.score, w.rank, w.character_id 
+		FROM %s AS w 
+		INNER JOIN %s AS t ON w.time_id = t.time_id 
+		INNER JOIN %s AS u ON w.user_id_key = u.user_id_key 
+		WHERE w.rank = ? AND w.character_id = ? 
+		ORDER BY t.timestamp DESC 
+		LIMIT 1`,
+		engine.db.Statement.Quote(wlTable.TableName()),
+		engine.db.Statement.Quote(timeIDTable.TableName()),
+		engine.db.Statement.Quote(usersTable.TableName()))
+	err := engine.WithContext(ctx).
+		Raw(query, rank, characterID).
+		Scan(&result).Error
 	if err != nil {
-		return fmt.Errorf("failed to insert world bloom ranking: %w", err)
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("failed to fetch latest world bloom ranking by rank: %w", err)
 	}
-	return nil
+	if result.UserID == "" {
+		return nil, nil
+	}
+	return &result, nil
+}
+
+func FetchAllWorldBloomRankingsByRank(ctx context.Context, engine *DatabaseEngine, server model.SekaiServerRegion, eventID int, rank int, characterID int) ([]*model.RecordedWorldBloomRankingSchema, error) {
+	wlTable := GetWorldBloomTableModel(server, eventID)
+	timeIDTable := GetTimeIDTableModel(server, eventID)
+	usersTable := GetEventUsersTableModel(server, eventID)
+	var results []*model.RecordedWorldBloomRankingSchema
+	query := fmt.Sprintf(`SELECT t.timestamp, u.user_id, w.score, w.rank, w.character_id 
+		FROM %s AS w 
+		INNER JOIN %s AS t ON w.time_id = t.time_id 
+		INNER JOIN %s AS u ON w.user_id_key = u.user_id_key 
+		WHERE w.rank = ? AND w.character_id = ? 
+		ORDER BY t.timestamp ASC`,
+		engine.db.Statement.Quote(wlTable.TableName()),
+		engine.db.Statement.Quote(timeIDTable.TableName()),
+		engine.db.Statement.Quote(usersTable.TableName()))
+	err := engine.WithContext(ctx).
+		Raw(query, rank, characterID).
+		Scan(&results).Error
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch all world bloom rankings by rank: %w", err)
+	}
+	return results, nil
+}
+
+func FetchRankingLines(ctx context.Context, engine *DatabaseEngine, server model.SekaiServerRegion, eventID int, ranks []int) ([]*model.RankingLineScoreSchema, error) {
+	eventTable := GetEventTableModel(server, eventID)
+	timeIDTable := GetTimeIDTableModel(server, eventID)
+	result := make([]*model.RankingLineScoreSchema, 0)
+	query := fmt.Sprintf(`SELECT t.timestamp, e.score, e.rank 
+		FROM %s AS e 
+		INNER JOIN %s AS t ON e.time_id = t.time_id 
+		WHERE e.rank = ? 
+		ORDER BY t.timestamp DESC 
+		LIMIT 1`,
+		engine.db.Statement.Quote(eventTable.TableName()),
+		engine.db.Statement.Quote(timeIDTable.TableName()))
+	for _, rank := range ranks {
+		var record struct {
+			Timestamp int64
+			Score     int
+			Rank      int
+		}
+		err := engine.WithContext(ctx).
+			Raw(query, rank).
+			Scan(&record).Error
+		if err == nil && record.Rank > 0 {
+			result = append(result, &model.RankingLineScoreSchema{
+				Rank:      record.Rank,
+				Score:     record.Score,
+				Timestamp: record.Timestamp,
+			})
+		}
+	}
+	return result, nil
+}
+
+func FetchRankingScoreGrowths(ctx context.Context, engine *DatabaseEngine, server model.SekaiServerRegion, eventID int, ranks []int, startTime int64) ([]*model.RankingScoreGrowthSchema, error) {
+	eventTable := GetEventTableModel(server, eventID)
+	timeIDTable := GetTimeIDTableModel(server, eventID)
+	result := make([]*model.RankingScoreGrowthSchema, 0)
+	query := fmt.Sprintf(`SELECT t.timestamp, e.score, e.rank 
+		FROM %s AS e 
+		INNER JOIN %s AS t ON e.time_id = t.time_id 
+		WHERE e.rank = ? AND t.timestamp >= ? 
+		ORDER BY t.timestamp ASC`,
+		engine.db.Statement.Quote(eventTable.TableName()),
+		engine.db.Statement.Quote(timeIDTable.TableName()))
+	for _, rank := range ranks {
+		var records []struct {
+			Timestamp int64
+			Score     int
+			Rank      int
+		}
+		err := engine.WithContext(ctx).
+			Raw(query, rank, startTime).
+			Scan(&records).Error
+		if err == nil && len(records) >= 2 {
+			earlier := records[0]
+			latest := records[len(records)-1]
+			growth := latest.Score - earlier.Score
+			result = append(result, &model.RankingScoreGrowthSchema{
+				Rank:             rank,
+				TimestampLatest:  latest.Timestamp,
+				ScoreLatest:      latest.Score,
+				TimestampEarlier: &earlier.Timestamp,
+				ScoreEarlier:     &earlier.Score,
+				Growth:           &growth,
+			})
+		}
+	}
+	return result, nil
+}
+
+func FetchWorldBloomRankingLines(ctx context.Context, engine *DatabaseEngine, server model.SekaiServerRegion, eventID int, characterID int, ranks []int) ([]*model.RankingLineScoreSchema, error) {
+	wlTable := GetWorldBloomTableModel(server, eventID)
+	timeIDTable := GetTimeIDTableModel(server, eventID)
+	result := make([]*model.RankingLineScoreSchema, 0)
+	query := fmt.Sprintf(`SELECT t.timestamp, w.score, w.rank 
+		FROM %s AS w 
+		INNER JOIN %s AS t ON w.time_id = t.time_id 
+		WHERE w.rank = ? AND w.character_id = ? 
+		ORDER BY t.timestamp DESC 
+		LIMIT 1`,
+		engine.db.Statement.Quote(wlTable.TableName()),
+		engine.db.Statement.Quote(timeIDTable.TableName()))
+	for _, rank := range ranks {
+		var record struct {
+			Timestamp int64
+			Score     int
+			Rank      int
+		}
+		err := engine.WithContext(ctx).
+			Raw(query, rank, characterID).
+			Scan(&record).Error
+		if err == nil && record.Rank > 0 {
+			result = append(result, &model.RankingLineScoreSchema{
+				Rank:      record.Rank,
+				Score:     record.Score,
+				Timestamp: record.Timestamp,
+			})
+		}
+	}
+	return result, nil
+}
+
+func FetchWorldBloomRankingScoreGrowths(ctx context.Context, engine *DatabaseEngine, server model.SekaiServerRegion, eventID int, characterID int, ranks []int, startTime int64) ([]*model.RankingScoreGrowthSchema, error) {
+	wlTable := GetWorldBloomTableModel(server, eventID)
+	timeIDTable := GetTimeIDTableModel(server, eventID)
+	result := make([]*model.RankingScoreGrowthSchema, 0)
+	query := fmt.Sprintf(`SELECT t.timestamp, w.score, w.rank 
+		FROM %s AS w 
+		INNER JOIN %s AS t ON w.time_id = t.time_id 
+		WHERE w.rank = ? AND w.character_id = ? AND t.timestamp >= ? 
+		ORDER BY t.timestamp ASC`,
+		engine.db.Statement.Quote(wlTable.TableName()),
+		engine.db.Statement.Quote(timeIDTable.TableName()))
+	for _, rank := range ranks {
+		var records []struct {
+			Timestamp int64
+			Score     int
+			Rank      int
+		}
+		err := engine.WithContext(ctx).
+			Raw(query, rank, characterID, startTime).
+			Scan(&records).Error
+		if err == nil && len(records) >= 2 {
+			earlier := records[0]
+			latest := records[len(records)-1]
+			growth := latest.Score - earlier.Score
+			result = append(result, &model.RankingScoreGrowthSchema{
+				Rank:             rank,
+				TimestampLatest:  latest.Timestamp,
+				ScoreLatest:      latest.Score,
+				TimestampEarlier: &earlier.Timestamp,
+				ScoreEarlier:     &earlier.Score,
+				Growth:           &growth,
+			})
+		}
+	}
+	return result, nil
 }
 
 func batchGetOrCreateTimeIDs(tx *gorm.DB, timeIDTable *DynamicTimeIDTable, timestamps map[int64]bool) (map[int64]int, error) {
