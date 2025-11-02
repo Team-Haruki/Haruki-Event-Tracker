@@ -12,7 +12,6 @@ var Version = "2.0.0-dev"
 var Cfg Config
 
 type RedisConfig struct {
-	Enabled  bool   `yaml:"enabled"`
 	Host     string `yaml:"host"`
 	Port     int    `yaml:"port"`
 	Password string `yaml:"password"`

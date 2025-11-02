@@ -13,7 +13,6 @@ type GormNamingConfig struct {
 }
 
 type GormConfig struct {
-	Enabled                                  bool             `yaml:"enabled"`
 	Dialect                                  string           `yaml:"dialect"`
 	DSN                                      string           `yaml:"dsn"`
 	MaxOpenConns                             int              `yaml:"max_open_conns,omitempty"`

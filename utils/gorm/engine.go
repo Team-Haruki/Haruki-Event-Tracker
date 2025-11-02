@@ -23,10 +23,6 @@ type DatabaseEngine struct {
 }
 
 func NewDatabaseEngine(cfg model.GormConfig) (*DatabaseEngine, error) {
-	if !cfg.Enabled {
-		return nil, fmt.Errorf("database is disabled in configuration")
-	}
-
 	var dialector gorm.Dialector
 	switch strings.ToLower(cfg.Dialect) {
 	case "mysql":

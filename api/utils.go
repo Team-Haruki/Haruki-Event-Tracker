@@ -27,21 +27,19 @@ func InitAPIUtils(cfg config.Config) error {
 	var err error
 	sekaiAPIUtilsLogger = logger.NewLogger("HarukiTrackerAPIUtils", cfg.Backend.LogLevel, nil)
 	sekaiAPIUtilsLogger.Infof("Initializing Haruki Event Tracker API...")
-	if cfg.Redis.Enabled {
-		sekaiAPIUtilsLogger.Infof("Initializing Redis client...")
-		sekaiRedis = redis.NewClient(&redis.Options{
-			Addr:     fmt.Sprintf("%s:%d", cfg.Redis.Host, cfg.Redis.Port),
-			Password: cfg.Redis.Password,
-			DB:       0,
-		})
-		ctx := context.Background()
-		if err := sekaiRedis.Ping(ctx).Err(); err != nil {
-			return fmt.Errorf("failed to connect to Redis: %w", err)
-		}
-		sekaiAPIUtilsLogger.Infof("Redis client initialized successfully")
-	} else {
-		sekaiAPIUtilsLogger.Warnf("Redis is disabled in configuration")
+
+	sekaiAPIUtilsLogger.Infof("Initializing Redis client...")
+	sekaiRedis = redis.NewClient(&redis.Options{
+		Addr:     fmt.Sprintf("%s:%d", cfg.Redis.Host, cfg.Redis.Port),
+		Password: cfg.Redis.Password,
+		DB:       0,
+	})
+	ctx := context.Background()
+	if err := sekaiRedis.Ping(ctx).Err(); err != nil {
+		return fmt.Errorf("failed to connect to Redis: %w", err)
 	}
+	sekaiAPIUtilsLogger.Infof("Redis client initialized successfully")
+
 	sekaiAPIUtilsLogger.Infof("Initializing Sekai API client...")
 	sekaiAPIClient = tracker.NewHarukiSekaiAPIClient(cfg.SekaiAPI.APIEndpoint, cfg.SekaiAPI.APIToken)
 	sekaiDBs = make(map[model.SekaiServerRegion]*gorm.DatabaseEngine)
@@ -59,18 +57,14 @@ func InitAPIUtils(cfg config.Config) error {
 			continue
 		}
 		sekaiAPIUtilsLogger.Infof("Initializing server: %s", server)
-		if serverCfg.GormConfig.Enabled {
-			sekaiAPIUtilsLogger.Infof("Creating database engine for %s...", server)
-			engine, err := gorm.NewDatabaseEngine(serverCfg.GormConfig)
-			if err != nil {
-				return fmt.Errorf("failed to create database engine for %s: %w", server, err)
-			}
-			sekaiDBs[server] = engine
-			sekaiAPIUtilsLogger.Infof("Database engine for %s initialized successfully", server)
-		} else {
-			sekaiAPIUtilsLogger.Warnf("Database is disabled for server %s", server)
-			continue
+		sekaiAPIUtilsLogger.Infof("Creating database engine for %s...", server)
+		engine, err := gorm.NewDatabaseEngine(serverCfg.GormConfig)
+		if err != nil {
+			return fmt.Errorf("failed to create database engine for %s: %w", server, err)
 		}
+		sekaiDBs[server] = engine
+		sekaiAPIUtilsLogger.Infof("Database engine for %s initialized successfully", server)
+
 		sekaiAPIUtilsLogger.Infof("Creating event tracker daemon for %s...", server)
 		trackerDaemon := tracker.NewHarukiEventTracker(
 			server,
