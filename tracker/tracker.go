@@ -53,69 +53,109 @@ func (t *HarukiEventTracker) Init() error {
 	return nil
 }
 
+func (t *HarukiEventTracker) handleEventEnded(ctx context.Context, event *model.EventStatus) bool {
+	if event.EventStatus != model.SekaiEventStatusEnded || t.tracker.IsEventEnded() {
+		return false
+	}
+
+	t.logger.Infof("Event %d has ended, finalizing tracking...", event.EventID)
+	err := t.tracker.RecordRankingData(ctx, false)
+	if err != nil {
+		t.logger.Errorf("Failed to record final ranking data for event %d: %v", event.EventID, err)
+	}
+	t.tracker.SetEventEnded(true)
+	return true
+}
+
+func (t *HarukiEventTracker) handleWorldBloomChapter(ctx context.Context, event *model.EventStatus, characterID int, detail model.WorldBloomChapterStatus) bool {
+	switch detail.ChapterStatus {
+	case model.SekaiEventStatusNotStarted:
+		return false
+	case model.SekaiEventStatusAggregating:
+		t.logger.Infof("World bloom event %d chapter %d is in aggregating, skipping tracking...", event.EventID, characterID)
+		return false
+	case model.SekaiEventStatusEnded:
+		if t.tracker.IsWorldBloomChapterEnded(characterID) {
+			return false
+		}
+		t.logger.Infof("World bloom event %d chapter %d has ended, finalizing tracking...", event.EventID, characterID)
+		if err := t.tracker.RecordRankingData(ctx, true); err != nil {
+			t.logger.Errorf("Failed to record world bloom final ranking data for event %d chapter %d: %v", event.EventID, characterID, err)
+		}
+		t.tracker.SetWorldBloomChapterEnded(characterID, true)
+		return true
+	default:
+		return false
+	}
+}
+
+func (t *HarukiEventTracker) handleWorldBloom(ctx context.Context, event *model.EventStatus) {
+	if !worldBloomStatusesEqual(t.tracker.GetWorldBloomChapterStatus(), event.ChapterStatuses) {
+		t.tracker.SetWorldBloomChapterStatus(event.ChapterStatuses)
+	}
+
+	for characterID, detail := range event.ChapterStatuses {
+		if t.handleWorldBloomChapter(ctx, event, characterID, detail) {
+			break
+		}
+	}
+}
+
+func (t *HarukiEventTracker) handleTrackerMatch(ctx context.Context, event *model.EventStatus) bool {
+	if t.tracker.IsEventEnded() {
+		t.logger.Infof("Event %d has already ended, skipping tracking...", event.EventID)
+		return true
+	}
+
+	if event.EventStatus == model.SekaiEventStatusAggregating {
+		t.logger.Infof("Event %d is in aggregating, skipping tracking...", event.EventID)
+		return true
+	}
+
+	if t.handleEventEnded(ctx, event) {
+		return true
+	}
+
+	if event.EventType == model.SekaiEventTypeWorldBloom {
+		t.handleWorldBloom(ctx, event)
+	}
+
+	return false
+}
+
 func (t *HarukiEventTracker) TrackRankingData() {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
+
 	event, err := t.dataParser.GetCurrentEventStatus()
 	if err != nil {
 		t.logger.Errorf("Failed to get current event status: %v", err)
 		return
 	}
+
 	if event == nil {
 		t.logger.Infof("No active event found, skipping tracking...")
 		return
-	} else if t.tracker == nil {
+	}
+
+	if t.tracker == nil {
 		t.logger.Infof("Initializing tracker for event %d...", event.EventID)
-		err = t.Init()
-		if err != nil {
+		if err = t.Init(); err != nil {
 			t.logger.Errorf("Failed to initialize tracker: %v", err)
 			return
 		}
-	} else if t.tracker != nil && t.tracker.GetEventID() < event.EventID {
+	} else if t.tracker.GetEventID() < event.EventID {
 		t.logger.Infof("Tracker daemon detected new event %d, switching tracker...", event.EventID)
-		err = t.Init()
-		if err != nil {
+		if err = t.Init(); err != nil {
 			t.logger.Errorf("Failed to initialize tracker for new event %d: %v", event.EventID, err)
 			return
 		}
-	} else if t.tracker != nil && t.tracker.GetEventID() == event.EventID {
-		if t.tracker.IsEventEnded() {
-			t.logger.Infof("Event %d has already ended, skipping tracking...", event.EventID)
+	} else if t.tracker.GetEventID() == event.EventID {
+		if t.handleTrackerMatch(ctx, event) {
 			return
-		} else if event.EventStatus == model.SekaiEventStatusAggregating {
-			t.logger.Infof("Event %d is in aggregating, skipping tracking...", event.EventID)
-			return
-		} else if event.EventStatus == model.SekaiEventStatusEnded && !t.tracker.IsEventEnded() {
-			t.logger.Infof("Event %d has ended, finalizing tracking...", event.EventID)
-			err = t.tracker.RecordRankingData(ctx, false)
-			if err != nil {
-				t.logger.Errorf("Failed to record final ranking data for event %d: %v", event.EventID, err)
-			}
-			t.tracker.SetEventEnded(true)
-			return
-		} else if event.EventType == model.SekaiEventTypeWorldBloom {
-			if !worldBloomStatusesEqual(t.tracker.GetWorldBloomChapterStatus(), event.ChapterStatuses) {
-				t.tracker.SetWorldBloomChapterStatus(event.ChapterStatuses)
-			}
-			if len(event.ChapterStatuses) > 0 {
-				for characterID, detail := range event.ChapterStatuses {
-					if detail.ChapterStatus == model.SekaiEventStatusNotStarted {
-						continue
-					} else if detail.ChapterStatus == model.SekaiEventStatusAggregating {
-						t.logger.Infof("World bloom event %d chapter %d is in aggregating, skipping tracking...", event.EventID, characterID)
-						continue
-					} else if detail.ChapterStatus == model.SekaiEventStatusEnded && t.tracker.IsWorldBloomChapterEnded(characterID) {
-						continue
-					} else if detail.ChapterStatus == model.SekaiEventStatusEnded && !t.tracker.IsWorldBloomChapterEnded(characterID) {
-						t.logger.Infof("World bloom event %d chapter %d has ended, finalizing tracking...", event.EventID, characterID)
-						err = t.tracker.RecordRankingData(ctx, true)
-						t.tracker.SetWorldBloomChapterEnded(characterID, true)
-						break
-					}
-				}
-			}
 		}
 	}
+
 	t.logger.Infof("Tracker start tracking data for event %d...", event.EventID)
 	err = t.tracker.RecordRankingData(ctx, false)
 	if err != nil {
@@ -123,5 +163,4 @@ func (t *HarukiEventTracker) TrackRankingData() {
 		return
 	}
 	t.logger.Infof("Tracker finished tracking data for event %d.", event.EventID)
-	return
 }

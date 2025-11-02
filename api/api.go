@@ -49,24 +49,7 @@ func parseCommonParams(c *fiber.Ctx) (*commonParams, error) {
 	return params, nil
 }
 
-func RegisterRoutes(app *fiber.App) {
-	eventAPI := app.Group("/event/:server/:event_id")
-	eventAPI.Get("/latest-ranking/user/:user_id", GetNormalRankingByUserID)
-	eventAPI.Get("/latest-ranking/rank/:rank", GetNormalRankingByRank)
-	eventAPI.Get("/latest-world-bloom-ranking/character/:character_id/user/:user_id", GetWorldBloomRankingByUserID)
-	eventAPI.Get("/latest-world-bloom-ranking/character/:character_id/rank/:rank", GetWorldBloomRankingByRank)
-	eventAPI.Get("/trace-ranking/user/:user_id", GetAllNormalRankingByUserID)
-	eventAPI.Get("/trace-ranking/rank/:rank", GetAllNormalRankingByRank)
-	eventAPI.Get("/trace-world-bloom-ranking/character/:character_id/user/:user_id", GetAllWorldBloomRankingByUserID)
-	eventAPI.Get("/trace-world-bloom-ranking/character/:character_id/rank/:rank", GetAllWorldBloomRankingByRank)
-	eventAPI.Get("/user-data/:user_id", GetUserDataByUserID)
-	eventAPI.Get("/ranking-lines", GetRankingLines)
-	eventAPI.Get("/ranking-score-growth/interval/:interval", GetRankingScoreGrowths)
-	eventAPI.Get("/world-bloom-ranking-lines/character/:character_id", GetWorldBloomRankingLines)
-	eventAPI.Get("/world-bloom-ranking-score-growth/character/:character_id/interval/:interval", GetWorldBloomRankingScoreGrowths)
-}
-
-func GetNormalRankingByUserID(c *fiber.Ctx) error {
+func getNormalRankingByUserID(c *fiber.Ctx) error {
 	p, err := parseCommonParams(c)
 	if err != nil {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
@@ -85,7 +68,7 @@ func GetNormalRankingByUserID(c *fiber.Ctx) error {
 	})
 }
 
-func GetNormalRankingByRank(c *fiber.Ctx) error {
+func getNormalRankingByRank(c *fiber.Ctx) error {
 	p, err := parseCommonParams(c)
 	if err != nil {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
@@ -104,7 +87,7 @@ func GetNormalRankingByRank(c *fiber.Ctx) error {
 	})
 }
 
-func GetWorldBloomRankingByUserID(c *fiber.Ctx) error {
+func getWorldBloomRankingByUserID(c *fiber.Ctx) error {
 	p, err := parseCommonParams(c)
 	if err != nil {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
@@ -123,7 +106,7 @@ func GetWorldBloomRankingByUserID(c *fiber.Ctx) error {
 	})
 }
 
-func GetWorldBloomRankingByRank(c *fiber.Ctx) error {
+func getWorldBloomRankingByRank(c *fiber.Ctx) error {
 	p, err := parseCommonParams(c)
 	if err != nil {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
@@ -142,7 +125,7 @@ func GetWorldBloomRankingByRank(c *fiber.Ctx) error {
 	})
 }
 
-func GetAllNormalRankingByUserID(c *fiber.Ctx) error {
+func getAllNormalRankingByUserID(c *fiber.Ctx) error {
 	p, err := parseCommonParams(c)
 	if err != nil {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
@@ -165,7 +148,7 @@ func GetAllNormalRankingByUserID(c *fiber.Ctx) error {
 	})
 }
 
-func GetAllNormalRankingByRank(c *fiber.Ctx) error {
+func getAllNormalRankingByRank(c *fiber.Ctx) error {
 	p, err := parseCommonParams(c)
 	if err != nil {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
@@ -187,7 +170,7 @@ func GetAllNormalRankingByRank(c *fiber.Ctx) error {
 	})
 }
 
-func GetAllWorldBloomRankingByUserID(c *fiber.Ctx) error {
+func getAllWorldBloomRankingByUserID(c *fiber.Ctx) error {
 	p, err := parseCommonParams(c)
 	if err != nil {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
@@ -210,7 +193,7 @@ func GetAllWorldBloomRankingByUserID(c *fiber.Ctx) error {
 	})
 }
 
-func GetAllWorldBloomRankingByRank(c *fiber.Ctx) error {
+func getAllWorldBloomRankingByRank(c *fiber.Ctx) error {
 	p, err := parseCommonParams(c)
 	if err != nil {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
@@ -232,7 +215,7 @@ func GetAllWorldBloomRankingByRank(c *fiber.Ctx) error {
 	})
 }
 
-func GetUserDataByUserID(c *fiber.Ctx) error {
+func getUserDataByUserID(c *fiber.Ctx) error {
 	p, err := parseCommonParams(c)
 	if err != nil {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
@@ -247,7 +230,7 @@ func GetUserDataByUserID(c *fiber.Ctx) error {
 	return c.JSON(userData)
 }
 
-func GetRankingLines(c *fiber.Ctx) error {
+func getRankingLines(c *fiber.Ctx) error {
 	p, err := parseCommonParams(c)
 	if err != nil {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
@@ -261,7 +244,7 @@ func GetRankingLines(c *fiber.Ctx) error {
 	return c.JSON(result)
 }
 
-func GetRankingScoreGrowths(c *fiber.Ctx) error {
+func getRankingScoreGrowths(c *fiber.Ctx) error {
 	p, err := parseCommonParams(c)
 	if err != nil {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
@@ -275,7 +258,7 @@ func GetRankingScoreGrowths(c *fiber.Ctx) error {
 	return c.JSON(result)
 }
 
-func GetWorldBloomRankingLines(c *fiber.Ctx) error {
+func getWorldBloomRankingLines(c *fiber.Ctx) error {
 	p, err := parseCommonParams(c)
 	if err != nil {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
@@ -289,7 +272,7 @@ func GetWorldBloomRankingLines(c *fiber.Ctx) error {
 	return c.JSON(result)
 }
 
-func GetWorldBloomRankingScoreGrowths(c *fiber.Ctx) error {
+func getWorldBloomRankingScoreGrowths(c *fiber.Ctx) error {
 	p, err := parseCommonParams(c)
 	if err != nil {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
@@ -301,4 +284,21 @@ func GetWorldBloomRankingScoreGrowths(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": err.Error()})
 	}
 	return c.JSON(result)
+}
+
+func RegisterRoutes(app *fiber.App) {
+	eventAPI := app.Group("/event/:server/:event_id")
+	eventAPI.Get("/latest-ranking/user/:user_id", getNormalRankingByUserID)
+	eventAPI.Get("/latest-ranking/rank/:rank", getNormalRankingByRank)
+	eventAPI.Get("/latest-world-bloom-ranking/character/:character_id/user/:user_id", getWorldBloomRankingByUserID)
+	eventAPI.Get("/latest-world-bloom-ranking/character/:character_id/rank/:rank", getWorldBloomRankingByRank)
+	eventAPI.Get("/trace-ranking/user/:user_id", getAllNormalRankingByUserID)
+	eventAPI.Get("/trace-ranking/rank/:rank", getAllNormalRankingByRank)
+	eventAPI.Get("/trace-world-bloom-ranking/character/:character_id/user/:user_id", getAllWorldBloomRankingByUserID)
+	eventAPI.Get("/trace-world-bloom-ranking/character/:character_id/rank/:rank", getAllWorldBloomRankingByRank)
+	eventAPI.Get("/user-data/:user_id", getUserDataByUserID)
+	eventAPI.Get("/ranking-lines", getRankingLines)
+	eventAPI.Get("/ranking-score-growth/interval/:interval", getRankingScoreGrowths)
+	eventAPI.Get("/world-bloom-ranking-lines/character/:character_id", getWorldBloomRankingLines)
+	eventAPI.Get("/world-bloom-ranking-score-growth/character/:character_id/interval/:interval", getWorldBloomRankingScoreGrowths)
 }
