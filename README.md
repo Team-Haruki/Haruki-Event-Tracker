@@ -2,42 +2,17 @@
 
 **Haruki Event Tracker** is a companion project for [HarukiBot](https://github.com/Team-Haruki), designed to track and record in-game ranking data and provide query APIs for clients.
 
-
 ## Requirements
-
-+ `MySQL` or `SQLite`
-+ `Redis`
-+ a working instance of [Haruki-Sekai-API](https://github.com/Team-Haruki/Haruki-Sekai-API)
++ `MySQL`, `SQLite`, `PostgreSQL` (Depending on your database choice)
++ `Redis` (For caching borderlines data)
 
 ## How to Use
-
-1. Copy `configs.example.py` to `configs.py` and configure it as needed.
-2. Install [uv](https://github.com/astral-sh/uv) to manage and install project dependencies.
-3. Run the following command to install dependencies:
-   ```bash
-   uv sync
-   ```
-4. (Optional) If you plan to use MySQL via aiomysql, install:
-   ```bash
-   uv add aiomysql
-   ```
-5. (Optional) If you plan to use MySQL via asyncmy, install:
-   ```bash
-   uv add asyncmy
-   ```
-6. (Optional) If you plan to use SQLite via aiosqlite, install:
-   ```bash
-   uv add aiosqlite
-   ```
-7. (Optional) If you're on **Linux/macOS**, it's recommended to install [uvloop](https://github.com/MagicStack/uvloop) for better performance:
-   ```bash
-   uv add uvloop
-   ```
-8. If you need to change the listening address or other server settings, edit the `hypercorn.toml` file. If you have installed uvloop, uncomment the `worker_class` line in `hypercorn.toml` to enable it.
-9. Finally, run the server using:
-   ```bash
-   uv run hypercorn app:app --config hypercorn.toml
-   ```
+1. Go to release page to download `HarukiEventTracker`
+2. Rename `haruki-tracker-configs.example.yaml` to `haruki-tracker-configs.yaml` and then edit it. For more details, see the `haruki-tracker-configs.example.yaml` comments.
+3. Make a new directory or use an exists directory
+4. Put `HarukiEventTracker` and `haruki-tracker-configs.yaml` in the same directory
+5. Open Terminal, and `cd` to the directory
+6. Run `HarukiEventTracker`
 
 ## License
 
