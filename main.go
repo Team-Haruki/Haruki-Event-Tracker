@@ -13,9 +13,10 @@ import (
 	"haruki-tracker/config"
 	harukiLogger "haruki-tracker/utils/logger"
 
-	"github.com/gofiber/fiber/v2"
-	"github.com/gofiber/fiber/v2/middleware/logger"
-	"github.com/gofiber/fiber/v2/middleware/recover"
+	"github.com/bytedance/sonic"
+	"github.com/gofiber/fiber/v3"
+	"github.com/gofiber/fiber/v3/middleware/logger"
+	"github.com/gofiber/fiber/v3/middleware/recover"
 )
 
 func main() {
@@ -45,9 +46,10 @@ func main() {
 	}
 	mainLogger.Infof("API utilities initialized successfully")
 	app := fiber.New(fiber.Config{
-		BodyLimit:             30 * 1024 * 1024, // 30MB
-		DisableStartupMessage: false,
-		ErrorHandler: func(c *fiber.Ctx, err error) error {
+		BodyLimit:   100 * 1024 * 1024,
+		JSONEncoder: sonic.Marshal,
+		JSONDecoder: sonic.Unmarshal,
+		ErrorHandler: func(c fiber.Ctx, err error) error {
 			code := fiber.StatusInternalServerError
 			var e *fiber.Error
 			if errors.As(err, &e) {
@@ -60,7 +62,11 @@ func main() {
 	})
 	app.Use(recover.New())
 	if config.Cfg.Backend.AccessLog != "" {
-		logCfg := logger.Config{Format: config.Cfg.Backend.AccessLog}
+		logCfg := logger.Config{
+			Format:     config.Cfg.Backend.AccessLog,
+			TimeFormat: "2006-01-02 15:04:05",
+			TimeZone:   "Asia/Shanghai",
+		}
 		if config.Cfg.Backend.AccessLogPath != "" {
 			accessLogFile, err := os.OpenFile(config.Cfg.Backend.AccessLogPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 			if err != nil {
@@ -70,7 +76,7 @@ func main() {
 			defer func(accessLogFile *os.File) {
 				_ = accessLogFile.Close()
 			}(accessLogFile)
-			logCfg.Output = accessLogFile
+			logCfg.Stream = io.MultiWriter(accessLogFile)
 		}
 		app.Use(logger.New(logCfg))
 	}
@@ -84,10 +90,15 @@ func main() {
 		var err error
 		if config.Cfg.Backend.SSL {
 			mainLogger.Infof("SSL enabled, using certificate: %s", config.Cfg.Backend.SSLCert)
-			err = app.ListenTLS(addr, config.Cfg.Backend.SSLCert, config.Cfg.Backend.SSLKey)
+			err = app.Listen(addr,
+				fiber.ListenConfig{
+					DisableStartupMessage: true,
+					CertFile:              config.Cfg.Backend.SSLCert,
+					CertKeyFile:           config.Cfg.Backend.SSLKey,
+				})
 		} else {
 			mainLogger.Infof("SSL disabled, starting HTTP server")
-			err = app.Listen(addr)
+			err = app.Listen(addr, fiber.ListenConfig{DisableStartupMessage: true})
 		}
 		if err != nil {
 			mainLogger.Errorf("failed to start server: %v", err)
