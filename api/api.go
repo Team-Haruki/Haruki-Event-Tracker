@@ -8,7 +8,7 @@ import (
 	"haruki-tracker/utils/gorm"
 	"haruki-tracker/utils/model"
 
-	"github.com/gofiber/fiber/v2"
+	"github.com/gofiber/fiber/v3"
 )
 
 type commonParams struct {
@@ -22,7 +22,7 @@ type commonParams struct {
 	interval     int64
 }
 
-func parseCommonParams(c *fiber.Ctx) (*commonParams, error) {
+func parseCommonParams(c fiber.Ctx) (*commonParams, error) {
 	server := c.Params("server")
 	serverRegion := model.SekaiServerRegion(server)
 	engine, exists := sekaiDBs[serverRegion]
@@ -49,7 +49,7 @@ func parseCommonParams(c *fiber.Ctx) (*commonParams, error) {
 	return params, nil
 }
 
-func getNormalRankingByUserID(c *fiber.Ctx) error {
+func getNormalRankingByUserID(c fiber.Ctx) error {
 	p, err := parseCommonParams(c)
 	if err != nil {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
@@ -68,7 +68,7 @@ func getNormalRankingByUserID(c *fiber.Ctx) error {
 	})
 }
 
-func getNormalRankingByRank(c *fiber.Ctx) error {
+func getNormalRankingByRank(c fiber.Ctx) error {
 	p, err := parseCommonParams(c)
 	if err != nil {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
@@ -87,7 +87,7 @@ func getNormalRankingByRank(c *fiber.Ctx) error {
 	})
 }
 
-func getWorldBloomRankingByUserID(c *fiber.Ctx) error {
+func getWorldBloomRankingByUserID(c fiber.Ctx) error {
 	p, err := parseCommonParams(c)
 	if err != nil {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
@@ -106,7 +106,7 @@ func getWorldBloomRankingByUserID(c *fiber.Ctx) error {
 	})
 }
 
-func getWorldBloomRankingByRank(c *fiber.Ctx) error {
+func getWorldBloomRankingByRank(c fiber.Ctx) error {
 	p, err := parseCommonParams(c)
 	if err != nil {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
@@ -125,7 +125,7 @@ func getWorldBloomRankingByRank(c *fiber.Ctx) error {
 	})
 }
 
-func getAllNormalRankingByUserID(c *fiber.Ctx) error {
+func getAllNormalRankingByUserID(c fiber.Ctx) error {
 	p, err := parseCommonParams(c)
 	if err != nil {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
@@ -148,7 +148,7 @@ func getAllNormalRankingByUserID(c *fiber.Ctx) error {
 	})
 }
 
-func getAllNormalRankingByRank(c *fiber.Ctx) error {
+func getAllNormalRankingByRank(c fiber.Ctx) error {
 	p, err := parseCommonParams(c)
 	if err != nil {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
@@ -170,7 +170,7 @@ func getAllNormalRankingByRank(c *fiber.Ctx) error {
 	})
 }
 
-func getAllWorldBloomRankingByUserID(c *fiber.Ctx) error {
+func getAllWorldBloomRankingByUserID(c fiber.Ctx) error {
 	p, err := parseCommonParams(c)
 	if err != nil {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
@@ -193,7 +193,7 @@ func getAllWorldBloomRankingByUserID(c *fiber.Ctx) error {
 	})
 }
 
-func getAllWorldBloomRankingByRank(c *fiber.Ctx) error {
+func getAllWorldBloomRankingByRank(c fiber.Ctx) error {
 	p, err := parseCommonParams(c)
 	if err != nil {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
@@ -215,7 +215,7 @@ func getAllWorldBloomRankingByRank(c *fiber.Ctx) error {
 	})
 }
 
-func getUserDataByUserID(c *fiber.Ctx) error {
+func getUserDataByUserID(c fiber.Ctx) error {
 	p, err := parseCommonParams(c)
 	if err != nil {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
@@ -230,7 +230,7 @@ func getUserDataByUserID(c *fiber.Ctx) error {
 	return c.JSON(userData)
 }
 
-func getRankingLines(c *fiber.Ctx) error {
+func getRankingLines(c fiber.Ctx) error {
 	p, err := parseCommonParams(c)
 	if err != nil {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
@@ -244,12 +244,12 @@ func getRankingLines(c *fiber.Ctx) error {
 	return c.JSON(result)
 }
 
-func getRankingScoreGrowths(c *fiber.Ctx) error {
+func getRankingScoreGrowths(c fiber.Ctx) error {
 	p, err := parseCommonParams(c)
 	if err != nil {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
 	}
-	currentTime := c.Context().Time().Unix()
+	currentTime := c.RequestCtx().Time().Unix()
 	startTime := currentTime - p.interval
 	result, err := gorm.FetchRankingScoreGrowths(p.ctx, p.engine, p.serverRegion, p.eventID, model.SekaiEventRankingLinesNormal, startTime)
 	if err != nil {
@@ -258,7 +258,7 @@ func getRankingScoreGrowths(c *fiber.Ctx) error {
 	return c.JSON(result)
 }
 
-func getWorldBloomRankingLines(c *fiber.Ctx) error {
+func getWorldBloomRankingLines(c fiber.Ctx) error {
 	p, err := parseCommonParams(c)
 	if err != nil {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
@@ -272,12 +272,12 @@ func getWorldBloomRankingLines(c *fiber.Ctx) error {
 	return c.JSON(result)
 }
 
-func getWorldBloomRankingScoreGrowths(c *fiber.Ctx) error {
+func getWorldBloomRankingScoreGrowths(c fiber.Ctx) error {
 	p, err := parseCommonParams(c)
 	if err != nil {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
 	}
-	currentTime := c.Context().Time().Unix()
+	currentTime := c.RequestCtx().Time().Unix()
 	startTime := currentTime - p.interval
 	result, err := gorm.FetchWorldBloomRankingScoreGrowths(p.ctx, p.engine, p.serverRegion, p.eventID, p.characterID, model.SekaiEventRankingLinesWorldBloom, startTime)
 	if err != nil {
