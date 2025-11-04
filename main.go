@@ -49,9 +49,10 @@ func main() {
 		BodyLimit:   100 * 1024 * 1024,
 		JSONEncoder: sonic.Marshal,
 		JSONDecoder: sonic.Unmarshal,
-		TrustProxy:  true,
+		TrustProxy:  config.Cfg.Backend.EnableTrustProxy,
+		ProxyHeader: config.Cfg.Backend.ProxyHeader,
 		TrustProxyConfig: fiber.TrustProxyConfig{
-			Proxies: []string{"127.0.0.0/8", "192.168.0.0/16", "10.0.0.0/8", "172.16.0.0/12", "100.64.0.0/10"},
+			Proxies: config.Cfg.Backend.TrustProxies,
 		},
 		ErrorHandler: func(c fiber.Ctx, err error) error {
 			code := fiber.StatusInternalServerError
