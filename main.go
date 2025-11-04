@@ -49,6 +49,10 @@ func main() {
 		BodyLimit:   100 * 1024 * 1024,
 		JSONEncoder: sonic.Marshal,
 		JSONDecoder: sonic.Unmarshal,
+		TrustProxy:  true,
+		TrustProxyConfig: fiber.TrustProxyConfig{
+			Proxies: []string{"127.0.0.0/8", "192.168.0.0/16", "10.0.0.0/8", "172.16.0.0/12", "100.64.0.0/10"},
+		},
 		ErrorHandler: func(c fiber.Ctx, err error) error {
 			code := fiber.StatusInternalServerError
 			var e *fiber.Error
@@ -87,19 +91,17 @@ func main() {
 	go func() {
 		addr := fmt.Sprintf("%s:%d", config.Cfg.Backend.Host, config.Cfg.Backend.Port)
 		mainLogger.Infof("Starting server on %s...", addr)
-		var err error
+		listenCfg := fiber.ListenConfig{
+			DisableStartupMessage: true,
+		}
 		if config.Cfg.Backend.SSL {
 			mainLogger.Infof("SSL enabled, using certificate: %s", config.Cfg.Backend.SSLCert)
-			err = app.Listen(addr,
-				fiber.ListenConfig{
-					DisableStartupMessage: true,
-					CertFile:              config.Cfg.Backend.SSLCert,
-					CertKeyFile:           config.Cfg.Backend.SSLKey,
-				})
+			listenCfg.CertFile = config.Cfg.Backend.SSLCert
+			listenCfg.CertKeyFile = config.Cfg.Backend.SSLKey
 		} else {
 			mainLogger.Infof("SSL disabled, starting HTTP server")
-			err = app.Listen(addr, fiber.ListenConfig{DisableStartupMessage: true})
 		}
+		err := app.Listen(addr, listenCfg)
 		if err != nil {
 			mainLogger.Errorf("failed to start server: %v", err)
 			os.Exit(1)
