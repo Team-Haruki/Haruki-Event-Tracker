@@ -72,7 +72,7 @@ func NewEventTrackerBase(
 		dbEngine:                   engine,
 		redisClient:                redisClient,
 		apiClient:                  apiClient,
-		logger:                     logger.NewLogger(fmt.Sprintf("HarukiEventTrackerBase%s-Event%d", strings.ToUpper(string(server)), eventID), "DEBUG", nil),
+		logger:                     logger.NewLogger(fmt.Sprintf("HarukiEventTrackerBase%s-Event%d", strings.ToUpper(string(server)), eventID), "INFO", nil),
 	}
 	if eventType == model.SekaiEventTypeWorldBloom && worldBloomStatuses != nil && len(worldBloomStatuses) > 0 {
 		tracker.isWorldBloomChapterEnded = make(map[int]bool)
