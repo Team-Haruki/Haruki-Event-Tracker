@@ -64,40 +64,42 @@ func InitAPIUtils(cfg config.Config) error {
 		}
 		sekaiDBs[server] = engine
 		sekaiAPIUtilsLogger.Infof("Database engine for %s initialized successfully", server)
-
-		sekaiAPIUtilsLogger.Infof("Creating event tracker daemon for %s...", server)
-		trackerDaemon := tracker.NewHarukiEventTracker(
-			server,
-			sekaiAPIClient,
-			sekaiRedis,
-			sekaiDBs[server],
-			serverCfg.MasterDataDir,
-		)
-		if err := trackerDaemon.Init(); err != nil {
-			sekaiAPIUtilsLogger.Warnf("Failed to initialize tracker daemon for %s: %v, will retry on first run", server, err)
+		if serverCfg.Tracker.Enabled {
+			sekaiAPIUtilsLogger.Infof("Creating event tracker daemon for %s...", server)
+			trackerDaemon := tracker.NewHarukiEventTracker(
+				server,
+				serverCfg.Tracker,
+				sekaiAPIClient,
+				sekaiRedis,
+				sekaiDBs[server],
+				serverCfg.MasterDataDir,
+			)
+			if err := trackerDaemon.Init(); err != nil {
+				sekaiAPIUtilsLogger.Warnf("Failed to initialize tracker daemon for %s: %v, will retry on first run", server, err)
+			}
+			sekaiTrackerDaemons[server] = trackerDaemon
+			sekaiAPIUtilsLogger.Infof("Event tracker daemon for %s initialized successfully", server)
+			cronExpr := serverCfg.Tracker.Cron
+			sekaiAPIUtilsLogger.Infof("Registering tracker cron job for %s with expression: %s", server, cronExpr)
+			_, err = sekaiScheduler.NewJob(
+				gocron.CronJob(cronExpr, serverCfg.Tracker.UseSecondLevelCron),
+				gocron.NewTask(func(s model.SekaiServerRegion) {
+					daemon := sekaiTrackerDaemons[s]
+					if daemon == nil {
+						sekaiAPIUtilsLogger.Errorf("Tracker daemon for %s not found", s)
+						return
+					}
+					sekaiAPIUtilsLogger.Infof("Running tracker for %s...", s)
+					daemon.TrackRankingData()
+					sekaiAPIUtilsLogger.Infof("Successfully tracked ranking data for %s", s)
+				}, server),
+				gocron.WithName(fmt.Sprintf("tracker-%s", server)),
+			)
+			if err != nil {
+				return fmt.Errorf("failed to register cron job for %s: %w", server, err)
+			}
+			sekaiAPIUtilsLogger.Infof("Cron job registered for %s", server)
 		}
-		sekaiTrackerDaemons[server] = trackerDaemon
-		sekaiAPIUtilsLogger.Infof("Event tracker daemon for %s initialized successfully", server)
-		cronExpr := serverCfg.TrackerCron
-		sekaiAPIUtilsLogger.Infof("Registering tracker cron job for %s with expression: %s", server, cronExpr)
-		_, err = sekaiScheduler.NewJob(
-			gocron.CronJob(cronExpr, serverCfg.UseSecondLevelTrackerCron),
-			gocron.NewTask(func(s model.SekaiServerRegion) {
-				daemon := sekaiTrackerDaemons[s]
-				if daemon == nil {
-					sekaiAPIUtilsLogger.Errorf("Tracker daemon for %s not found", s)
-					return
-				}
-				sekaiAPIUtilsLogger.Infof("Running tracker for %s...", s)
-				daemon.TrackRankingData()
-				sekaiAPIUtilsLogger.Infof("Successfully tracked ranking data for %s", s)
-			}, server),
-			gocron.WithName(fmt.Sprintf("tracker-%s", server)),
-		)
-		if err != nil {
-			return fmt.Errorf("failed to register cron job for %s: %w", server, err)
-		}
-		sekaiAPIUtilsLogger.Infof("Cron job registered for %s", server)
 	}
 	sekaiAPIUtilsLogger.Infof("Haruki Event Tracker API initialized successfully")
 	return nil

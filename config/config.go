@@ -11,6 +11,18 @@ import (
 var Version = "2.0.0-dev"
 var Cfg Config
 
+type TrackerConfig struct {
+	Enabled               bool                            `yaml:"enabled"`
+	UseSecondLevelCron    bool                            `yaml:"use_second_level_cron,omitempty"`
+	Cron                  string                          `yaml:"cron"`
+	SecondLevelTrackType  model.SecondLevelEventTrackType `yaml:"second_level_track_type"`
+	RangeTrackLowerRank   *int                            `yaml:"range_track_lower_rank,omitempty"`
+	RangeTrackUpperRank   *int                            `yaml:"range_track_upper_rank,omitempty"`
+	SpecificTrackRanks    *[]int                          `yaml:"specific_track_ranks,omitempty"`
+	TrackSpecificPlayers  *bool                           `yaml:"track_specific_players,omitempty"`
+	SpecificPlayerUserIDs *[]string                       `yaml:"specific_player_user_ids,omitempty"`
+}
+
 type RedisConfig struct {
 	Host     string `yaml:"host"`
 	Port     int    `yaml:"port"`
@@ -39,11 +51,10 @@ type BackendConfig struct {
 }
 
 type ServerConfig struct {
-	Enabled                   bool             `yaml:"enabled"`
-	MasterDataDir             string           `yaml:"master_data_dir"`
-	UseSecondLevelTrackerCron bool             `yaml:"use_second_level_tracker_cron,omitempty"`
-	TrackerCron               string           `yaml:"tracker_cron"`
-	GormConfig                model.GormConfig `yaml:"gorm_config"`
+	Enabled       bool             `yaml:"enabled"`
+	MasterDataDir string           `yaml:"master_data_dir"`
+	Tracker       TrackerConfig    `yaml:"tracker"`
+	GormConfig    model.GormConfig `yaml:"gorm_config"`
 }
 
 type Config struct {

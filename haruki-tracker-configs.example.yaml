@@ -75,15 +75,19 @@ servers:
     enabled: false           # 是否启用该服务器的追踪（true/false）
     master_data_dir: Data/haruki-sekai-master/master  # 游戏 Master 数据目录路径
 
-    # Cron 定时任务配置
-    use_second_level_tracker_cron: true  # 是否使用秒级 Cron（支持每秒执行）
-    tracker_cron: "*/5 * * * *"          # Cron 表达式（每 5 分钟执行一次）
-                                          # 格式：分 时 日 月 周
-                                          # 秒级格式（启用 use_second_level_tracker_cron）: 秒 分 时 日 月 周
-                                          # 示例：
-                                          #   "*/5 * * * *"      - 每 5 分钟
-                                          #   "0 */1 * * *"      - 每小时整点
-                                          #   "*/30 * * * * *"   - 每 30 秒（需启用秒级）
+    # tracker配置
+    tracker:
+      enabled: true         # 是否启用活动追踪器
+      use_second_level_cron: false  # 是否启用秒级 Cron 表达式
+      cron: "*/2 * * * *"   # Cron 表达式，默认每 2 分钟执行一次
+      second_level_track_type: "range" # 秒级追踪类型：range（范围排名），specific（指定排名）
+      # =========== 当 second_level_track_type 为 range 时生效 ============
+      range_track_lower_rank: 1    # 范围追踪高顺位排名（仅当 type 为 range 时有效，可与upper调转）
+      range_track_upper_rank: 10 # 范围追踪低顺位排名（仅当 type 为 range 时有效，可与lower调转）
+      # ========== 当 second_level_track_type 为 specific 时生效 ==========
+      specific_track_ranks: null  # 指定排名列表（仅当 type 为 specific 时有效，为null或[]时不生效）
+      track_specific_players: false  # 是否追踪指定玩家
+      specific_player_user_ids: null  # 指定玩家 User ID 列表（仅当 track_specific_players 为 true 时有效，为null或[]时不生效，类型为string）
 
     # 数据库配置（GORM）
     gorm_config:
@@ -123,8 +127,16 @@ servers:
   en:
     enabled: false           # 是否启用国际服追踪
     master_data_dir: Data/haruki-sekai-master/master
-    use_second_level_tracker_cron: true
-    tracker_cron: "*/5 * * * *"  # 每 5 分钟执行一次
+    tracker:
+      enabled: true
+      use_second_level_cron: false
+      cron: "*/2 * * * *"
+      second_level_track_type: "range"
+      range_track_lower_rank: 1
+      range_track_upper_rank: 10
+      specific_track_ranks: null
+      track_specific_players: false
+      specific_player_user_ids: null
     gorm_config:
       enabled: true
       dialect: mysql         # 使用 MySQL 数据库
@@ -149,8 +161,16 @@ servers:
   tw:
     enabled: false           # 是否启用台服追踪
     master_data_dir: Data/haruki-sekai-master/master
-    use_second_level_tracker_cron: true
-    tracker_cron: "*/5 * * * *"
+    tracker:
+      enabled: true
+      use_second_level_cron: false
+      cron: "*/2 * * * *"
+      second_level_track_type: "range"
+      range_track_lower_rank: 1
+      range_track_upper_rank: 10
+      specific_track_ranks: null
+      track_specific_players: false
+      specific_player_user_ids: null
     gorm_config:
       enabled: true
       dialect: mysql
@@ -175,8 +195,16 @@ servers:
   kr:
     enabled: false           # 是否启用韩服追踪
     master_data_dir: Data/haruki-sekai-master/master
-    use_second_level_tracker_cron: true
-    tracker_cron: "*/5 * * * *"
+    tracker:
+      enabled: true
+      use_second_level_cron: false
+      cron: "*/2 * * * *"
+      second_level_track_type: "range"
+      range_track_lower_rank: 1
+      range_track_upper_rank: 10
+      specific_track_ranks: null
+      track_specific_players: false
+      specific_player_user_ids: null
     gorm_config:
       enabled: true
       dialect: mysql
@@ -201,8 +229,16 @@ servers:
   cn:
     enabled: false           # 是否启用国服追踪（默认禁用，使用时请改为 true）
     master_data_dir: Data/haruki-sekai-sc-master/master  # 国服使用简体中文 Master 数据
-    use_second_level_tracker_cron: true
-    tracker_cron: "*/10 * * * * *"  # 每 10 秒执行一次（秒级 Cron）
+    tracker:
+      enabled: true
+      use_second_level_cron: false
+      cron: "*/2 * * * *"
+      second_level_track_type: "range"
+      range_track_lower_rank: 1
+      range_track_upper_rank: 10
+      specific_track_ranks: null
+      track_specific_players: false
+      specific_player_user_ids: null
     gorm_config:
       enabled: true
       dialect: postgres      # 使用 PostgreSQL 数据库

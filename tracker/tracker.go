@@ -3,6 +3,7 @@ package tracker
 import (
 	"context"
 	"fmt"
+	"haruki-tracker/config"
 	"haruki-tracker/utils/gorm"
 	"haruki-tracker/utils/logger"
 	"haruki-tracker/utils/model"
@@ -13,23 +14,32 @@ import (
 )
 
 type HarukiEventTracker struct {
-	server     model.SekaiServerRegion
-	sekaiAPI   HarukiSekaiAPIClient
-	redis      *redis.Client
-	dbEngine   *gorm.DatabaseEngine
-	dataParser *EventDataParser
-	tracker    *EventTrackerBase
-	logger     *logger.Logger
+	server        model.SekaiServerRegion
+	sekaiAPI      HarukiSekaiAPIClient
+	redis         *redis.Client
+	dbEngine      *gorm.DatabaseEngine
+	dataParser    *EventDataParser
+	tracker       *EventTrackerBase
+	trackerConfig config.TrackerConfig
+	logger        *logger.Logger
 }
 
-func NewHarukiEventTracker(server model.SekaiServerRegion, apiClient *HarukiSekaiAPIClient, redisClient *redis.Client, dbEngine *gorm.DatabaseEngine, masterDir string) *HarukiEventTracker {
+func NewHarukiEventTracker(
+	server model.SekaiServerRegion,
+	trackerConfig config.TrackerConfig,
+	apiClient *HarukiSekaiAPIClient,
+	redisClient *redis.Client,
+	dbEngine *gorm.DatabaseEngine,
+	masterDir string,
+) *HarukiEventTracker {
 	return &HarukiEventTracker{
-		server:     server,
-		sekaiAPI:   *apiClient,
-		redis:      redisClient,
-		dbEngine:   dbEngine,
-		dataParser: NewEventDataParser(server, masterDir),
-		logger:     logger.NewLogger(fmt.Sprintf("HarukiEventTracker%sDaemon", strings.ToUpper(string(server))), "INFO", nil),
+		server:        server,
+		sekaiAPI:      *apiClient,
+		redis:         redisClient,
+		dbEngine:      dbEngine,
+		dataParser:    NewEventDataParser(server, masterDir),
+		trackerConfig: trackerConfig,
+		logger:        logger.NewLogger(fmt.Sprintf("HarukiEventTracker%sDaemon", strings.ToUpper(string(server))), "INFO", nil),
 	}
 }
 
@@ -44,7 +54,18 @@ func (t *HarukiEventTracker) Init() error {
 		return fmt.Errorf("no active event found for server %s", t.server)
 	}
 	isEventEnded := event.EventStatus == model.SekaiEventStatusEnded
-	t.tracker = NewEventTrackerBase(t.server, event.EventID, event.EventType, isEventEnded, t.dbEngine, t.redis, &t.sekaiAPI, event.ChapterStatuses)
+	t.tracker = NewEventTrackerBase(
+		t.server,
+		event.EventID,
+		event.EventType,
+		isEventEnded,
+		t.trackerConfig.SecondLevelTrackType,
+		t.trackerConfig.RangeTrackLowerRank,
+		t.trackerConfig.RangeTrackUpperRank,
+		t.trackerConfig.SpecificTrackRanks,
+		t.trackerConfig.TrackSpecificPlayers,
+		t.trackerConfig.SpecificPlayerUserIDs,
+		t.dbEngine, t.redis, &t.sekaiAPI, event.ChapterStatuses)
 	err = t.tracker.Init(ctx)
 	if err != nil {
 		t.logger.Errorf("Tracker Init Error: %s", err.Error())

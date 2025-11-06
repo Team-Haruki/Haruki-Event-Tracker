@@ -11,7 +11,6 @@ import (
 	"haruki-tracker/utils/logger"
 	"haruki-tracker/utils/model"
 
-	"github.com/bytedance/sonic"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -23,17 +22,23 @@ type HandledRankingData struct {
 }
 
 type EventTrackerBase struct {
-	server                   model.SekaiServerRegion
-	eventID                  int
-	eventType                model.SekaiEventType
-	isEventEnded             bool
-	worldBloomStatuses       map[int]model.WorldBloomChapterStatus
-	isWorldBloomChapterEnded map[int]bool
-	dbEngine                 *gorm.DatabaseEngine
-	redisClient              *redis.Client
-	apiClient                *HarukiSekaiAPIClient
-	lastUpdateTime           string
-	logger                   *logger.Logger
+	server                     model.SekaiServerRegion
+	eventID                    int
+	eventType                  model.SekaiEventType
+	isEventEnded               bool
+	worldBloomStatuses         map[int]model.WorldBloomChapterStatus
+	isWorldBloomChapterEnded   map[int]bool
+	secondLevelTrackType       model.SecondLevelEventTrackType
+	rangeTrackLowerRank        *int
+	rangeTrackUpperRank        *int
+	SpecificTrackRanks         *[]int
+	trackSpecificPlayer        *bool
+	trackSpecificPlayerUserIDs *[]string
+	dbEngine                   *gorm.DatabaseEngine
+	redisClient                *redis.Client
+	apiClient                  *HarukiSekaiAPIClient
+	lastUpdateTime             string
+	logger                     *logger.Logger
 }
 
 func NewEventTrackerBase(
@@ -41,21 +46,33 @@ func NewEventTrackerBase(
 	eventID int,
 	eventType model.SekaiEventType,
 	isEventEnded bool,
+	secondLevelTrackType model.SecondLevelEventTrackType,
+	rangeTrackLowerRank *int,
+	rangeTrackUpperRank *int,
+	specificTrackRanks *[]int,
+	trackSpecificPlayer *bool,
+	trackSpecificPlayerUserIDs *[]string,
 	engine *gorm.DatabaseEngine,
 	redisClient *redis.Client,
 	apiClient *HarukiSekaiAPIClient,
 	worldBloomStatuses map[int]model.WorldBloomChapterStatus,
 ) *EventTrackerBase {
 	tracker := &EventTrackerBase{
-		server:             server,
-		eventID:            eventID,
-		eventType:          eventType,
-		isEventEnded:       isEventEnded,
-		worldBloomStatuses: worldBloomStatuses,
-		dbEngine:           engine,
-		redisClient:        redisClient,
-		apiClient:          apiClient,
-		logger:             logger.NewLogger(fmt.Sprintf("HarukiEventTrackerBase%s-%d", strings.ToUpper(string(server)), eventID), "INFO", nil),
+		server:                     server,
+		eventID:                    eventID,
+		eventType:                  eventType,
+		isEventEnded:               isEventEnded,
+		worldBloomStatuses:         worldBloomStatuses,
+		secondLevelTrackType:       secondLevelTrackType,
+		rangeTrackLowerRank:        rangeTrackLowerRank,
+		rangeTrackUpperRank:        rangeTrackUpperRank,
+		SpecificTrackRanks:         specificTrackRanks,
+		trackSpecificPlayer:        trackSpecificPlayer,
+		trackSpecificPlayerUserIDs: trackSpecificPlayerUserIDs,
+		dbEngine:                   engine,
+		redisClient:                redisClient,
+		apiClient:                  apiClient,
+		logger:                     logger.NewLogger(fmt.Sprintf("HarukiEventTrackerBase%s-Event%d", strings.ToUpper(string(server)), eventID), "DEBUG", nil),
 	}
 	if eventType == model.SekaiEventTypeWorldBloom && worldBloomStatuses != nil && len(worldBloomStatuses) > 0 {
 		tracker.isWorldBloomChapterEnded = make(map[int]bool)
@@ -66,7 +83,6 @@ func NewEventTrackerBase(
 	return tracker
 }
 
-// worldBloomStatusesEqual compares two WorldBloomChapterStatus maps for equality
 func worldBloomStatusesEqual(a, b map[int]model.WorldBloomChapterStatus) bool {
 	if len(a) != len(b) {
 		return false
@@ -88,22 +104,27 @@ func (t *EventTrackerBase) Init(ctx context.Context) error {
 	return nil
 }
 
-func (t *EventTrackerBase) detectCache(ctx context.Context, key string, newData []model.PlayerRankingSchema) (bool, error) {
-	newDataJSON, err := sonic.Marshal(newData)
-	if err != nil {
-		return false, fmt.Errorf("failed to marshal new data: %w", err)
-	}
-	cachedDataJSON, err := t.redisClient.Get(ctx, key).Result()
+func (t *EventTrackerBase) detectCache(ctx context.Context, key string, newHash [32]byte) (bool, error) {
+	cachedHashStr, err := t.redisClient.Get(ctx, key).Result()
 	if err != nil && !errors.Is(err, redis.Nil) {
 		return false, fmt.Errorf("failed to get cached data: %w", err)
 	}
-	if errors.Is(err, redis.Nil) || cachedDataJSON != string(newDataJSON) {
-		if err := t.redisClient.Set(ctx, key, newDataJSON, 0).Err(); err != nil {
+	if errors.Is(err, redis.Nil) {
+		t.logger.Debugf("Cache miss: key %s not found, setting cache for %s %d event tracker", key, t.server, t.eventID)
+		if err := t.redisClient.Set(ctx, key, fmt.Sprintf("%x", newHash), 0).Err(); err != nil {
+			return false, fmt.Errorf("failed to set cache: %w", err)
+		}
+		return false, nil
+	}
+	if cachedHashStr != fmt.Sprintf("%x", newHash) {
+		t.logger.Debugf("Cache miss: data changed for key %s, setting cache for %s %d event tracker", key, t.server, t.eventID)
+		if err := t.redisClient.Set(ctx, key, fmt.Sprintf("%x", newHash), 0).Err(); err != nil {
 			return false, fmt.Errorf("failed to set cache: %w", err)
 		}
 		return false, nil
 	}
 
+	t.logger.Debugf("Cache hit: key %s found for %s %d event tracker", key, t.server, t.eventID)
 	return true, nil
 }
 
@@ -111,9 +132,10 @@ func (t *EventTrackerBase) mergeRankings(
 	ctx context.Context,
 	top100Rankings []model.PlayerRankingSchema,
 	borderRankings []model.PlayerRankingSchema,
+	borderHash [32]byte,
 	cacheKey string,
 ) ([]model.PlayerRankingSchema, error) {
-	isCached, err := t.detectCache(ctx, cacheKey, borderRankings)
+	isCached, err := t.detectCache(ctx, cacheKey, borderHash)
 	if err != nil {
 		t.logger.Warnf("Failed to check cache for %s: %v, using all data", cacheKey, err)
 		isCached = false
@@ -216,11 +238,12 @@ func (t *EventTrackerBase) handleRankingData(ctx context.Context) (*HandledRanki
 		t.logger.Errorf("Warning: Failed to get top100 rankings: %v", err)
 		return nil, err
 	}
-	border, err := t.apiClient.GetBorder(ctx, t.eventID, t.server)
+	borderHash, border, err := t.apiClient.GetBorder(ctx, t.eventID, t.server)
 	if err != nil {
 		t.logger.Errorf("Warning: Failed to get border rankings: %v", err)
 		return nil, err
 	}
+	t.logger.Debugf("Border response hash: %x", borderHash)
 	if top100 == nil {
 		t.logger.Errorf("Warning: Haruki Sekai API error, skipping tracking...")
 		return nil, fmt.Errorf("top100 response is nil")
@@ -236,7 +259,7 @@ func (t *EventTrackerBase) handleRankingData(ctx context.Context) (*HandledRanki
 	}
 
 	mainCacheKey := fmt.Sprintf("%s-event-%d-main-border", t.server, t.eventID)
-	rankings, err := t.mergeRankings(ctx, mainTop100Rankings, mainBorderRankings, mainCacheKey)
+	rankings, err := t.mergeRankings(ctx, mainTop100Rankings, mainBorderRankings, borderHash, mainCacheKey)
 	if err != nil {
 		return nil, fmt.Errorf("failed to merge main rankings: %w", err)
 	}
@@ -244,7 +267,7 @@ func (t *EventTrackerBase) handleRankingData(ctx context.Context) (*HandledRanki
 	var wlRankings []model.PlayerRankingSchema
 	if len(wlTop100Rankings) > 0 && characterID != nil {
 		wlCacheKey := fmt.Sprintf("%s-event-%d-world-bloom-%d-border", t.server, t.eventID, *characterID)
-		wlRankings, err = t.mergeRankings(ctx, wlTop100Rankings, wlBorderRankings, wlCacheKey)
+		wlRankings, err = t.mergeRankings(ctx, wlTop100Rankings, wlBorderRankings, borderHash, wlCacheKey)
 		if err != nil {
 			return nil, fmt.Errorf("failed to merge world bloom rankings: %w", err)
 		}
@@ -264,8 +287,59 @@ func (t *EventTrackerBase) getFilterFunc(currentTimeMinute string) func(*model.P
 		return func(r *model.PlayerRankingSchema) bool { return true }
 	}
 	return func(r *model.PlayerRankingSchema) bool {
-		return r.Rank != nil && *r.Rank <= 10
+		if t.checkRange(r) || t.checkSpecificRanks(r) || t.checkSpecificPlayers(r) {
+			return true
+		}
+		return false
 	}
+}
+
+func (t *EventTrackerBase) checkRange(r *model.PlayerRankingSchema) bool {
+	if t.secondLevelTrackType != model.SecondLevelEventTrackTypeRange {
+		return false
+	}
+	if t.rangeTrackUpperRank == nil || t.rangeTrackLowerRank == nil {
+		return false
+	}
+	lower := *t.rangeTrackLowerRank
+	upper := *t.rangeTrackUpperRank
+	if lower > upper {
+		lower, upper = upper, lower
+	}
+	if r.Rank == nil {
+		return false
+	}
+	return *r.Rank >= lower && *r.Rank <= upper
+}
+
+func (t *EventTrackerBase) checkSpecificRanks(r *model.PlayerRankingSchema) bool {
+	if t.secondLevelTrackType != model.SecondLevelEventTrackTypeSpecific {
+		return false
+	}
+	if t.SpecificTrackRanks == nil || r.Rank == nil {
+		return false
+	}
+	for _, rank := range *t.SpecificTrackRanks {
+		if *r.Rank == rank {
+			return true
+		}
+	}
+	return false
+}
+
+func (t *EventTrackerBase) checkSpecificPlayers(r *model.PlayerRankingSchema) bool {
+	if t.trackSpecificPlayer == nil || !*t.trackSpecificPlayer {
+		return false
+	}
+	if t.trackSpecificPlayerUserIDs == nil || r.UserID == nil {
+		return false
+	}
+	for _, userID := range *t.trackSpecificPlayerUserIDs {
+		if fmt.Sprintf("%d", *r.UserID) == userID {
+			return true
+		}
+	}
+	return false
 }
 
 func (t *EventTrackerBase) extractCheerfulTeamID(r *model.PlayerRankingSchema) *int {

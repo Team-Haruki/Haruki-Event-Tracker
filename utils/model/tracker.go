@@ -13,3 +13,10 @@ type PlayerWorldBloomRankingRecordSchema struct {
 	PlayerEventRankingRecordSchema
 	CharacterID int
 }
+
+type SecondLevelEventTrackType string
+
+const (
+	SecondLevelEventTrackTypeRange    SecondLevelEventTrackType = "range"
+	SecondLevelEventTrackTypeSpecific SecondLevelEventTrackType = "specific"
+)

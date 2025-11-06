@@ -2,6 +2,7 @@ package tracker
 
 import (
 	"context"
+	"crypto/sha256"
 	"fmt"
 	"haruki-tracker/config"
 	"time"
@@ -50,20 +51,21 @@ func (c *HarukiSekaiAPIClient) GetTop100(ctx context.Context, eventID int, serve
 	return &response, nil
 }
 
-func (c *HarukiSekaiAPIClient) GetBorder(ctx context.Context, eventID int, server model.SekaiServerRegion) (*model.BorderRankingResponse, error) {
+func (c *HarukiSekaiAPIClient) GetBorder(ctx context.Context, eventID int, server model.SekaiServerRegion) ([32]byte, *model.BorderRankingResponse, error) {
 	url := fmt.Sprintf("%s/%s/event/%d/ranking-border", c.apiEndpoint, server, eventID)
 	resp, err := c.client.R().
 		SetContext(ctx).
 		Get(url)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get border: %w", err)
+		return [32]byte{}, nil, fmt.Errorf("failed to get border: %w", err)
 	}
 	if resp.StatusCode() != 200 {
-		return nil, fmt.Errorf("unexpected status code: %d", resp.StatusCode())
+		return [32]byte{}, nil, fmt.Errorf("unexpected status code: %d", resp.StatusCode())
 	}
 	var response model.BorderRankingResponse
+	rawHash := sha256.Sum256(resp.Body())
 	if err := sonic.Unmarshal(resp.Body(), &response); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal response: %w", err)
+		return [32]byte{}, nil, fmt.Errorf("failed to unmarshal response: %w", err)
 	}
-	return &response, nil
+	return rawHash, &response, nil
 }
