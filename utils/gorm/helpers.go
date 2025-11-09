@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 
 	"haruki-tracker/utils/model"
 
@@ -246,7 +247,7 @@ func FetchAllWorldBloomRankingsByRank(ctx context.Context, engine *DatabaseEngin
 func FetchRankingLines(ctx context.Context, engine *DatabaseEngine, server model.SekaiServerRegion, eventID int, ranks []int) ([]*model.RankingLineScoreSchema, error) {
 	eventTable := GetEventTableModel(server, eventID)
 	timeIDTable := GetTimeIDTableModel(server, eventID)
-	result := make([]*model.RankingLineScoreSchema, 0)
+
 	query := fmt.Sprintf(`SELECT t.timestamp, e.score, e.rank 
 		FROM %s AS e 
 		INNER JOIN %s AS t ON e.time_id = t.time_id 
@@ -255,30 +256,43 @@ func FetchRankingLines(ctx context.Context, engine *DatabaseEngine, server model
 		LIMIT 1`,
 		engine.db.Statement.Quote(eventTable.TableName()),
 		engine.db.Statement.Quote(timeIDTable.TableName()))
+
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	result := make([]*model.RankingLineScoreSchema, 0, len(ranks))
+
 	for _, rank := range ranks {
-		var record struct {
-			Timestamp int64
-			Score     int
-			Rank      int
-		}
-		err := engine.WithContext(ctx).
-			Raw(query, rank).
-			Scan(&record).Error
-		if err == nil && record.Rank > 0 {
-			result = append(result, &model.RankingLineScoreSchema{
-				Rank:      record.Rank,
-				Score:     record.Score,
-				Timestamp: record.Timestamp,
-			})
-		}
+		wg.Add(1)
+		go func(r int) {
+			defer wg.Done()
+			var record struct {
+				Timestamp int64
+				Score     int
+				Rank      int
+			}
+			err := engine.WithContext(ctx).
+				Raw(query, r).
+				Scan(&record).Error
+			if err == nil && record.Rank > 0 {
+				mu.Lock()
+				result = append(result, &model.RankingLineScoreSchema{
+					Rank:      record.Rank,
+					Score:     record.Score,
+					Timestamp: record.Timestamp,
+				})
+				mu.Unlock()
+			}
+		}(rank)
 	}
+
+	wg.Wait()
 	return result, nil
 }
 
 func FetchRankingScoreGrowths(ctx context.Context, engine *DatabaseEngine, server model.SekaiServerRegion, eventID int, ranks []int, startTime int64) ([]*model.RankingScoreGrowthSchema, error) {
 	eventTable := GetEventTableModel(server, eventID)
 	timeIDTable := GetTimeIDTableModel(server, eventID)
-	result := make([]*model.RankingScoreGrowthSchema, 0)
+
 	query := fmt.Sprintf(`SELECT t.timestamp, e.score, e.rank 
 		FROM %s AS e 
 		INNER JOIN %s AS t ON e.time_id = t.time_id 
@@ -286,38 +300,51 @@ func FetchRankingScoreGrowths(ctx context.Context, engine *DatabaseEngine, serve
 		ORDER BY t.timestamp ASC`,
 		engine.db.Statement.Quote(eventTable.TableName()),
 		engine.db.Statement.Quote(timeIDTable.TableName()))
+
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	result := make([]*model.RankingScoreGrowthSchema, 0, len(ranks))
+
 	for _, rank := range ranks {
-		var records []struct {
-			Timestamp int64
-			Score     int
-			Rank      int
-		}
-		err := engine.WithContext(ctx).
-			Raw(query, rank, startTime).
-			Scan(&records).Error
-		if err == nil && len(records) >= 2 {
-			earlier := records[0]
-			latest := records[len(records)-1]
-			growth := latest.Score - earlier.Score
-			diff := latest.Timestamp - earlier.Timestamp
-			result = append(result, &model.RankingScoreGrowthSchema{
-				Rank:             rank,
-				TimestampLatest:  latest.Timestamp,
-				ScoreLatest:      latest.Score,
-				TimestampEarlier: &earlier.Timestamp,
-				ScoreEarlier:     &earlier.Score,
-				TimeDiff:         &diff,
-				Growth:           &growth,
-			})
-		}
+		wg.Add(1)
+		go func(r int) {
+			defer wg.Done()
+			var records []struct {
+				Timestamp int64
+				Score     int
+				Rank      int
+			}
+			err := engine.WithContext(ctx).
+				Raw(query, r, startTime).
+				Scan(&records).Error
+			if err == nil && len(records) >= 2 {
+				earlier := records[0]
+				latest := records[len(records)-1]
+				growth := latest.Score - earlier.Score
+				diff := latest.Timestamp - earlier.Timestamp
+				mu.Lock()
+				result = append(result, &model.RankingScoreGrowthSchema{
+					Rank:             r,
+					TimestampLatest:  latest.Timestamp,
+					ScoreLatest:      latest.Score,
+					TimestampEarlier: &earlier.Timestamp,
+					ScoreEarlier:     &earlier.Score,
+					TimeDiff:         &diff,
+					Growth:           &growth,
+				})
+				mu.Unlock()
+			}
+		}(rank)
 	}
+
+	wg.Wait()
 	return result, nil
 }
 
 func FetchWorldBloomRankingLines(ctx context.Context, engine *DatabaseEngine, server model.SekaiServerRegion, eventID int, characterID int, ranks []int) ([]*model.RankingLineScoreSchema, error) {
 	wlTable := GetWorldBloomTableModel(server, eventID)
 	timeIDTable := GetTimeIDTableModel(server, eventID)
-	result := make([]*model.RankingLineScoreSchema, 0)
+
 	query := fmt.Sprintf(`SELECT t.timestamp, w.score, w.rank 
 		FROM %s AS w 
 		INNER JOIN %s AS t ON w.time_id = t.time_id 
@@ -326,30 +353,43 @@ func FetchWorldBloomRankingLines(ctx context.Context, engine *DatabaseEngine, se
 		LIMIT 1`,
 		engine.db.Statement.Quote(wlTable.TableName()),
 		engine.db.Statement.Quote(timeIDTable.TableName()))
+
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	result := make([]*model.RankingLineScoreSchema, 0, len(ranks))
+
 	for _, rank := range ranks {
-		var record struct {
-			Timestamp int64
-			Score     int
-			Rank      int
-		}
-		err := engine.WithContext(ctx).
-			Raw(query, rank, characterID).
-			Scan(&record).Error
-		if err == nil && record.Rank > 0 {
-			result = append(result, &model.RankingLineScoreSchema{
-				Rank:      record.Rank,
-				Score:     record.Score,
-				Timestamp: record.Timestamp,
-			})
-		}
+		wg.Add(1)
+		go func(r int) {
+			defer wg.Done()
+			var record struct {
+				Timestamp int64
+				Score     int
+				Rank      int
+			}
+			err := engine.WithContext(ctx).
+				Raw(query, r, characterID).
+				Scan(&record).Error
+			if err == nil && record.Rank > 0 {
+				mu.Lock()
+				result = append(result, &model.RankingLineScoreSchema{
+					Rank:      record.Rank,
+					Score:     record.Score,
+					Timestamp: record.Timestamp,
+				})
+				mu.Unlock()
+			}
+		}(rank)
 	}
+
+	wg.Wait()
 	return result, nil
 }
 
 func FetchWorldBloomRankingScoreGrowths(ctx context.Context, engine *DatabaseEngine, server model.SekaiServerRegion, eventID int, characterID int, ranks []int, startTime int64) ([]*model.RankingScoreGrowthSchema, error) {
 	wlTable := GetWorldBloomTableModel(server, eventID)
 	timeIDTable := GetTimeIDTableModel(server, eventID)
-	result := make([]*model.RankingScoreGrowthSchema, 0)
+
 	query := fmt.Sprintf(`SELECT t.timestamp, w.score, w.rank 
 		FROM %s AS w 
 		INNER JOIN %s AS t ON w.time_id = t.time_id 
@@ -357,31 +397,44 @@ func FetchWorldBloomRankingScoreGrowths(ctx context.Context, engine *DatabaseEng
 		ORDER BY t.timestamp ASC`,
 		engine.db.Statement.Quote(wlTable.TableName()),
 		engine.db.Statement.Quote(timeIDTable.TableName()))
+
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	result := make([]*model.RankingScoreGrowthSchema, 0, len(ranks))
+
 	for _, rank := range ranks {
-		var records []struct {
-			Timestamp int64
-			Score     int
-			Rank      int
-		}
-		err := engine.WithContext(ctx).
-			Raw(query, rank, characterID, startTime).
-			Scan(&records).Error
-		if err == nil && len(records) >= 2 {
-			earlier := records[0]
-			latest := records[len(records)-1]
-			growth := latest.Score - earlier.Score
-			diff := latest.Timestamp - earlier.Timestamp
-			result = append(result, &model.RankingScoreGrowthSchema{
-				Rank:             rank,
-				TimestampLatest:  latest.Timestamp,
-				ScoreLatest:      latest.Score,
-				TimestampEarlier: &earlier.Timestamp,
-				ScoreEarlier:     &earlier.Score,
-				TimeDiff:         &diff,
-				Growth:           &growth,
-			})
-		}
+		wg.Add(1)
+		go func(r int) {
+			defer wg.Done()
+			var records []struct {
+				Timestamp int64
+				Score     int
+				Rank      int
+			}
+			err := engine.WithContext(ctx).
+				Raw(query, r, characterID, startTime).
+				Scan(&records).Error
+			if err == nil && len(records) >= 2 {
+				earlier := records[0]
+				latest := records[len(records)-1]
+				growth := latest.Score - earlier.Score
+				diff := latest.Timestamp - earlier.Timestamp
+				mu.Lock()
+				result = append(result, &model.RankingScoreGrowthSchema{
+					Rank:             r,
+					TimestampLatest:  latest.Timestamp,
+					ScoreLatest:      latest.Score,
+					TimestampEarlier: &earlier.Timestamp,
+					ScoreEarlier:     &earlier.Score,
+					TimeDiff:         &diff,
+					Growth:           &growth,
+				})
+				mu.Unlock()
+			}
+		}(rank)
 	}
+
+	wg.Wait()
 	return result, nil
 }
 
