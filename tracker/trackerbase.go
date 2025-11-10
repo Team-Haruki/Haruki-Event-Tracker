@@ -287,6 +287,9 @@ func (t *EventTrackerBase) getFilterFunc(currentTimeMinute string) func(*model.P
 		return func(r *model.PlayerRankingSchema) bool { return true }
 	}
 	return func(r *model.PlayerRankingSchema) bool {
+		if *r.Rank > 100 {
+			return true
+		}
 		if t.checkRange(r) || t.checkSpecificRanks(r) || t.checkSpecificPlayers(r) {
 			return true
 		}
