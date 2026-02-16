@@ -19,6 +19,11 @@ type PlayerState struct {
 	Rank  int
 }
 
+type WorldBloomKey struct {
+	UserIDKey   int
+	CharacterID int
+}
+
 type SecondLevelEventTrackType string
 
 const (

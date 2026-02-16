@@ -571,7 +571,7 @@ func BatchInsertEventRankings(ctx context.Context, engine *DatabaseEngine, serve
 	})
 }
 
-func BatchInsertWorldBloomRankings(ctx context.Context, engine *DatabaseEngine, server model.SekaiServerRegion, eventID int, records []*model.PlayerWorldBloomRankingRecordSchema, prevState map[string]model.PlayerState) error {
+func BatchInsertWorldBloomRankings(ctx context.Context, engine *DatabaseEngine, server model.SekaiServerRegion, eventID int, records []*model.PlayerWorldBloomRankingRecordSchema, prevState map[model.WorldBloomKey]model.PlayerState) error {
 	if len(records) == 0 {
 		return nil
 	}
@@ -608,7 +608,7 @@ func BatchInsertWorldBloomRankings(ctx context.Context, engine *DatabaseEngine, 
 		var changedRecords []*model.PlayerWorldBloomRankingRecordSchema
 		for _, record := range records {
 			userIDKey := userIDKeyLookup[record.UserID]
-			compositeKey := fmt.Sprintf("%d:%d", userIDKey, record.CharacterID)
+			compositeKey := model.WorldBloomKey{UserIDKey: userIDKey, CharacterID: record.CharacterID}
 			last, exists := prevState[compositeKey]
 			if !exists || last.Score != record.Score || last.Rank != record.Rank {
 				changedRecords = append(changedRecords, record)
