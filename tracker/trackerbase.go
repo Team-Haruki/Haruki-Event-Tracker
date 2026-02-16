@@ -410,9 +410,8 @@ func (t *EventTrackerBase) RecordRankingData(ctx context.Context, isOnlyRecordWo
 		return nil
 	}
 	
-	// Always write heartbeat first with current time
+	// Track current time for heartbeat
 	currentTime := time.Now().Unix()
-	heartbeatWritten := false
 	
 	data, err := t.handleRankingData(ctx)
 	if err != nil {
@@ -436,14 +435,16 @@ func (t *EventTrackerBase) RecordRankingData(ctx context.Context, isOnlyRecordWo
 
 	t.logger.Infof("%s server tracker started inserting ranking data...", t.server)
 	
+	// Track if we need to write standalone heartbeat
+	// Batch functions write heartbeat when called, so only write standalone if neither is called
+	batchFunctionCalled := false
+	
 	// Handle event rankings
-	if !isOnlyRecordWorldBloom {
-		if len(eventRows) > 0 {
-			if err := gorm.BatchInsertEventRankings(ctx, t.dbEngine, t.server, t.eventID, eventRows, t.prevEventState); err != nil {
-				return fmt.Errorf("failed to insert event rankings: %w", err)
-			}
-			heartbeatWritten = true // BatchInsertEventRankings writes heartbeat via batchGetOrCreateTimeIDs
+	if !isOnlyRecordWorldBloom && len(eventRows) > 0 {
+		if err := gorm.BatchInsertEventRankings(ctx, t.dbEngine, t.server, t.eventID, eventRows, t.prevEventState); err != nil {
+			return fmt.Errorf("failed to insert event rankings: %w", err)
 		}
+		batchFunctionCalled = true // BatchInsertEventRankings always writes heartbeat
 	}
 	
 	// Handle world bloom rankings
@@ -451,13 +452,13 @@ func (t *EventTrackerBase) RecordRankingData(ctx context.Context, isOnlyRecordWo
 		if err := gorm.BatchInsertWorldBloomRankings(ctx, t.dbEngine, t.server, t.eventID, wlRows, t.prevWorldBloomState); err != nil {
 			return fmt.Errorf("failed to insert world bloom rankings: %w", err)
 		}
-		heartbeatWritten = true // BatchInsertWorldBloomRankings writes heartbeat via batchGetOrCreateTimeIDs
+		batchFunctionCalled = true // BatchInsertWorldBloomRankings always writes heartbeat
 	}
 	
-	// If no data was written (all records filtered out by deduplication), still write heartbeat
-	if !heartbeatWritten {
+	// If no batch function was called (no input rows), write standalone heartbeat
+	if !batchFunctionCalled {
 		if heartbeatErr := gorm.WriteHeartbeat(ctx, t.dbEngine, t.server, t.eventID, currentTime, 0); heartbeatErr != nil {
-			t.logger.Errorf("Failed to write heartbeat with no data changes: %v", heartbeatErr)
+			t.logger.Errorf("Failed to write heartbeat with no input data: %v", heartbeatErr)
 			return fmt.Errorf("failed to write heartbeat: %w", heartbeatErr)
 		}
 	}
