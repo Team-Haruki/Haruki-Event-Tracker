@@ -508,6 +508,9 @@ func batchGetOrCreateUserIDKeys(tx *gorm.DB, usersTable *DynamicEventUsersTable,
 	return userIDKeyLookup, nil
 }
 
+// BatchInsertEventRankings inserts event ranking records with deduplication.
+// The prevState map is modified by this function to track (score, rank) state.
+// Note: Caller must ensure sequential access to prevState (no concurrent calls).
 func BatchInsertEventRankings(ctx context.Context, engine *DatabaseEngine, server model.SekaiServerRegion, eventID int, records []*model.PlayerEventRankingRecordSchema, prevState map[int]model.PlayerState) error {
 	if len(records) == 0 {
 		return nil
@@ -571,6 +574,9 @@ func BatchInsertEventRankings(ctx context.Context, engine *DatabaseEngine, serve
 	})
 }
 
+// BatchInsertWorldBloomRankings inserts world bloom ranking records with deduplication.
+// The prevState map is modified by this function to track (score, rank) state per (user, character).
+// Note: Caller must ensure sequential access to prevState (no concurrent calls).
 func BatchInsertWorldBloomRankings(ctx context.Context, engine *DatabaseEngine, server model.SekaiServerRegion, eventID int, records []*model.PlayerWorldBloomRankingRecordSchema, prevState map[model.WorldBloomKey]model.PlayerState) error {
 	if len(records) == 0 {
 		return nil

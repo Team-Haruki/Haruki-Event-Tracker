@@ -21,6 +21,10 @@ type HandledRankingData struct {
 	CharacterID        *int
 }
 
+// EventTrackerBase tracks event rankings for a single event
+// Note: RecordRankingData is called sequentially by a cron scheduler, so prevState maps
+// do not require mutex protection. If concurrent calls are introduced in the future,
+// add sync.RWMutex protection to prevEventState and prevWorldBloomState.
 type EventTrackerBase struct {
 	server                     model.SekaiServerRegion
 	eventID                    int
@@ -444,7 +448,7 @@ func (t *EventTrackerBase) RecordRankingData(ctx context.Context, isOnlyRecordWo
 		if err := gorm.BatchInsertEventRankings(ctx, t.dbEngine, t.server, t.eventID, eventRows, t.prevEventState); err != nil {
 			return fmt.Errorf("failed to insert event rankings: %w", err)
 		}
-		batchFunctionCalled = true // BatchInsertEventRankings always writes heartbeat
+		batchFunctionCalled = true // Heartbeat written via batchGetOrCreateTimeIDs (before filtering)
 	}
 	
 	// Handle world bloom rankings
@@ -452,7 +456,7 @@ func (t *EventTrackerBase) RecordRankingData(ctx context.Context, isOnlyRecordWo
 		if err := gorm.BatchInsertWorldBloomRankings(ctx, t.dbEngine, t.server, t.eventID, wlRows, t.prevWorldBloomState); err != nil {
 			return fmt.Errorf("failed to insert world bloom rankings: %w", err)
 		}
-		batchFunctionCalled = true // BatchInsertWorldBloomRankings always writes heartbeat
+		batchFunctionCalled = true // Heartbeat written via batchGetOrCreateTimeIDs (before filtering)
 	}
 	
 	// If no batch function was called (no input rows), write standalone heartbeat
