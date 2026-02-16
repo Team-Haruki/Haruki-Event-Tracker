@@ -10,6 +10,7 @@ import (
 type TimeIDTable struct {
 	TimeID    int   `gorm:"primaryKey;autoIncrement;column:time_id"`
 	Timestamp int64 `gorm:"uniqueIndex;column:timestamp;not null"`
+	Status    int8  `gorm:"column:status;not null;default:0"`
 }
 
 type EventUsersTable struct {

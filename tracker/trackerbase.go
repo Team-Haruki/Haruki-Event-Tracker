@@ -39,6 +39,8 @@ type EventTrackerBase struct {
 	apiClient                  *HarukiSekaiAPIClient
 	lastUpdateTime             string
 	logger                     *logger.Logger
+	prevEventState             map[int]model.PlayerState
+	prevWorldBloomState        map[string]model.PlayerState
 }
 
 func NewEventTrackerBase(
@@ -73,6 +75,8 @@ func NewEventTrackerBase(
 		redisClient:                redisClient,
 		apiClient:                  apiClient,
 		logger:                     logger.NewLogger(fmt.Sprintf("HarukiEventTrackerBase%s-Event%d", strings.ToUpper(string(server)), eventID), "INFO", nil),
+		prevEventState:             make(map[int]model.PlayerState),
+		prevWorldBloomState:        make(map[string]model.PlayerState),
 	}
 	if eventType == model.SekaiEventTypeWorldBloom && worldBloomStatuses != nil && len(worldBloomStatuses) > 0 {
 		tracker.isWorldBloomChapterEnded = make(map[int]bool)
@@ -405,8 +409,18 @@ func (t *EventTrackerBase) RecordRankingData(ctx context.Context, isOnlyRecordWo
 		t.logger.Infof("Detected event ended, skipping ranking data recording.")
 		return nil
 	}
+	
+	// Always write heartbeat first
+	currentTime := time.Now().Unix()
+	
 	data, err := t.handleRankingData(ctx)
 	if err != nil {
+		// On API error, write heartbeat with status=1 and return
+		t.logger.Warnf("API error, writing heartbeat with status=1: %v", err)
+		if heartbeatErr := gorm.WriteHeartbeat(ctx, t.dbEngine, t.server, t.eventID, currentTime, 1); heartbeatErr != nil {
+			t.logger.Errorf("Failed to write heartbeat on API error: %v", heartbeatErr)
+			return fmt.Errorf("API error and heartbeat write failed: %w; original error: %w", heartbeatErr, err)
+		}
 		return err
 	}
 	if data == nil {
@@ -421,12 +435,18 @@ func (t *EventTrackerBase) RecordRankingData(ctx context.Context, isOnlyRecordWo
 
 	t.logger.Infof("%s server tracker started inserting ranking data...", t.server)
 	if !isOnlyRecordWorldBloom && len(eventRows) > 0 {
-		if err := gorm.BatchInsertEventRankings(ctx, t.dbEngine, t.server, t.eventID, eventRows); err != nil {
+		if err := gorm.BatchInsertEventRankings(ctx, t.dbEngine, t.server, t.eventID, eventRows, t.prevEventState); err != nil {
 			return fmt.Errorf("failed to insert event rankings: %w", err)
+		}
+	} else if !isOnlyRecordWorldBloom && len(eventRows) == 0 {
+		// No event data to write, but still write heartbeat with status=0
+		if heartbeatErr := gorm.WriteHeartbeat(ctx, t.dbEngine, t.server, t.eventID, currentTime, 0); heartbeatErr != nil {
+			t.logger.Errorf("Failed to write heartbeat with no data changes: %v", heartbeatErr)
+			return fmt.Errorf("failed to write heartbeat: %w", heartbeatErr)
 		}
 	}
 	if len(wlRows) > 0 {
-		if err := gorm.BatchInsertWorldBloomRankings(ctx, t.dbEngine, t.server, t.eventID, wlRows); err != nil {
+		if err := gorm.BatchInsertWorldBloomRankings(ctx, t.dbEngine, t.server, t.eventID, wlRows, t.prevWorldBloomState); err != nil {
 			return fmt.Errorf("failed to insert world bloom rankings: %w", err)
 		}
 	}

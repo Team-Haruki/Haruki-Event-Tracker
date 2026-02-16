@@ -438,7 +438,7 @@ func FetchWorldBloomRankingScoreGrowths(ctx context.Context, engine *DatabaseEng
 	return result, nil
 }
 
-func batchGetOrCreateTimeIDs(tx *gorm.DB, timeIDTable *DynamicTimeIDTable, timestamps map[int64]bool) (map[int64]int, error) {
+func batchGetOrCreateTimeIDs(tx *gorm.DB, timeIDTable *DynamicTimeIDTable, timestamps map[int64]bool, status int8) (map[int64]int, error) {
 	timeIDLookup := make(map[int64]int)
 	for timestamp := range timestamps {
 		var result TimeIDTable
@@ -446,7 +446,7 @@ func batchGetOrCreateTimeIDs(tx *gorm.DB, timeIDTable *DynamicTimeIDTable, times
 			Where("timestamp = ?", timestamp).
 			First(&result).Error
 		if errors.Is(err, gorm.ErrRecordNotFound) {
-			newRecord := &TimeIDTable{Timestamp: timestamp}
+			newRecord := &TimeIDTable{Timestamp: timestamp, Status: status}
 			err = tx.Table(timeIDTable.TableName()).Create(newRecord).Error
 			if err != nil {
 				return nil, fmt.Errorf("failed to create time_id: %w", err)
@@ -459,6 +459,15 @@ func batchGetOrCreateTimeIDs(tx *gorm.DB, timeIDTable *DynamicTimeIDTable, times
 		}
 	}
 	return timeIDLookup, nil
+}
+
+func WriteHeartbeat(ctx context.Context, engine *DatabaseEngine, server model.SekaiServerRegion, eventID int, timestamp int64, status int8) error {
+	return engine.Transaction(ctx, func(tx *gorm.DB) error {
+		timeIDTable := GetTimeIDTableModel(server, eventID)
+		timestampMap := map[int64]bool{timestamp: true}
+		_, err := batchGetOrCreateTimeIDs(tx, timeIDTable, timestampMap, status)
+		return err
+	})
 }
 
 func batchGetOrCreateUserIDKeys(tx *gorm.DB, usersTable *DynamicEventUsersTable, userMap map[string]struct {
@@ -499,7 +508,7 @@ func batchGetOrCreateUserIDKeys(tx *gorm.DB, usersTable *DynamicEventUsersTable,
 	return userIDKeyLookup, nil
 }
 
-func BatchInsertEventRankings(ctx context.Context, engine *DatabaseEngine, server model.SekaiServerRegion, eventID int, records []*model.PlayerEventRankingRecordSchema) error {
+func BatchInsertEventRankings(ctx context.Context, engine *DatabaseEngine, server model.SekaiServerRegion, eventID int, records []*model.PlayerEventRankingRecordSchema, prevState map[int]model.PlayerState) error {
 	if len(records) == 0 {
 		return nil
 	}
@@ -522,7 +531,7 @@ func BatchInsertEventRankings(ctx context.Context, engine *DatabaseEngine, serve
 			}
 		}
 		timeIDTable := GetTimeIDTableModel(server, eventID)
-		timeIDLookup, err := batchGetOrCreateTimeIDs(tx, timeIDTable, timestampMap)
+		timeIDLookup, err := batchGetOrCreateTimeIDs(tx, timeIDTable, timestampMap, 0)
 		if err != nil {
 			return err
 		}
@@ -531,9 +540,26 @@ func BatchInsertEventRankings(ctx context.Context, engine *DatabaseEngine, serve
 		if err != nil {
 			return err
 		}
-		eventTable := GetEventTableModel(server, eventID)
-		eventRecords := make([]*EventTable, 0, len(records))
+		
+		// Filter records: only keep those with changed (score, rank)
+		var changedRecords []*model.PlayerEventRankingRecordSchema
 		for _, record := range records {
+			userIDKey := userIDKeyLookup[record.UserID]
+			last, exists := prevState[userIDKey]
+			if !exists || last.Score != record.Score || last.Rank != record.Rank {
+				changedRecords = append(changedRecords, record)
+				prevState[userIDKey] = model.PlayerState{Score: record.Score, Rank: record.Rank}
+			}
+		}
+		
+		// If no changes, skip EventTable write
+		if len(changedRecords) == 0 {
+			return nil
+		}
+		
+		eventTable := GetEventTableModel(server, eventID)
+		eventRecords := make([]*EventTable, 0, len(changedRecords))
+		for _, record := range changedRecords {
 			eventRecords = append(eventRecords, &EventTable{
 				TimeID:    timeIDLookup[record.Timestamp],
 				UserIDKey: userIDKeyLookup[record.UserID],
@@ -545,7 +571,7 @@ func BatchInsertEventRankings(ctx context.Context, engine *DatabaseEngine, serve
 	})
 }
 
-func BatchInsertWorldBloomRankings(ctx context.Context, engine *DatabaseEngine, server model.SekaiServerRegion, eventID int, records []*model.PlayerWorldBloomRankingRecordSchema) error {
+func BatchInsertWorldBloomRankings(ctx context.Context, engine *DatabaseEngine, server model.SekaiServerRegion, eventID int, records []*model.PlayerWorldBloomRankingRecordSchema, prevState map[string]model.PlayerState) error {
 	if len(records) == 0 {
 		return nil
 	}
@@ -568,7 +594,7 @@ func BatchInsertWorldBloomRankings(ctx context.Context, engine *DatabaseEngine, 
 			}
 		}
 		timeIDTable := GetTimeIDTableModel(server, eventID)
-		timeIDLookup, err := batchGetOrCreateTimeIDs(tx, timeIDTable, timestampMap)
+		timeIDLookup, err := batchGetOrCreateTimeIDs(tx, timeIDTable, timestampMap, 0)
 		if err != nil {
 			return err
 		}
@@ -577,9 +603,27 @@ func BatchInsertWorldBloomRankings(ctx context.Context, engine *DatabaseEngine, 
 		if err != nil {
 			return err
 		}
-		wlTable := GetWorldBloomTableModel(server, eventID)
-		wlRecords := make([]*WorldBloomTable, 0, len(records))
+		
+		// Filter records: only keep those with changed (score, rank)
+		var changedRecords []*model.PlayerWorldBloomRankingRecordSchema
 		for _, record := range records {
+			userIDKey := userIDKeyLookup[record.UserID]
+			compositeKey := fmt.Sprintf("%d:%d", userIDKey, record.CharacterID)
+			last, exists := prevState[compositeKey]
+			if !exists || last.Score != record.Score || last.Rank != record.Rank {
+				changedRecords = append(changedRecords, record)
+				prevState[compositeKey] = model.PlayerState{Score: record.Score, Rank: record.Rank}
+			}
+		}
+		
+		// If no changes, skip WorldBloomTable write
+		if len(changedRecords) == 0 {
+			return nil
+		}
+		
+		wlTable := GetWorldBloomTableModel(server, eventID)
+		wlRecords := make([]*WorldBloomTable, 0, len(changedRecords))
+		for _, record := range changedRecords {
 			wlRecords = append(wlRecords, &WorldBloomTable{
 				TimeID:      timeIDLookup[record.Timestamp],
 				UserIDKey:   userIDKeyLookup[record.UserID],
