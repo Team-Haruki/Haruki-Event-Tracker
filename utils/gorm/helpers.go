@@ -37,12 +37,12 @@ func FetchLatestRanking(ctx context.Context, engine *DatabaseEngine, server mode
 	timeIDTable := GetTimeIDTableModel(server, eventID)
 	usersTable := GetEventUsersTableModel(server, eventID)
 	var result model.RecordedRankingSchema
-	query := fmt.Sprintf(`SELECT t.timestamp, u.user_id, e.score, e.rank 
-		FROM %s AS e 
-		INNER JOIN %s AS t ON e.time_id = t.time_id 
-		INNER JOIN %s AS u ON e.user_id_key = u.user_id_key 
-		WHERE u.user_id = ? 
-		ORDER BY t.timestamp DESC 
+	query := fmt.Sprintf(`SELECT t.timestamp, u.user_id, e.score, e.rank
+		FROM %s AS e
+		INNER JOIN %s AS t ON e.time_id = t.time_id
+		INNER JOIN %s AS u ON e.user_id_key = u.user_id_key
+		WHERE u.user_id = ?
+		ORDER BY t.timestamp DESC
 		LIMIT 1`,
 		engine.db.Statement.Quote(eventTable.TableName()),
 		engine.db.Statement.Quote(timeIDTable.TableName()),
@@ -67,11 +67,11 @@ func FetchAllRankings(ctx context.Context, engine *DatabaseEngine, server model.
 	timeIDTable := GetTimeIDTableModel(server, eventID)
 	usersTable := GetEventUsersTableModel(server, eventID)
 	var results []*model.RecordedRankingSchema
-	query := fmt.Sprintf(`SELECT t.timestamp, u.user_id, e.score, e.rank 
-		FROM %s AS e 
-		INNER JOIN %s AS t ON e.time_id = t.time_id 
-		INNER JOIN %s AS u ON e.user_id_key = u.user_id_key 
-		WHERE u.user_id = ? 
+	query := fmt.Sprintf(`SELECT t.timestamp, u.user_id, e.score, e.rank
+		FROM %s AS e
+		INNER JOIN %s AS t ON e.time_id = t.time_id
+		INNER JOIN %s AS u ON e.user_id_key = u.user_id_key
+		WHERE u.user_id = ?
 		ORDER BY t.timestamp ASC`,
 		engine.db.Statement.Quote(eventTable.TableName()),
 		engine.db.Statement.Quote(timeIDTable.TableName()),
@@ -90,12 +90,12 @@ func FetchLatestWorldBloomRanking(ctx context.Context, engine *DatabaseEngine, s
 	timeIDTable := GetTimeIDTableModel(server, eventID)
 	usersTable := GetEventUsersTableModel(server, eventID)
 	var result model.RecordedWorldBloomRankingSchema
-	query := fmt.Sprintf(`SELECT t.timestamp, u.user_id, w.score, w.rank, w.character_id 
-		FROM %s AS w 
-		INNER JOIN %s AS t ON w.time_id = t.time_id 
-		INNER JOIN %s AS u ON w.user_id_key = u.user_id_key 
-		WHERE u.user_id = ? AND w.character_id = ? 
-		ORDER BY t.timestamp DESC 
+	query := fmt.Sprintf(`SELECT t.timestamp, u.user_id, w.score, w.rank, w.character_id
+		FROM %s AS w
+		INNER JOIN %s AS t ON w.time_id = t.time_id
+		INNER JOIN %s AS u ON w.user_id_key = u.user_id_key
+		WHERE u.user_id = ? AND w.character_id = ?
+		ORDER BY t.timestamp DESC
 		LIMIT 1`,
 		engine.db.Statement.Quote(wlTable.TableName()),
 		engine.db.Statement.Quote(timeIDTable.TableName()),
@@ -120,11 +120,11 @@ func FetchAllWorldBloomRankings(ctx context.Context, engine *DatabaseEngine, ser
 	timeIDTable := GetTimeIDTableModel(server, eventID)
 	usersTable := GetEventUsersTableModel(server, eventID)
 	var results []*model.RecordedWorldBloomRankingSchema
-	query := fmt.Sprintf(`SELECT t.timestamp, u.user_id, w.score, w.rank, w.character_id 
-		FROM %s AS w 
-		INNER JOIN %s AS t ON w.time_id = t.time_id 
-		INNER JOIN %s AS u ON w.user_id_key = u.user_id_key 
-		WHERE u.user_id = ? AND w.character_id = ? 
+	query := fmt.Sprintf(`SELECT t.timestamp, u.user_id, w.score, w.rank, w.character_id
+		FROM %s AS w
+		INNER JOIN %s AS t ON w.time_id = t.time_id
+		INNER JOIN %s AS u ON w.user_id_key = u.user_id_key
+		WHERE u.user_id = ? AND w.character_id = ?
 		ORDER BY t.timestamp ASC`,
 		engine.db.Statement.Quote(wlTable.TableName()),
 		engine.db.Statement.Quote(timeIDTable.TableName()),
@@ -143,12 +143,12 @@ func FetchLatestRankingByRank(ctx context.Context, engine *DatabaseEngine, serve
 	timeIDTable := GetTimeIDTableModel(server, eventID)
 	usersTable := GetEventUsersTableModel(server, eventID)
 	var result model.RecordedRankingSchema
-	query := fmt.Sprintf(`SELECT t.timestamp, u.user_id, e.score, e.rank 
-		FROM %s AS e 
-		INNER JOIN %s AS t ON e.time_id = t.time_id 
-		INNER JOIN %s AS u ON e.user_id_key = u.user_id_key 
-		WHERE e.rank = ? 
-		ORDER BY t.timestamp DESC 
+	query := fmt.Sprintf(`SELECT t.timestamp, u.user_id, e.score, e.rank
+		FROM %s AS e
+		INNER JOIN %s AS t ON e.time_id = t.time_id
+		INNER JOIN %s AS u ON e.user_id_key = u.user_id_key
+		WHERE e.rank = ?
+		ORDER BY t.timestamp DESC
 		LIMIT 1`,
 		engine.db.Statement.Quote(eventTable.TableName()),
 		engine.db.Statement.Quote(timeIDTable.TableName()),
@@ -173,11 +173,11 @@ func FetchAllRankingsByRank(ctx context.Context, engine *DatabaseEngine, server 
 	timeIDTable := GetTimeIDTableModel(server, eventID)
 	usersTable := GetEventUsersTableModel(server, eventID)
 	var results []*model.RecordedRankingSchema
-	query := fmt.Sprintf(`SELECT t.timestamp, u.user_id, e.score, e.rank 
-		FROM %s AS e 
-		INNER JOIN %s AS t ON e.time_id = t.time_id 
-		INNER JOIN %s AS u ON e.user_id_key = u.user_id_key 
-		WHERE e.rank = ? 
+	query := fmt.Sprintf(`SELECT t.timestamp, u.user_id, e.score, e.rank
+		FROM %s AS e
+		INNER JOIN %s AS t ON e.time_id = t.time_id
+		INNER JOIN %s AS u ON e.user_id_key = u.user_id_key
+		WHERE e.rank = ?
 		ORDER BY t.timestamp ASC`,
 		engine.db.Statement.Quote(eventTable.TableName()),
 		engine.db.Statement.Quote(timeIDTable.TableName()),
@@ -196,12 +196,12 @@ func FetchLatestWorldBloomRankingByRank(ctx context.Context, engine *DatabaseEng
 	timeIDTable := GetTimeIDTableModel(server, eventID)
 	usersTable := GetEventUsersTableModel(server, eventID)
 	var result model.RecordedWorldBloomRankingSchema
-	query := fmt.Sprintf(`SELECT t.timestamp, u.user_id, w.score, w.rank, w.character_id 
-		FROM %s AS w 
-		INNER JOIN %s AS t ON w.time_id = t.time_id 
-		INNER JOIN %s AS u ON w.user_id_key = u.user_id_key 
-		WHERE w.rank = ? AND w.character_id = ? 
-		ORDER BY t.timestamp DESC 
+	query := fmt.Sprintf(`SELECT t.timestamp, u.user_id, w.score, w.rank, w.character_id
+		FROM %s AS w
+		INNER JOIN %s AS t ON w.time_id = t.time_id
+		INNER JOIN %s AS u ON w.user_id_key = u.user_id_key
+		WHERE w.rank = ? AND w.character_id = ?
+		ORDER BY t.timestamp DESC
 		LIMIT 1`,
 		engine.db.Statement.Quote(wlTable.TableName()),
 		engine.db.Statement.Quote(timeIDTable.TableName()),
@@ -226,11 +226,11 @@ func FetchAllWorldBloomRankingsByRank(ctx context.Context, engine *DatabaseEngin
 	timeIDTable := GetTimeIDTableModel(server, eventID)
 	usersTable := GetEventUsersTableModel(server, eventID)
 	var results []*model.RecordedWorldBloomRankingSchema
-	query := fmt.Sprintf(`SELECT t.timestamp, u.user_id, w.score, w.rank, w.character_id 
-		FROM %s AS w 
-		INNER JOIN %s AS t ON w.time_id = t.time_id 
-		INNER JOIN %s AS u ON w.user_id_key = u.user_id_key 
-		WHERE w.rank = ? AND w.character_id = ? 
+	query := fmt.Sprintf(`SELECT t.timestamp, u.user_id, w.score, w.rank, w.character_id
+		FROM %s AS w
+		INNER JOIN %s AS t ON w.time_id = t.time_id
+		INNER JOIN %s AS u ON w.user_id_key = u.user_id_key
+		WHERE w.rank = ? AND w.character_id = ?
 		ORDER BY t.timestamp ASC`,
 		engine.db.Statement.Quote(wlTable.TableName()),
 		engine.db.Statement.Quote(timeIDTable.TableName()),
@@ -248,11 +248,11 @@ func FetchRankingLines(ctx context.Context, engine *DatabaseEngine, server model
 	eventTable := GetEventTableModel(server, eventID)
 	timeIDTable := GetTimeIDTableModel(server, eventID)
 
-	query := fmt.Sprintf(`SELECT t.timestamp, e.score, e.rank 
-		FROM %s AS e 
-		INNER JOIN %s AS t ON e.time_id = t.time_id 
-		WHERE e.rank = ? 
-		ORDER BY t.timestamp DESC 
+	query := fmt.Sprintf(`SELECT t.timestamp, e.score, e.rank
+		FROM %s AS e
+		INNER JOIN %s AS t ON e.time_id = t.time_id
+		WHERE e.rank = ?
+		ORDER BY t.timestamp DESC
 		LIMIT 1`,
 		engine.db.Statement.Quote(eventTable.TableName()),
 		engine.db.Statement.Quote(timeIDTable.TableName()))
@@ -293,10 +293,10 @@ func FetchRankingScoreGrowths(ctx context.Context, engine *DatabaseEngine, serve
 	eventTable := GetEventTableModel(server, eventID)
 	timeIDTable := GetTimeIDTableModel(server, eventID)
 
-	query := fmt.Sprintf(`SELECT t.timestamp, e.score, e.rank 
-		FROM %s AS e 
-		INNER JOIN %s AS t ON e.time_id = t.time_id 
-		WHERE e.rank = ? AND t.timestamp >= ? 
+	query := fmt.Sprintf(`SELECT t.timestamp, e.score, e.rank
+		FROM %s AS e
+		INNER JOIN %s AS t ON e.time_id = t.time_id
+		WHERE e.rank = ? AND t.timestamp >= ?
 		ORDER BY t.timestamp ASC`,
 		engine.db.Statement.Quote(eventTable.TableName()),
 		engine.db.Statement.Quote(timeIDTable.TableName()))
@@ -345,11 +345,11 @@ func FetchWorldBloomRankingLines(ctx context.Context, engine *DatabaseEngine, se
 	wlTable := GetWorldBloomTableModel(server, eventID)
 	timeIDTable := GetTimeIDTableModel(server, eventID)
 
-	query := fmt.Sprintf(`SELECT t.timestamp, w.score, w.rank 
-		FROM %s AS w 
-		INNER JOIN %s AS t ON w.time_id = t.time_id 
-		WHERE w.rank = ? AND w.character_id = ? 
-		ORDER BY t.timestamp DESC 
+	query := fmt.Sprintf(`SELECT t.timestamp, w.score, w.rank
+		FROM %s AS w
+		INNER JOIN %s AS t ON w.time_id = t.time_id
+		WHERE w.rank = ? AND w.character_id = ?
+		ORDER BY t.timestamp DESC
 		LIMIT 1`,
 		engine.db.Statement.Quote(wlTable.TableName()),
 		engine.db.Statement.Quote(timeIDTable.TableName()))
@@ -390,10 +390,10 @@ func FetchWorldBloomRankingScoreGrowths(ctx context.Context, engine *DatabaseEng
 	wlTable := GetWorldBloomTableModel(server, eventID)
 	timeIDTable := GetTimeIDTableModel(server, eventID)
 
-	query := fmt.Sprintf(`SELECT t.timestamp, w.score, w.rank 
-		FROM %s AS w 
-		INNER JOIN %s AS t ON w.time_id = t.time_id 
-		WHERE w.rank = ? AND w.character_id = ? AND t.timestamp >= ? 
+	query := fmt.Sprintf(`SELECT t.timestamp, w.score, w.rank
+		FROM %s AS w
+		INNER JOIN %s AS t ON w.time_id = t.time_id
+		WHERE w.rank = ? AND w.character_id = ? AND t.timestamp >= ?
 		ORDER BY t.timestamp ASC`,
 		engine.db.Statement.Quote(wlTable.TableName()),
 		engine.db.Statement.Quote(timeIDTable.TableName()))
@@ -554,12 +554,12 @@ func BatchInsertEventRankings(ctx context.Context, engine *DatabaseEngine, serve
 				prevState[userIDKey] = model.PlayerState{Score: record.Score, Rank: record.Rank}
 			}
 		}
-		
+
 		// If no changes, skip EventTable write
 		if len(changedRecords) == 0 {
 			return nil
 		}
-		
+
 		eventTable := GetEventTableModel(server, eventID)
 		eventRecords := make([]*EventTable, 0, len(changedRecords))
 		for _, record := range changedRecords {
@@ -621,12 +621,12 @@ func BatchInsertWorldBloomRankings(ctx context.Context, engine *DatabaseEngine, 
 				prevState[compositeKey] = model.PlayerState{Score: record.Score, Rank: record.Rank}
 			}
 		}
-		
+
 		// If no changes, skip WorldBloomTable write
 		if len(changedRecords) == 0 {
 			return nil
 		}
-		
+
 		wlTable := GetWorldBloomTableModel(server, eventID)
 		wlRecords := make([]*WorldBloomTable, 0, len(changedRecords))
 		for _, record := range changedRecords {

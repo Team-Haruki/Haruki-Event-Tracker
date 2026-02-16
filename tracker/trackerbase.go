@@ -413,10 +413,10 @@ func (t *EventTrackerBase) RecordRankingData(ctx context.Context, isOnlyRecordWo
 		t.logger.Infof("Detected event ended, skipping ranking data recording.")
 		return nil
 	}
-	
+
 	// Track current time for heartbeat
 	currentTime := time.Now().Unix()
-	
+
 	data, err := t.handleRankingData(ctx)
 	if err != nil {
 		// On API error, write heartbeat with status=1 and return
@@ -438,11 +438,11 @@ func (t *EventTrackerBase) RecordRankingData(ctx context.Context, isOnlyRecordWo
 	wlRows := t.buildWorldBloomRows(data)
 
 	t.logger.Infof("%s server tracker started inserting ranking data...", t.server)
-	
+
 	// Track if we need to write standalone heartbeat
 	// Batch functions write heartbeat when called, so only write standalone if neither is called
 	batchFunctionCalled := false
-	
+
 	// Handle event rankings
 	if !isOnlyRecordWorldBloom && len(eventRows) > 0 {
 		if err := gorm.BatchInsertEventRankings(ctx, t.dbEngine, t.server, t.eventID, eventRows, t.prevEventState); err != nil {
@@ -450,7 +450,7 @@ func (t *EventTrackerBase) RecordRankingData(ctx context.Context, isOnlyRecordWo
 		}
 		batchFunctionCalled = true // Heartbeat written via batchGetOrCreateTimeIDs (before filtering)
 	}
-	
+
 	// Handle world bloom rankings
 	if len(wlRows) > 0 {
 		if err := gorm.BatchInsertWorldBloomRankings(ctx, t.dbEngine, t.server, t.eventID, wlRows, t.prevWorldBloomState); err != nil {
@@ -458,7 +458,7 @@ func (t *EventTrackerBase) RecordRankingData(ctx context.Context, isOnlyRecordWo
 		}
 		batchFunctionCalled = true // Heartbeat written via batchGetOrCreateTimeIDs (before filtering)
 	}
-	
+
 	// If no batch function was called (no input rows), write standalone heartbeat
 	if !batchFunctionCalled {
 		if heartbeatErr := gorm.WriteHeartbeat(ctx, t.dbEngine, t.server, t.eventID, currentTime, 0); heartbeatErr != nil {
@@ -466,7 +466,7 @@ func (t *EventTrackerBase) RecordRankingData(ctx context.Context, isOnlyRecordWo
 			return fmt.Errorf("failed to write heartbeat: %w", heartbeatErr)
 		}
 	}
-	
+
 	t.logger.Infof("%s server tracker finished inserting ranking data.", t.server)
 	return nil
 }
