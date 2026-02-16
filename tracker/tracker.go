@@ -115,10 +115,19 @@ func (t *HarukiEventTracker) handleWorldBloom(ctx context.Context, event *model.
 		t.tracker.SetWorldBloomChapterStatus(event.ChapterStatuses)
 	}
 
+	// Track all chapters, not just the first one
+	// This allows handling multiple chapters during overlap periods
+	hasEndedChapter := false
 	for characterID, detail := range event.ChapterStatuses {
 		if t.handleWorldBloomChapter(ctx, event, characterID, detail) {
-			break
+			hasEndedChapter = true
 		}
+	}
+
+	// If we recorded any ended chapters, we're done for this tick
+	// Normal ongoing chapters will be recorded in the main RecordRankingData call
+	if hasEndedChapter {
+		return
 	}
 }
 
