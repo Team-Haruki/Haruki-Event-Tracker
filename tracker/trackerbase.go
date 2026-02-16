@@ -258,7 +258,7 @@ func (t *EventTrackerBase) processWorldBloomChapter(chapter model.UserWorldBloom
 		// Chapter aggregation completed, final rankings are now available
 		// This is the critical moment to capture the final results
 		shouldTrack = true
-		t.logger.Infof("Recording final rankings for world bloom chapter %d (character)", charID)
+		t.logger.Infof("Recording final rankings for world bloom chapter (character ID: %d)", charID)
 	}
 	// Note: Aggregating state is handled by the status check - we skip it naturally
 
@@ -419,7 +419,7 @@ func (t *EventTrackerBase) buildWorldBloomRows(data *HandledRankingData) []*mode
 	}
 
 	wlRows := make([]*model.PlayerWorldBloomRankingRecordSchema, 0)
-	
+
 	// Process each character's rankings
 	for characterID, rankings := range data.WorldBloomRankings {
 		for i := range rankings {
@@ -440,7 +440,7 @@ func (t *EventTrackerBase) buildWorldBloomRows(data *HandledRankingData) []*mode
 			})
 		}
 	}
-	
+
 	return wlRows
 }
 
