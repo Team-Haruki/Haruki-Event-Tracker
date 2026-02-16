@@ -15,12 +15,15 @@ import (
 )
 
 type HandledRankingData struct {
-	RecordTime         int64
-	Rankings           []model.PlayerRankingSchema
-	WorldBloomRankings []model.PlayerRankingSchema
-	CharacterID        *int
+	RecordTime          int64
+	Rankings            []model.PlayerRankingSchema
+	WorldBloomRankings  map[int][]model.PlayerRankingSchema // key: characterID
 }
 
+// EventTrackerBase tracks event rankings for a single event
+// Note: RecordRankingData is called sequentially by a cron scheduler, so prevState maps
+// do not require mutex protection. If concurrent calls are introduced in the future,
+// add sync.RWMutex protection to prevEventState and prevWorldBloomState.
 type EventTrackerBase struct {
 	server                     model.SekaiServerRegion
 	eventID                    int
@@ -39,6 +42,8 @@ type EventTrackerBase struct {
 	apiClient                  *HarukiSekaiAPIClient
 	lastUpdateTime             string
 	logger                     *logger.Logger
+	prevEventState             map[int]model.PlayerState
+	prevWorldBloomState        map[model.WorldBloomKey]model.PlayerState
 }
 
 func NewEventTrackerBase(
@@ -73,6 +78,8 @@ func NewEventTrackerBase(
 		redisClient:                redisClient,
 		apiClient:                  apiClient,
 		logger:                     logger.NewLogger(fmt.Sprintf("HarukiEventTrackerBase%s-Event%d", strings.ToUpper(string(server)), eventID), "INFO", nil),
+		prevEventState:             make(map[int]model.PlayerState),
+		prevWorldBloomState:        make(map[model.WorldBloomKey]model.PlayerState),
 	}
 	if eventType == model.SekaiEventTypeWorldBloom && worldBloomStatuses != nil && len(worldBloomStatuses) > 0 {
 		tracker.isWorldBloomChapterEnded = make(map[int]bool)
@@ -170,28 +177,54 @@ func (t *EventTrackerBase) extractMainRankings(top100 *model.Top100RankingRespon
 	return mainTop100Rankings, mainBorderRankings
 }
 
-func (t *EventTrackerBase) extractWorldBloomRankings(top100 *model.Top100RankingResponse, border *model.BorderRankingResponse) ([]model.PlayerRankingSchema, []model.PlayerRankingSchema, *int) {
-	var wlTop100Rankings, wlBorderRankings []model.PlayerRankingSchema
-	var characterID *int
+func (t *EventTrackerBase) extractWorldBloomRankings(top100 *model.Top100RankingResponse, border *model.BorderRankingResponse) map[int][]model.PlayerRankingSchema {
+	result := make(map[int][]model.PlayerRankingSchema)
 
 	if top100.UserWorldBloomChapterRankings == nil || len(top100.UserWorldBloomChapterRankings) == 0 {
-		return wlTop100Rankings, wlBorderRankings, characterID
+		return result
 	}
 
+	// Process all chapters, not just the first one
 	for _, chapter := range top100.UserWorldBloomChapterRankings {
 		charID, rankings := t.processWorldBloomChapter(chapter)
-		if charID != nil {
-			characterID = charID
-			wlTop100Rankings = rankings
-			break
+		if charID != nil && len(rankings) > 0 {
+			// Get border rankings for this character
+			var borderRankings []model.PlayerRankingSchema
+			if border != nil && border.UserWorldBloomChapterRankingBorders != nil {
+				borderRankings = t.extractWorldBloomBorderRankings(border.UserWorldBloomChapterRankingBorders, *charID)
+			}
+
+			// Merge top100 and border for this character
+			result[*charID] = t.mergeWorldBloomRankingsForCharacter(rankings, borderRankings)
 		}
 	}
 
-	if border != nil && border.UserWorldBloomChapterRankingBorders != nil && characterID != nil {
-		wlBorderRankings = t.extractWorldBloomBorderRankings(border.UserWorldBloomChapterRankingBorders, *characterID)
+	return result
+}
+
+func (t *EventTrackerBase) mergeWorldBloomRankingsForCharacter(top100Rankings []model.PlayerRankingSchema, borderRankings []model.PlayerRankingSchema) []model.PlayerRankingSchema {
+	if len(borderRankings) == 0 {
+		return top100Rankings
 	}
 
-	return wlTop100Rankings, wlBorderRankings, characterID
+	// Build a set of ranks in top100
+	top100Ranks := make(map[int]bool)
+	for _, r := range top100Rankings {
+		if r.Rank != nil {
+			top100Ranks[*r.Rank] = true
+		}
+	}
+
+	// Merge: add border rankings that aren't already in top100
+	result := make([]model.PlayerRankingSchema, 0, len(top100Rankings)+len(borderRankings))
+	result = append(result, top100Rankings...)
+	for _, r := range borderRankings {
+		if r.Rank != nil && !top100Ranks[*r.Rank] {
+			result = append(result, r)
+		}
+	}
+
+	return result
 }
 
 func (t *EventTrackerBase) processWorldBloomChapter(chapter model.UserWorldBloomChapterRanking) (*int, []model.PlayerRankingSchema) {
@@ -205,16 +238,32 @@ func (t *EventTrackerBase) processWorldBloomChapter(chapter model.UserWorldBloom
 		return nil, nil
 	}
 
-	if *chapter.IsWorldBloomChapterAggregate {
+	// Skip if this is the aggregate chapter (Finale type)
+	if chapter.IsWorldBloomChapterAggregate != nil && *chapter.IsWorldBloomChapterAggregate {
 		return nil, nil
 	}
 
 	chapterEnded := t.isWorldBloomChapterEnded[charID]
-	if (status.ChapterStatus == model.SekaiEventStatusEnded && !chapterEnded) ||
-		status.ChapterStatus == model.SekaiEventStatusOngoing {
-		if chapter.Rankings != nil {
-			return &charID, chapter.Rankings
-		}
+
+	// Handle three states:
+	// 1. Ongoing: Track normally (ChapterStartAt <= now < AggregateAt)
+	// 2. Aggregating: Server returns empty list, skip (AggregateAt <= now < ChapterEndAt)
+	//    The status check below will naturally skip this since rankings will be nil/empty
+	// 3. Ended: Final rankings available, record once (ChapterEndAt <= now)
+	shouldTrack := false
+	if status.ChapterStatus == model.SekaiEventStatusOngoing {
+		// Normal ongoing tracking
+		shouldTrack = true
+	} else if status.ChapterStatus == model.SekaiEventStatusEnded && !chapterEnded {
+		// Chapter aggregation completed, final rankings are now available
+		// This is the critical moment to capture the final results
+		shouldTrack = true
+		t.logger.Infof("Recording final rankings for world bloom chapter (character ID: %d)", charID)
+	}
+	// Note: Aggregating state is handled by the status check - we skip it naturally
+
+	if shouldTrack && chapter.Rankings != nil && len(chapter.Rankings) > 0 {
+		return &charID, chapter.Rankings
 	}
 
 	return nil, nil
@@ -252,10 +301,10 @@ func (t *EventTrackerBase) handleRankingData(ctx context.Context) (*HandledRanki
 	currentTime := time.Now().Unix()
 	mainTop100Rankings, mainBorderRankings := t.extractMainRankings(top100, border)
 
-	var wlTop100Rankings, wlBorderRankings []model.PlayerRankingSchema
-	var characterID *int
+	// For WorldBloom events, extract rankings for ALL active chapters
+	var wlRankingsMap map[int][]model.PlayerRankingSchema
 	if t.eventType == model.SekaiEventTypeWorldBloom {
-		wlTop100Rankings, wlBorderRankings, characterID = t.extractWorldBloomRankings(top100, border)
+		wlRankingsMap = t.extractWorldBloomRankings(top100, border)
 	}
 
 	mainCacheKey := fmt.Sprintf("%s-event-%d-main-border", t.server, t.eventID)
@@ -264,20 +313,10 @@ func (t *EventTrackerBase) handleRankingData(ctx context.Context) (*HandledRanki
 		return nil, fmt.Errorf("failed to merge main rankings: %w", err)
 	}
 
-	var wlRankings []model.PlayerRankingSchema
-	if len(wlTop100Rankings) > 0 && characterID != nil {
-		wlCacheKey := fmt.Sprintf("%s-event-%d-world-bloom-%d-border", t.server, t.eventID, *characterID)
-		wlRankings, err = t.mergeRankings(ctx, wlTop100Rankings, wlBorderRankings, borderHash, wlCacheKey)
-		if err != nil {
-			return nil, fmt.Errorf("failed to merge world bloom rankings: %w", err)
-		}
-	}
-
 	return &HandledRankingData{
-		RecordTime:         currentTime,
-		Rankings:           rankings,
-		WorldBloomRankings: wlRankings,
-		CharacterID:        characterID,
+		RecordTime:          currentTime,
+		Rankings:            rankings,
+		WorldBloomRankings:  wlRankingsMap,
 	}, nil
 }
 
@@ -375,28 +414,33 @@ func (t *EventTrackerBase) buildEventRows(data *HandledRankingData, filterFunc f
 }
 
 func (t *EventTrackerBase) buildWorldBloomRows(data *HandledRankingData) []*model.PlayerWorldBloomRankingRecordSchema {
-	if len(data.WorldBloomRankings) == 0 || data.CharacterID == nil {
+	if len(data.WorldBloomRankings) == 0 {
 		return nil
 	}
 
 	wlRows := make([]*model.PlayerWorldBloomRankingRecordSchema, 0)
-	for i := range data.WorldBloomRankings {
-		r := &data.WorldBloomRankings[i]
-		if r.UserID == nil || r.Score == nil || r.Rank == nil || r.Name == nil {
-			continue
+
+	// Process each character's rankings
+	for characterID, rankings := range data.WorldBloomRankings {
+		for i := range rankings {
+			r := &rankings[i]
+			if r.UserID == nil || r.Score == nil || r.Rank == nil || r.Name == nil {
+				continue
+			}
+			wlRows = append(wlRows, &model.PlayerWorldBloomRankingRecordSchema{
+				PlayerEventRankingRecordSchema: model.PlayerEventRankingRecordSchema{
+					Timestamp:      data.RecordTime,
+					UserID:         fmt.Sprintf("%d", *r.UserID),
+					Name:           *r.Name,
+					Score:          *r.Score,
+					Rank:           *r.Rank,
+					CheerfulTeamID: t.extractCheerfulTeamID(r),
+				},
+				CharacterID: characterID,
+			})
 		}
-		wlRows = append(wlRows, &model.PlayerWorldBloomRankingRecordSchema{
-			PlayerEventRankingRecordSchema: model.PlayerEventRankingRecordSchema{
-				Timestamp:      data.RecordTime,
-				UserID:         fmt.Sprintf("%d", *r.UserID),
-				Name:           *r.Name,
-				Score:          *r.Score,
-				Rank:           *r.Rank,
-				CheerfulTeamID: t.extractCheerfulTeamID(r),
-			},
-			CharacterID: *data.CharacterID,
-		})
 	}
+
 	return wlRows
 }
 
@@ -405,8 +449,18 @@ func (t *EventTrackerBase) RecordRankingData(ctx context.Context, isOnlyRecordWo
 		t.logger.Infof("Detected event ended, skipping ranking data recording.")
 		return nil
 	}
+
+	// Track current time for heartbeat
+	currentTime := time.Now().Unix()
+
 	data, err := t.handleRankingData(ctx)
 	if err != nil {
+		// On API error, write heartbeat with status=1 and return
+		t.logger.Warnf("API error, writing heartbeat with status=1: %v", err)
+		if heartbeatErr := gorm.WriteHeartbeat(ctx, t.dbEngine, t.server, t.eventID, currentTime, 1); heartbeatErr != nil {
+			t.logger.Errorf("Failed to write heartbeat on API error: %v", heartbeatErr)
+			return fmt.Errorf("API error: %w (heartbeat write also failed: %v)", err, heartbeatErr)
+		}
 		return err
 	}
 	if data == nil {
@@ -420,16 +474,35 @@ func (t *EventTrackerBase) RecordRankingData(ctx context.Context, isOnlyRecordWo
 	wlRows := t.buildWorldBloomRows(data)
 
 	t.logger.Infof("%s server tracker started inserting ranking data...", t.server)
+
+	// Track if we need to write standalone heartbeat
+	// Batch functions write heartbeat when called, so only write standalone if neither is called
+	batchFunctionCalled := false
+
+	// Handle event rankings
 	if !isOnlyRecordWorldBloom && len(eventRows) > 0 {
-		if err := gorm.BatchInsertEventRankings(ctx, t.dbEngine, t.server, t.eventID, eventRows); err != nil {
+		if err := gorm.BatchInsertEventRankings(ctx, t.dbEngine, t.server, t.eventID, eventRows, t.prevEventState); err != nil {
 			return fmt.Errorf("failed to insert event rankings: %w", err)
 		}
+		batchFunctionCalled = true // Heartbeat written via batchGetOrCreateTimeIDs (before filtering)
 	}
+
+	// Handle world bloom rankings
 	if len(wlRows) > 0 {
-		if err := gorm.BatchInsertWorldBloomRankings(ctx, t.dbEngine, t.server, t.eventID, wlRows); err != nil {
+		if err := gorm.BatchInsertWorldBloomRankings(ctx, t.dbEngine, t.server, t.eventID, wlRows, t.prevWorldBloomState); err != nil {
 			return fmt.Errorf("failed to insert world bloom rankings: %w", err)
 		}
+		batchFunctionCalled = true // Heartbeat written via batchGetOrCreateTimeIDs (before filtering)
 	}
+
+	// If no batch function was called (no input rows), write standalone heartbeat
+	if !batchFunctionCalled {
+		if heartbeatErr := gorm.WriteHeartbeat(ctx, t.dbEngine, t.server, t.eventID, currentTime, 0); heartbeatErr != nil {
+			t.logger.Errorf("Failed to write heartbeat with no input data: %v", heartbeatErr)
+			return fmt.Errorf("failed to write heartbeat: %w", heartbeatErr)
+		}
+	}
+
 	t.logger.Infof("%s server tracker finished inserting ranking data.", t.server)
 	return nil
 }

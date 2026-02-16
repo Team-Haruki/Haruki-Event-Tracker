@@ -8,6 +8,9 @@
 *.so
 *.dylib
 
+# Project binary
+haruki-tracker
+
 # Test binary, built with `go test -c`
 *.test
 

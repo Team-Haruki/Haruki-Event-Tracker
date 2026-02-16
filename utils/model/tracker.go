@@ -14,6 +14,16 @@ type PlayerWorldBloomRankingRecordSchema struct {
 	CharacterID int
 }
 
+type PlayerState struct {
+	Score int
+	Rank  int
+}
+
+type WorldBloomKey struct {
+	UserIDKey   int
+	CharacterID int
+}
+
 type SecondLevelEventTrackType string
 
 const (
