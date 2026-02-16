@@ -543,7 +543,7 @@ func BatchInsertEventRankings(ctx context.Context, engine *DatabaseEngine, serve
 		if err != nil {
 			return err
 		}
-		
+
 		// Filter records: only keep those with changed (score, rank)
 		var changedRecords []*model.PlayerEventRankingRecordSchema
 		for _, record := range records {
@@ -609,7 +609,7 @@ func BatchInsertWorldBloomRankings(ctx context.Context, engine *DatabaseEngine, 
 		if err != nil {
 			return err
 		}
-		
+
 		// Filter records: only keep those with changed (score, rank)
 		var changedRecords []*model.PlayerWorldBloomRankingRecordSchema
 		for _, record := range records {

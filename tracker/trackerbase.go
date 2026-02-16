@@ -423,7 +423,7 @@ func (t *EventTrackerBase) RecordRankingData(ctx context.Context, isOnlyRecordWo
 		t.logger.Warnf("API error, writing heartbeat with status=1: %v", err)
 		if heartbeatErr := gorm.WriteHeartbeat(ctx, t.dbEngine, t.server, t.eventID, currentTime, 1); heartbeatErr != nil {
 			t.logger.Errorf("Failed to write heartbeat on API error: %v", heartbeatErr)
-			return fmt.Errorf("API error and heartbeat write failed: %w; original error: %w", heartbeatErr, err)
+			return fmt.Errorf("API error: %w (heartbeat write also failed: %v)", err, heartbeatErr)
 		}
 		return err
 	}
