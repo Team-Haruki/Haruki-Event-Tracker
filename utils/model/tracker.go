@@ -15,8 +15,13 @@ type PlayerWorldBloomRankingRecordSchema struct {
 }
 
 type PlayerState struct {
-	Score int
-	Rank  int
+	Score int `json:"s"`
+	Rank  int `json:"r"`
+}
+
+type RankState struct {
+	UserID string `json:"u"`
+	Score  int    `json:"s"`
 }
 
 type WorldBloomKey struct {

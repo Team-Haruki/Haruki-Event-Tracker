@@ -508,10 +508,7 @@ func batchGetOrCreateUserIDKeys(tx *gorm.DB, usersTable *DynamicEventUsersTable,
 	return userIDKeyLookup, nil
 }
 
-// BatchInsertEventRankings inserts event ranking records with deduplication.
-// The prevState map is modified by this function to track (score, rank) state.
-// Note: Caller must ensure sequential access to prevState (no concurrent calls).
-func BatchInsertEventRankings(ctx context.Context, engine *DatabaseEngine, server model.SekaiServerRegion, eventID int, records []*model.PlayerEventRankingRecordSchema, prevState map[int]model.PlayerState) error {
+func BatchInsertEventRankings(ctx context.Context, engine *DatabaseEngine, server model.SekaiServerRegion, eventID int, records []*model.PlayerEventRankingRecordSchema, _ map[int]model.PlayerState) error {
 	if len(records) == 0 {
 		return nil
 	}
@@ -544,25 +541,9 @@ func BatchInsertEventRankings(ctx context.Context, engine *DatabaseEngine, serve
 			return err
 		}
 
-		// Filter records: only keep those with changed (score, rank)
-		var changedRecords []*model.PlayerEventRankingRecordSchema
-		for _, record := range records {
-			userIDKey := userIDKeyLookup[record.UserID]
-			last, exists := prevState[userIDKey]
-			if !exists || last.Score != record.Score || last.Rank != record.Rank {
-				changedRecords = append(changedRecords, record)
-				prevState[userIDKey] = model.PlayerState{Score: record.Score, Rank: record.Rank}
-			}
-		}
-
-		// If no changes, skip EventTable write
-		if len(changedRecords) == 0 {
-			return nil
-		}
-
 		eventTable := GetEventTableModel(server, eventID)
-		eventRecords := make([]*EventTable, 0, len(changedRecords))
-		for _, record := range changedRecords {
+		eventRecords := make([]*EventTable, 0, len(records))
+		for _, record := range records {
 			eventRecords = append(eventRecords, &EventTable{
 				TimeID:    timeIDLookup[record.Timestamp],
 				UserIDKey: userIDKeyLookup[record.UserID],
@@ -570,13 +551,11 @@ func BatchInsertEventRankings(ctx context.Context, engine *DatabaseEngine, serve
 				Rank:      record.Rank,
 			})
 		}
+
 		return tx.Table(eventTable.TableName()).Create(eventRecords).Error
 	})
 }
 
-// BatchInsertWorldBloomRankings inserts world bloom ranking records with deduplication.
-// The prevState map is modified by this function to track (score, rank) state per (user, character).
-// Note: Caller must ensure sequential access to prevState (no concurrent calls).
 func BatchInsertWorldBloomRankings(ctx context.Context, engine *DatabaseEngine, server model.SekaiServerRegion, eventID int, records []*model.PlayerWorldBloomRankingRecordSchema, prevState map[model.WorldBloomKey]model.PlayerState) error {
 	if len(records) == 0 {
 		return nil
@@ -610,7 +589,6 @@ func BatchInsertWorldBloomRankings(ctx context.Context, engine *DatabaseEngine, 
 			return err
 		}
 
-		// Filter records: only keep those with changed (score, rank)
 		var changedRecords []*model.PlayerWorldBloomRankingRecordSchema
 		for _, record := range records {
 			userIDKey := userIDKeyLookup[record.UserID]
@@ -622,7 +600,6 @@ func BatchInsertWorldBloomRankings(ctx context.Context, engine *DatabaseEngine, 
 			}
 		}
 
-		// If no changes, skip WorldBloomTable write
 		if len(changedRecords) == 0 {
 			return nil
 		}
