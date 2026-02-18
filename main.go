@@ -15,6 +15,7 @@ import (
 
 	"github.com/bytedance/sonic"
 	"github.com/gofiber/fiber/v3"
+	"github.com/gofiber/fiber/v3/middleware/compress"
 	"github.com/gofiber/fiber/v3/middleware/logger"
 	"github.com/gofiber/fiber/v3/middleware/recover"
 )
@@ -66,6 +67,7 @@ func main() {
 		},
 	})
 	app.Use(recover.New())
+	app.Use(compress.New(compress.Config{Level: compress.LevelBestSpeed}))
 	if config.Cfg.Backend.AccessLog != "" {
 		logCfg := logger.Config{
 			Format:     config.Cfg.Backend.AccessLog,
