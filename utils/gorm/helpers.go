@@ -470,6 +470,30 @@ func WriteHeartbeat(ctx context.Context, engine *DatabaseEngine, server model.Se
 	})
 }
 
+func FetchLatestHeartbeat(ctx context.Context, engine *DatabaseEngine, server model.SekaiServerRegion, eventID int) (*int64, *int8, error) {
+	timeIDTable := GetTimeIDTableModel(server, eventID)
+	type Result struct {
+		Timestamp int64
+		Status    int8
+	}
+	var result Result
+	err := engine.db.WithContext(ctx).
+		Table(timeIDTable.TableName()).
+		Order("timestamp DESC").
+		Limit(1).
+		Scan(&result).Error
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, nil, nil
+		}
+		return nil, nil, fmt.Errorf("failed to fetch latest heartbeat: %w", err)
+	}
+	if result.Timestamp == 0 {
+		return nil, nil, nil
+	}
+	return &result.Timestamp, &result.Status, nil
+}
+
 func batchGetOrCreateUserIDKeys(tx *gorm.DB, usersTable *DynamicEventUsersTable, userMap map[string]struct {
 	Name           string
 	CheerfulTeamID *int

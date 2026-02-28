@@ -59,12 +59,6 @@ func (t *HarukiEventTracker) Init() error {
 		event.EventID,
 		event.EventType,
 		isEventEnded,
-		t.trackerConfig.SecondLevelTrackType,
-		t.trackerConfig.RangeTrackLowerRank,
-		t.trackerConfig.RangeTrackUpperRank,
-		t.trackerConfig.SpecificTrackRanks,
-		t.trackerConfig.TrackSpecificPlayers,
-		t.trackerConfig.SpecificPlayerUserIDs,
 		t.dbEngine, t.redis, &t.sekaiAPI, event.ChapterStatuses)
 	err = t.tracker.Init(ctx)
 	if err != nil {

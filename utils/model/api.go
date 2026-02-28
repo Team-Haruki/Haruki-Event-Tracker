@@ -43,3 +43,10 @@ type RankingScoreGrowthSchema struct {
 	TimeDiff         *int64 `json:"timeDiff,omitempty"`
 	Growth           *int   `json:"growth,omitempty"`
 }
+
+type EventStatusResponseSchema struct {
+	Timestamp  int64  `json:"timestamp"`
+	Status     int8   `json:"status"`
+	StatusDesc string `json:"statusDesc"`
+	TimeAgo    int64  `json:"timeAgo"`
+}

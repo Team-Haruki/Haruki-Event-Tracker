@@ -12,15 +12,9 @@ var Version = "2.0.0-dev"
 var Cfg Config
 
 type TrackerConfig struct {
-	Enabled               bool                            `yaml:"enabled"`
-	UseSecondLevelCron    bool                            `yaml:"use_second_level_cron,omitempty"`
-	Cron                  string                          `yaml:"cron"`
-	SecondLevelTrackType  model.SecondLevelEventTrackType `yaml:"second_level_track_type"`
-	RangeTrackLowerRank   *int                            `yaml:"range_track_lower_rank,omitempty"`
-	RangeTrackUpperRank   *int                            `yaml:"range_track_upper_rank,omitempty"`
-	SpecificTrackRanks    *[]int                          `yaml:"specific_track_ranks,omitempty"`
-	TrackSpecificPlayers  *bool                           `yaml:"track_specific_players,omitempty"`
-	SpecificPlayerUserIDs *[]string                       `yaml:"specific_player_user_ids,omitempty"`
+	Enabled            bool   `yaml:"enabled"`
+	UseSecondLevelCron bool   `yaml:"use_second_level_cron,omitempty"`
+	Cron               string `yaml:"cron"`
 }
 
 type RedisConfig struct {

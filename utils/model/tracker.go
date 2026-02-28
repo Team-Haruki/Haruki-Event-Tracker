@@ -28,10 +28,3 @@ type WorldBloomKey struct {
 	UserIDKey   int
 	CharacterID int
 }
-
-type SecondLevelEventTrackType string
-
-const (
-	SecondLevelEventTrackTypeRange    SecondLevelEventTrackType = "range"
-	SecondLevelEventTrackTypeSpecific SecondLevelEventTrackType = "specific"
-)

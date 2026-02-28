@@ -22,27 +22,21 @@ type HandledRankingData struct {
 }
 
 type EventTrackerBase struct {
-	server                     model.SekaiServerRegion
-	eventID                    int
-	eventType                  model.SekaiEventType
-	isEventEnded               bool
-	worldBloomStatuses         map[int]model.WorldBloomChapterStatus
-	isWorldBloomChapterEnded   map[int]bool
-	secondLevelTrackType       model.SecondLevelEventTrackType
-	rangeTrackLowerRank        *int
-	rangeTrackUpperRank        *int
-	SpecificTrackRanks         *[]int
-	trackSpecificPlayer        *bool
-	trackSpecificPlayerUserIDs *[]string
-	dbEngine                   *gorm.DatabaseEngine
-	redisClient                *redis.Client
-	apiClient                  *HarukiSekaiAPIClient
-	lastUpdateTime             string
-	logger                     *logger.Logger
-	prevEventState             map[int]model.PlayerState
-	prevWorldBloomState        map[model.WorldBloomKey]model.PlayerState
-	prevRankState              map[int]model.RankState
-	prevUserState              map[string]model.PlayerState
+	server                   model.SekaiServerRegion
+	eventID                  int
+	eventType                model.SekaiEventType
+	isEventEnded             bool
+	worldBloomStatuses       map[int]model.WorldBloomChapterStatus
+	isWorldBloomChapterEnded map[int]bool
+	dbEngine                 *gorm.DatabaseEngine
+	redisClient              *redis.Client
+	apiClient                *HarukiSekaiAPIClient
+	lastUpdateTime           string
+	logger                   *logger.Logger
+	prevEventState           map[int]model.PlayerState
+	prevWorldBloomState      map[model.WorldBloomKey]model.PlayerState
+	prevRankState            map[int]model.RankState
+	prevUserState            map[string]model.PlayerState
 }
 
 func NewEventTrackerBase(
@@ -50,37 +44,25 @@ func NewEventTrackerBase(
 	eventID int,
 	eventType model.SekaiEventType,
 	isEventEnded bool,
-	secondLevelTrackType model.SecondLevelEventTrackType,
-	rangeTrackLowerRank *int,
-	rangeTrackUpperRank *int,
-	specificTrackRanks *[]int,
-	trackSpecificPlayer *bool,
-	trackSpecificPlayerUserIDs *[]string,
 	engine *gorm.DatabaseEngine,
 	redisClient *redis.Client,
 	apiClient *HarukiSekaiAPIClient,
 	worldBloomStatuses map[int]model.WorldBloomChapterStatus,
 ) *EventTrackerBase {
 	tracker := &EventTrackerBase{
-		server:                     server,
-		eventID:                    eventID,
-		eventType:                  eventType,
-		isEventEnded:               isEventEnded,
-		worldBloomStatuses:         worldBloomStatuses,
-		secondLevelTrackType:       secondLevelTrackType,
-		rangeTrackLowerRank:        rangeTrackLowerRank,
-		rangeTrackUpperRank:        rangeTrackUpperRank,
-		SpecificTrackRanks:         specificTrackRanks,
-		trackSpecificPlayer:        trackSpecificPlayer,
-		trackSpecificPlayerUserIDs: trackSpecificPlayerUserIDs,
-		dbEngine:                   engine,
-		redisClient:                redisClient,
-		apiClient:                  apiClient,
-		logger:                     logger.NewLogger(fmt.Sprintf("HarukiEventTrackerBase%s-Event%d", strings.ToUpper(string(server)), eventID), "INFO", nil),
-		prevEventState:             make(map[int]model.PlayerState),
-		prevWorldBloomState:        make(map[model.WorldBloomKey]model.PlayerState),
-		prevRankState:              make(map[int]model.RankState),
-		prevUserState:              make(map[string]model.PlayerState),
+		server:              server,
+		eventID:             eventID,
+		eventType:           eventType,
+		isEventEnded:        isEventEnded,
+		worldBloomStatuses:  worldBloomStatuses,
+		dbEngine:            engine,
+		redisClient:         redisClient,
+		apiClient:           apiClient,
+		logger:              logger.NewLogger(fmt.Sprintf("HarukiEventTrackerBase%s-Event%d", strings.ToUpper(string(server)), eventID), "INFO", nil),
+		prevEventState:      make(map[int]model.PlayerState),
+		prevWorldBloomState: make(map[model.WorldBloomKey]model.PlayerState),
+		prevRankState:       make(map[int]model.RankState),
+		prevUserState:       make(map[string]model.PlayerState),
 	}
 	if eventType == model.SekaiEventTypeWorldBloom && worldBloomStatuses != nil && len(worldBloomStatuses) > 0 {
 		tracker.isWorldBloomChapterEnded = make(map[int]bool)
@@ -398,9 +380,6 @@ func (t *EventTrackerBase) diffRankBased(
 		if r.Rank == nil || r.Score == nil || r.UserID == nil {
 			continue
 		}
-		if *r.Rank > 100 {
-			continue
-		}
 
 		rank := *r.Rank
 		score := *r.Score
@@ -417,52 +396,11 @@ func (t *EventTrackerBase) diffRankBased(
 	return result
 }
 
-func (t *EventTrackerBase) diffUserBased(
-	data []model.PlayerRankingSchema,
-	changedUsers map[string]model.PlayerState,
-) []*model.PlayerRankingSchema {
-	if t.trackSpecificPlayer == nil || !*t.trackSpecificPlayer {
-		return nil
-	}
-
-	var result []*model.PlayerRankingSchema
-	allowedUserIDs := make(map[string]bool)
-	if t.trackSpecificPlayerUserIDs != nil {
-		for _, uid := range *t.trackSpecificPlayerUserIDs {
-			allowedUserIDs[uid] = true
-		}
-	}
-
-	for i := range data {
-		r := &data[i]
-		if r.Rank == nil || r.Score == nil || r.UserID == nil {
-			continue
-		}
-		userID := fmt.Sprintf("%d", *r.UserID)
-
-		// Filter for specific players
-		if len(allowedUserIDs) > 0 && !allowedUserIDs[userID] {
-			continue
-		}
-
-		score := *r.Score
-		rank := *r.Rank
-
-		prev, exists := t.prevUserState[userID]
-		if !exists || prev.Score != score || prev.Rank != rank {
-			result = append(result, r)
-			newState := model.PlayerState{Score: score, Rank: rank}
-			t.prevUserState[userID] = newState
-			changedUsers[userID] = newState
-		}
-	}
-	return result
-}
+// Specific player tracking logic has been removed.
 
 func (t *EventTrackerBase) buildEventRecords(
 	recordTime int64,
 	rankBasedRows []*model.PlayerRankingSchema,
-	userBasedRows []*model.PlayerRankingSchema,
 ) []*model.PlayerEventRankingRecordSchema {
 	uniqueRecords := make(map[string]*model.PlayerEventRankingRecordSchema)
 
@@ -484,9 +422,6 @@ func (t *EventTrackerBase) buildEventRecords(
 	for _, r := range rankBasedRows {
 		addRecord(r)
 	}
-	for _, r := range userBasedRows {
-		addRecord(r)
-	}
 
 	result := make([]*model.PlayerEventRankingRecordSchema, 0, len(uniqueRecords))
 	for _, r := range uniqueRecords {
@@ -501,62 +436,8 @@ func (t *EventTrackerBase) getFilterFunc(currentTimeMinute string) func(*model.P
 		return func(r *model.PlayerRankingSchema) bool { return true }
 	}
 	return func(r *model.PlayerRankingSchema) bool {
-		if *r.Rank > 100 {
-			return true
-		}
-		if t.checkRange(r) || t.checkSpecificRanks(r) || t.checkSpecificPlayers(r) {
-			return true
-		}
-		return false
+		return true
 	}
-}
-
-func (t *EventTrackerBase) checkRange(r *model.PlayerRankingSchema) bool {
-	if t.secondLevelTrackType != model.SecondLevelEventTrackTypeRange {
-		return false
-	}
-	if t.rangeTrackUpperRank == nil || t.rangeTrackLowerRank == nil {
-		return false
-	}
-	lower := *t.rangeTrackLowerRank
-	upper := *t.rangeTrackUpperRank
-	if lower > upper {
-		lower, upper = upper, lower
-	}
-	if r.Rank == nil {
-		return false
-	}
-	return *r.Rank >= lower && *r.Rank <= upper
-}
-
-func (t *EventTrackerBase) checkSpecificRanks(r *model.PlayerRankingSchema) bool {
-	if t.secondLevelTrackType != model.SecondLevelEventTrackTypeSpecific {
-		return false
-	}
-	if t.SpecificTrackRanks == nil || r.Rank == nil {
-		return false
-	}
-	for _, rank := range *t.SpecificTrackRanks {
-		if *r.Rank == rank {
-			return true
-		}
-	}
-	return false
-}
-
-func (t *EventTrackerBase) checkSpecificPlayers(r *model.PlayerRankingSchema) bool {
-	if t.trackSpecificPlayer == nil || !*t.trackSpecificPlayer {
-		return false
-	}
-	if t.trackSpecificPlayerUserIDs == nil || r.UserID == nil {
-		return false
-	}
-	for _, userID := range *t.trackSpecificPlayerUserIDs {
-		if fmt.Sprintf("%d", *r.UserID) == userID {
-			return true
-		}
-	}
-	return false
 }
 
 func (t *EventTrackerBase) extractCheerfulTeamID(r *model.PlayerRankingSchema) *int {
@@ -643,12 +524,11 @@ func (t *EventTrackerBase) RecordRankingData(ctx context.Context, isOnlyRecordWo
 	batchFunctionCalled := false
 
 	changedRanks := make(map[int]model.RankState)
-	changedUsers := make(map[string]model.PlayerState)
+	changedUsers := make(map[string]model.PlayerState) // Kept for struct compatibility
 
 	if !isOnlyRecordWorldBloom && len(data.Rankings) > 0 {
 		rankBasedDiffs := t.diffRankBased(data.Rankings, changedRanks)
-		userBasedDiffs := t.diffUserBased(data.Rankings, changedUsers)
-		eventRows := t.buildEventRecords(data.RecordTime, rankBasedDiffs, userBasedDiffs)
+		eventRows := t.buildEventRecords(data.RecordTime, rankBasedDiffs)
 
 		if len(eventRows) > 0 {
 			if err := gorm.BatchInsertEventRankings(ctx, t.dbEngine, t.server, t.eventID, eventRows, nil); err != nil {

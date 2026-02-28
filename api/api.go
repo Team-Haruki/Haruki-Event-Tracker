@@ -286,6 +286,36 @@ func getWorldBloomRankingScoreGrowths(c fiber.Ctx) error {
 	return c.JSON(result)
 }
 
+func getEventStatus(c fiber.Ctx) error {
+	p, err := parseCommonParams(c)
+	if err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
+	}
+
+	timestamp, status, err := gorm.FetchLatestHeartbeat(p.ctx, p.engine, p.serverRegion, p.eventID)
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": err.Error()})
+	}
+	if timestamp == nil {
+		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "no heartbeat found"})
+	}
+
+	currentTime := c.RequestCtx().Time().Unix()
+	timeAgo := currentTime - *timestamp
+
+	statusDesc := "OK"
+	if *status != 0 {
+		statusDesc = "Error"
+	}
+
+	return c.JSON(model.EventStatusResponseSchema{
+		Timestamp:  *timestamp,
+		Status:     *status,
+		StatusDesc: statusDesc,
+		TimeAgo:    timeAgo,
+	})
+}
+
 func RegisterRoutes(app *fiber.App) {
 	eventAPI := app.Group("/event/:server/:event_id")
 	eventAPI.Get("/latest-ranking/user/:user_id", getNormalRankingByUserID)
@@ -301,4 +331,5 @@ func RegisterRoutes(app *fiber.App) {
 	eventAPI.Get("/ranking-score-growth/interval/:interval", getRankingScoreGrowths)
 	eventAPI.Get("/world-bloom-ranking-lines/character/:character_id", getWorldBloomRankingLines)
 	eventAPI.Get("/world-bloom-ranking-score-growth/character/:character_id/interval/:interval", getWorldBloomRankingScoreGrowths)
+	eventAPI.Get("/status", getEventStatus)
 }
