@@ -151,10 +151,12 @@ src/
 - [x] `#[tracing::instrument(skip(self), fields(server, event_id))]` 覆盖
 - 新增 `sha2 = "0.10"` 依赖
 
-### Phase 4 — 事件解析器 `[ ]`
-- [ ] `tracker/parser.rs`:`tokio::fs` + sonic-rs 读取 `events.json` / `worldBlooms.json` / `eventCards.json` 等
-- [ ] 输出 `EventStatus { event_id, event_type, event_status, chapter_statuses }`
-- [ ] 与 Go 版 `eventparser.go` 行为对照
+### Phase 4 — 事件解析器 `[x]`
+- [x] `tracker/parser.rs`:`EventDataParser { server, master_dir }`,`tokio::fs::read` + `sonic_rs::from_slice` 读取 `events.json` / `worldBlooms.json`(Go 版 dead-code `LoadData(path)` 通用缓存已废弃)
+- [x] `get_current_event_status` 输出 `Option<EventStatus>`,带 `ChapterStatuses`(World Bloom 类型才填),非 World Bloom 走空 HashMap
+- [x] `get_world_bloom_character_statuses`:跳过 `Finale` chapter,按 `(start, aggregate, end)` 计算每角色 chapter 状态
+- [x] `event_time_remain` 复刻 Go 版多语言 remaining-time 格式化(JP/CN/TW/EN/KR);5 个单测覆盖
+- [x] `ParseError { Read, Parse }` thiserror 枚举,`#[tracing::instrument]` 覆盖入口
 
 ### Phase 5 — Tracker 核心 `[ ]`
 - [ ] `tracker/diff.rs`:`diff_rank_based` + `merge_rankings`(**纯函数**)
