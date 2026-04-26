@@ -117,16 +117,18 @@ src/
 - [x] 建立 `src/` 目录骨架,53 个 `.rs` 文件,`foo.rs` + `foo/` 同层模式贯穿
 - [x] 通过 `cargo check`(29.93s,无 warning)
 - 已解析依赖版本:axum 0.8.9 / sea-orm 1.1.20 / sea-query 0.32.7 / sonic-rs 0.3.17 / redis 0.27.6 / tokio-cron-scheduler 0.13.0 / reqwest 0.12.28 / tower-http 0.6.8
-- ⚠ `serde_yaml 0.9.34+deprecated`:dtolnay 已停止维护,Phase 1 切到 `serde_yml`(社区维护 fork,API 兼容)
+- ⚠ `serde_yaml 0.9.34+deprecated`:dtolnay 已停止维护,但 API 稳定。Phase 1 暂留,后续如出现问题再切 `serde_yml`(API 兼容 fork)
 
-### Phase 1 — 基础数据层 `[ ]`
-- [ ] `config.rs`:Config / BackendConfig / RedisConfig / SekaiAPIConfig / ServerConfig 结构体 + `load_from_file`
-- [ ] `model/enums.rs`:SekaiServerRegion / EventType / EventStatus / WorldBloomType / SpeedType / Unit + `RankingLinesNormal/WorldBloom` 常量
-- [ ] `model/sekai.rs`:Top100Response / BorderResponse / PlayerRankingSchema / UserWorldBloomChapterRanking 等
-- [ ] `model/api.rs`:UserLatestRankingQueryResponse / UserAllRankingDataQueryResponse / EventStatusResponse 等
-- [ ] `model/tracker.rs`:PlayerState / RankState / WorldBloomKey / HandledRankingData
-- [ ] `model/db_config.rs`:DbConfig / NamingConfig / LoggerConfig
-- [ ] `logger.rs`:tracing-subscriber + 文件 multi-writer,保留 `[Component] LEVEL` 格式
+### Phase 1 — 基础数据层 `[x]`
+- [x] `config.rs`:Config / BackendConfig / RedisConfig / SekaiAPIConfig / ServerConfig 结构体 + `load_from_file`(`gorm_config` YAML 键保留以兼容旧配置)
+- [x] `model/enums.rs`:SekaiServerRegion / EventType / EventStatus / WorldBloomType / SpeedType / Unit + `SEKAI_EVENT_RANKING_LINES_{NORMAL,WORLD_BLOOM}` 常量
+- [x] `model/sekai.rs`:Top100Response / BorderResponse / PlayerRankingSchema / UserWorldBloomChapterRanking 等(receive-only,丢弃 Go 版未消费的字段)
+- [x] `model/api.rs`:UserLatestRankingQueryResponse / UserAllRankingDataQueryResponse / EventStatusResponse 等;`RecordedRankData` 用 `#[serde(untagged)]` enum 替代 Go 的 `interface{}`
+- [x] `model/tracker.rs`:PlayerState / RankState 保留短键(`s`/`r`/`u`)字节兼容 Go Redis state;新增 WorldBloomKey / HandledRankingData
+- [x] `model/db_config.rs`:DbConfig / NamingConfig / LoggerConfig(对齐 Go `GormConfig` 字段)
+- [x] `model/event.rs`:EventStatus / Event / WorldBloom / WorldBloomChapterStatus,master data 解析输出
+- [x] `logger.rs`:tracing-subscriber + `Mutex<File>` 文件 mirror,自定义 `GoStyleFormat` 保留 `[ts][LEVEL][target] msg` 格式
+- 通过 `cargo check --all-targets`,无 warning
 
 ### Phase 2 — 数据库层 `[ ]`
 - [ ] `db/entity/{time_id,event_users,event,world_bloom}.rs`:4 个 SeaORM Entity
