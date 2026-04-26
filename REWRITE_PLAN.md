@@ -144,11 +144,12 @@ src/
 - [x] `db/query/batch.rs`:`batch_insert_event_rankings` / `batch_insert_world_bloom_rankings` + `batch_get_or_create_{time_ids,user_id_keys}`(`OnConflict::do_nothing` 兜底重试)
 - 通过 `cargo check --all-targets` 与 `cargo test --lib`(4 passed)
 
-### Phase 3 — Sekai API client `[ ]`
-- [ ] `sekai_api/client.rs`:HarukiSekaiAPIClient(reqwest 实例 + base url + token)
-- [ ] `sekai_api/endpoint.rs`:`get_top100`、`get_border`(返回 `[u8; 32]` hash)
-- [ ] `sekai_api/error.rs`:SekaiApiError(thiserror)
-- [ ] `#[tracing::instrument]` 覆盖
+### Phase 3 — Sekai API client `[x]`
+- [x] `sekai_api/client.rs`:`HarukiSekaiAPIClient { reqwest::Client, api_endpoint }`,User-Agent `Haruki-Event-Tracker/{CARGO_PKG_VERSION}`,可选 `X-Haruki-Sekai-Token` 头,20s 超时
+- [x] `sekai_api/endpoint.rs`:`get_top100` / `get_border`,后者返回 `([u8; 32], BorderRankingResponse)` SHA-256 hash + sonic-rs 解析
+- [x] `sekai_api/error.rs`:`SekaiApiError { Request, Status, Decode }` 三态(thiserror)
+- [x] `#[tracing::instrument(skip(self), fields(server, event_id))]` 覆盖
+- 新增 `sha2 = "0.10"` 依赖
 
 ### Phase 4 — 事件解析器 `[ ]`
 - [ ] `tracker/parser.rs`:`tokio::fs` + sonic-rs 读取 `events.json` / `worldBlooms.json` / `eventCards.json` 等

@@ -899,6 +899,7 @@ dependencies = [
  "sea-query",
  "serde",
  "serde_yaml",
+ "sha2",
  "sonic-rs",
  "thiserror",
  "tokio",
