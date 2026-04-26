@@ -10,6 +10,11 @@
 
 # Project binary
 haruki-tracker
+haruki-event-tracker
+
+# Rust build output
+/target/
+**/*.rs.bk
 
 # Test binary, built with `go test -c`
 *.test

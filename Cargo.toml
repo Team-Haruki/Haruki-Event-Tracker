@@ -1,0 +1,95 @@
+[package]
+name = "haruki-event-tracker"
+version = "2.0.0-dev"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+description = "Project Sekai event ranking tracker and query API."
+default-run = "haruki-event-tracker"
+
+[lib]
+name = "haruki_event_tracker"
+path = "src/lib.rs"
+
+[[bin]]
+name = "haruki-event-tracker"
+path = "src/main.rs"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1.42", features = ["full"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+futures = "0.3"
+async-trait = "0.1"
+
+# HTTP server
+axum = "0.8"
+tower = { version = "0.5", features = ["util"] }
+tower-http = { version = "0.6", features = [
+    "compression-gzip",
+    "compression-br",
+    "trace",
+    "catch-panic",
+] }
+
+# HTTP client
+reqwest = { version = "0.12", default-features = false, features = [
+    "rustls-tls",
+    "gzip",
+    "brotli",
+    "stream",
+] }
+
+# ORM / DB
+sea-orm = { version = "1.1", features = [
+    "runtime-tokio-rustls",
+    "sqlx-mysql",
+    "sqlx-postgres",
+    "sqlx-sqlite",
+    "macros",
+    "with-chrono",
+] }
+sea-query = "0.32"
+
+# JSON
+sonic-rs = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+
+# Redis
+redis = { version = "0.27", features = [
+    "tokio-comp",
+    "connection-manager",
+] }
+
+# Scheduling
+tokio-cron-scheduler = "0.13"
+
+# Logging / observability
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = [
+    "env-filter",
+    "fmt",
+    "time",
+    "local-time",
+] }
+
+# Errors
+thiserror = "2"
+anyhow = "1"
+
+# Utilities
+bytes = "1"
+chrono = { version = "0.4", default-features = false, features = [
+    "clock",
+    "serde",
+] }
+
+[dev-dependencies]
+tokio = { version = "1.42", features = ["full", "test-util", "macros"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
+opt-level = 3
