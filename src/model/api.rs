@@ -1,6 +1,7 @@
+use sea_orm::FromQueryResult;
 use serde::Serialize;
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, FromQueryResult)]
 #[serde(rename_all = "camelCase")]
 pub struct RecordedRankingSchema {
     pub timestamp: i64,
@@ -9,11 +10,17 @@ pub struct RecordedRankingSchema {
     pub rank: i64,
 }
 
-#[derive(Debug, Clone, Serialize)]
+/// Same wire shape as the Go version: `RecordedRankingSchema` is embedded so
+/// JSON output is flat — fields are duplicated here rather than nested via
+/// `serde(flatten)` so this type can also be `FromQueryResult`-derived from
+/// the World Bloom join (which selects `character_id` as an extra column).
+#[derive(Debug, Clone, Serialize, FromQueryResult)]
 #[serde(rename_all = "camelCase")]
 pub struct RecordedWorldBloomRankingSchema {
-    #[serde(flatten)]
-    pub base: RecordedRankingSchema,
+    pub timestamp: i64,
+    pub user_id: String,
+    pub score: i64,
+    pub rank: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub character_id: Option<i64>,
 }
@@ -25,7 +32,7 @@ pub enum RecordedRankData {
     WorldBloom(RecordedWorldBloomRankingSchema),
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, FromQueryResult)]
 #[serde(rename_all = "camelCase")]
 pub struct RecordedUserNameSchema {
     pub user_id: String,
@@ -52,7 +59,7 @@ pub struct UserAllRankingDataQueryResponseSchema {
     pub user_data: Option<RecordedUserNameSchema>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, FromQueryResult)]
 #[serde(rename_all = "camelCase")]
 pub struct RankingLineScoreSchema {
     pub rank: i64,

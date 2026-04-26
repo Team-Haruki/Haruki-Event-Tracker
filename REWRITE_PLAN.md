@@ -130,18 +130,19 @@ src/
 - [x] `logger.rs`:tracing-subscriber + `Mutex<File>` 文件 mirror,自定义 `GoStyleFormat` 保留 `[ts][LEVEL][target] msg` 格式
 - 通过 `cargo check --all-targets`,无 warning
 
-### Phase 2 — 数据库层 `[ ]`
-- [ ] `db/entity/{time_id,event_users,event,world_bloom}.rs`:4 个 SeaORM Entity
-- [ ] `db/table_name.rs`:`build_table_name(server, event_id, kind)` 单一事实源
-- [ ] `db/schema.rs`:`create_event_tables`(Schema + 表名覆写,含 isWorldBloom 分支)
-- [ ] `db/engine.rs`:多方言 DatabaseEngine,连接池,Close/Ping
-- [ ] `db/query/ranking.rs`:FetchLatestRanking / ByRank / FetchAllRankings / ByRank
-- [ ] `db/query/world_bloom.rs`:World Bloom 四个查询变体
-- [ ] `db/query/lines.rs`:FetchRankingLines / FetchWorldBloomRankingLines
-- [ ] `db/query/growth.rs`:FetchRankingScoreGrowths / WorldBloom 版本
-- [ ] `db/query/user.rs`:GetUserData
-- [ ] `db/query/heartbeat.rs`:WriteHeartbeat / FetchLatestHeartbeat
-- [ ] `db/query/batch.rs`:BatchInsertEventRankings / BatchInsertWorldBloomRankings
+### Phase 2 — 数据库层 `[x]`
+- [x] `db/entity/{time_id,event_users,event,world_bloom}.rs`:4 个 SeaORM Entity(动态表名:`Entity { table_name: &'static str }` + 手写 `EntityName`)
+- [x] `db/table_name.rs`:`TableKind` 枚举 + `intern(kind, event_id)` `Box::leak` 缓存,4 种表名格式与 Go 版一致(单测覆盖)
+- [x] `db/schema.rs`:`create_event_tables`,`Schema::create_table_from_entity` + `if_not_exists()`,World Bloom 分支
+- [x] `db/engine.rs`:多方言(MySQL/Postgres/Sqlite),连接池默认 100/10/3600s,`parse_simple_duration` Go 风格 duration(单测)
+- [x] `db/query/ranking.rs`:`fetch_latest_ranking` / `_by_rank` / `fetch_all_rankings` / `_by_rank`(三表 JOIN 共用 `ranking_select`)
+- [x] `db/query/world_bloom.rs`:四个 World Bloom 查询变体(`wl_<id>` JOIN,带 `character_id` 过滤)
+- [x] `db/query/lines.rs`:`fetch_ranking_lines` / `fetch_world_bloom_ranking_lines`,每个 rank 一个并行 `find_by_statement` 通过 `futures::future::join_all`,失败静默丢弃
+- [x] `db/query/growth.rs`:`fetch_ranking_score_growths` / WB 版本,并行 + `(latest - earliest)` 增长
+- [x] `db/query/user.rs`:`get_user_data`
+- [x] `db/query/heartbeat.rs`:`write_heartbeat` / `fetch_latest_heartbeat`(共享 `batch_get_or_create_time_ids`)
+- [x] `db/query/batch.rs`:`batch_insert_event_rankings` / `batch_insert_world_bloom_rankings` + `batch_get_or_create_{time_ids,user_id_keys}`(`OnConflict::do_nothing` 兜底重试)
+- 通过 `cargo check --all-targets` 与 `cargo test --lib`(4 passed)
 
 ### Phase 3 — Sekai API client `[ ]`
 - [ ] `sekai_api/client.rs`:HarukiSekaiAPIClient(reqwest 实例 + base url + token)
