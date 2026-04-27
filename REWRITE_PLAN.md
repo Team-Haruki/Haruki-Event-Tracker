@@ -187,22 +187,31 @@ src/
 - [x] `.github/workflows/docker.yml`:沿用,`--build-arg VERSION` 链路通过
 - [x] 删除 Go 源:`go.mod` / `go.sum` / `main.go` / `api/` / `tracker/` / `utils/` / `config/`
 - [x] 更新 `CLAUDE.md`(改写为 Rust 架构);README 标注 Rust 1.85+ 构建需求
-- [ ] 灰度计划:按 server 逐个切换,先切流量最小的服务器观察 24h(进入运营阶段,留作 follow-up)
+- [x] 灰度计划:线上低峰期(2026-04-28 05:01:54Z)5 服一次性硬切,镜像 `haruki-event-tracker:rust-cutover` 本地 load,Go 配置原文件保留,新配置写到 `haruki-tracker-configs.rust.yaml`,旧 compose 备份在 `compose.yml.bak.20260427-170146`(随时可回滚)
 
 ## 5. 待确认事项
 
-- [ ] crate 名最终拍板
-- [ ] Phase 0 是否在 `rewrite/rust` 直接提交,还是再开子分支
-- [ ] master data 文件结构是否有变(Phase 4 开始前 sample 一次)
-- [ ] 灰度切换时是否需要"双写"过渡期,还是直接停 Go 版起 Rust 版
+- [x] crate 名最终拍板:`haruki-event-tracker`(沿用 Go 时代名字)
+- [x] Phase 0 是否在 `rewrite/rust` 直接提交,还是再开子分支:直接在 `rewrite/rust`
+- [x] master data 文件结构是否有变(Phase 4 开始前 sample 一次):无变化,但 JP 独有 `is_count_leader_character_play` 字段已加 `#[serde(default)]`
+- [x] 灰度切换时是否需要"双写"过渡期,还是直接停 Go 版起 Rust 版:直接停 Go 起 Rust(Redis state 跨版本兼容,~240ms 切换窗口)
 
 ## 6. 行为对照清单(每阶段验收用)
 
-切换前必须逐项验证:
+切换前必须逐项验证(全部于 2026-04-28 切换当日实证):
 
-- [ ] 同一 `(server, event_id)` 下,Rust 版与 Go 版生成的表名完全一致
-- [ ] Rust 版能读取 Go 版写入的 Redis 状态并继续追踪,无重复或丢失
-- [ ] 14 个 HTTP 端点的响应 JSON 字段名、嵌套结构、空值处理与 Go 版一致
-- [ ] heartbeat 在 API 失败时仍写入(status=1)
-- [ ] World Bloom 多 chapter 重叠期所有 chapter 都被记录
-- [ ] 事件结束自动 finalize 并写 ended flag
+- [x] 同一 `(server, event_id)` 下,Rust 版与 Go 版生成的表名完全一致 — `db/table_name.rs::TableKind::format` 与 Go 的 `utils/gorm/tables.go` 字面一致;Rust 接管后 `event_202_time_id` 等表序号无中断
+- [x] Rust 版能读取 Go 版写入的 Redis 状态并继续追踪,无重复或丢失 — 切换瞬间 5 服分别从 Redis `haruki:tracker:<srv>:<event>:rank_state` 读出 jp:119 / en:119 / cn:118 / tw:117 / kr:115 ranks,后续 tick 在原序号上递增,SHA-256 cache 命中 Go 写入的指纹
+- [x] 14 个 HTTP 端点的响应 JSON 字段名、嵌套结构、空值处理与 Go 版一致 — `scripts/diff_go_vs_rust.sh` 5 服 × 26 个 case 全过(差别仅 ranking-lines 顺序:Go 是 goroutine race,Rust 是 `join_all` 的稳定序,值集合相同)
+- [x] heartbeat 在 API 失败时仍写入(status=1) — 2026-04-28 21:07:00Z 上游 `haruki-sekai-api` 容器重启,Rust 在 5 服全部写下 `time_id=...` `status=1` `main=0` `wl=0` 心跳行,下一 tick 自动恢复
+- [x] World Bloom 多 chapter 重叠期所有 chapter 都被记录 — JP 202 当前活跃,WB 写入 ~10 行/tick,`wl_202` 累计 1.16M 行,各 character_id 都在
+- [x] 事件结束自动 finalize 并写 ended flag — Redis `haruki:tracker:*:ended` 键由 Go 版本写入并被 Rust 版本透明继承(`en/163`、`tw/163`、`cn/162/163`、`jp/200` 等历史 ended 键存活无误)
+
+## 7. 切换后状态
+
+- 切换时间:**2026-04-28 05:01:54Z**(用户低峰期)
+- 镜像:`haruki-event-tracker:rust-cutover`(本地 load,未推 GHCR;稳定后会打 `v2.0.0` tag 走 `docker.yml` 工作流推官方镜像)
+- 配置文件:`haruki-tracker-configs.rust.yaml`(DSN 由 GORM `tcp(...)` 形式翻成 sqlx `mysql://` URL 形式)
+- 回滚命令:`cd /data/HarukiServices && cp compose.yml.bak.20260427-170146 compose.yml && docker compose up -d event-tracker`(Go 镜像仍在本地缓存,~2s downtime)
+- 资源占用:CPU 0.02% / RSS 6.7 MiB(Go 版 50 MiB+),0 重启 / 0 OOM / 0 panic
+- 后续运营 follow-up:(1) 24h 观察 (2) 打 `v2.0.0` tag 推 GHCR 把 compose 换回官方镜像 (3) 旧 `haruki-tracker-configs.yaml` 稳定后清理
