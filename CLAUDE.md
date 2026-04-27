@@ -8,6 +8,8 @@ Haruki Event Tracker is a Rust service that periodically scrapes ranking data fr
 
 The repo was rewritten from Go on `rewrite/rust`; `REWRITE_PLAN.md` carries the per-phase decisions and notes any Go behaviour that was intentionally not ported (dead code paths, unused state maps).
 
+**Status**: the Rust port took over production traffic on **2026-04-28 05:01:54Z** (5 servers, hard cutover from the Go binary, Redis state read-through verified). `REWRITE_PLAN.md` §6 has the per-item verification record and §7 the rollback handle. Code-side work is closed; remaining items are operational (push `v2.0.0` tag → GHCR image, retire the Go-style config, decommission backup compose).
+
 ## Build & Run
 
 - MSRV: Rust 1.85 (edition 2024).
@@ -15,7 +17,7 @@ The repo was rewritten from Go on `rewrite/rust`; `REWRITE_PLAN.md` carries the 
 - Run: needs `haruki-tracker-configs.yaml` in the working directory (copy from `haruki-tracker-configs.example.yaml`); `config::load_from_file` returns `ConfigError::{Read, Parse}` and `main` exits non-zero when missing/unparseable. Redis must be reachable before startup. Start with `./target/release/haruki-event-tracker` (or `cargo run --release`).
 - Tests: `cargo test --lib` runs the pure-function unit tests (diff/parser/state/db helpers). There is no integration test suite — DB and HTTP behaviour is validated against staging during the cutover.
 - Lint: `cargo clippy --all-targets -- -D warnings`. Keep clippy clean before committing — new warnings are treated as build failures.
-- Docker: `docker build --build-arg VERSION=<ver> -t haruki-event-tracker .` (multi-stage `rust:1.85-slim-bookworm` builder → `debian:bookworm-slim` runtime). The image expects the config file mounted into `/app`.
+- Docker: `docker build --build-arg VERSION=<ver> -t haruki-event-tracker .` (multi-stage `rust:1.85-alpine` builder → `alpine:3.23` runtime, ~29 MB). The image expects the config file mounted into `/app`. The builder pre-builds deps from a dummy `src/main.rs`; if you change the runtime base, keep the `find src -name '*.rs' -exec touch {} +` line — Docker `COPY` preserves host mtimes and otherwise cargo skips the real rebuild.
 - Tagged releases: pushing `v*` tags triggers `.github/workflows/release.yml` (per-target builds: linux-amd64, linux-arm64, macos-arm64, windows-x64) and `.github/workflows/docker.yml` (GHCR push).
 
 ## Architecture
@@ -50,4 +52,42 @@ World Bloom events have per-character chapters tracked in parallel. `EventTracke
 - **Dynamic table inserts** must go through `sea-query` (`Query::insert_into(Alias::new(intern(...)))`); SeaORM `ActiveModel` API can't be used because the Entity types carry a non-unit `table_name` field.
 - **Comments are sparse** — only when the *why* is non-obvious (cross-language wire compat, lifetime workarounds, Go-version dead code that's intentionally skipped). Don't add narrating comments.
 - **TLS**: rustls 0.23 panics in `ServerConfig::builder()` when both `ring` and `aws_lc_rs` providers are reachable in the dep graph (they are, transitively). `main` calls `aws_lc_rs::default_provider().install_default()` once on the SSL branch — keep that line.
-- Logging is `tracing` with the `GoStyleFormat` formatter (`[YYYY-MM-DD HH:MM:SS.mmm][LEVEL][target] message`) so log lines stay shape-compatible with the Go build during gradual rollout.
+- Logging is `tracing` with the `GoStyleFormat` formatter (`[YYYY-MM-DD HH:MM:SS.mmm][LEVEL][target] message`) so log lines stay shape-compatible with the Go build during gradual rollout. `target = "access"` is routed to `access_log_path`; everything else goes to `main_log_file` and stdout. File sinks strip ANSI; stdout keeps it.
+- DSN form: sea-orm/sqlx wants URL form (`mysql://user:pwd@host:port/db?charset=utf8mb4`). The Go-style `user:pwd@tcp(host:port)/db?...` is **not** parsed and must be translated at cutover time. `parseTime` and `loc` are GORM-only and must be dropped.
+
+## Git commits
+
+All commit subjects must follow:
+
+```text
+[Type] Short description starting with capital letter
+```
+
+Allowed types:
+
+| Type      | Usage                                                 |
+|-----------|-------------------------------------------------------|
+| `[Feat]`  | New feature or capability                             |
+| `[Fix]`   | Bug fix                                               |
+| `[Chore]` | Maintenance, refactoring, dependency or build changes |
+| `[Docs]`  | Documentation-only changes                            |
+
+Rules:
+
+- Description starts with a capital letter.
+- Use imperative mood: `Add ...`, not `Added ...`.
+- No trailing period.
+- Keep the subject at or below roughly 70 characters.
+- Agent attribution uses the standard Git `Co-authored-by:` trailer in the commit body (separated from the subject by a blank line, on its own line). GitHub renders the co-author avatar from this trailer.
+  - Claude Code (any 4.x): `Co-authored-by: Claude Opus 4.7 <noreply@anthropic.com>` — substitute the actual model (e.g. `Claude Sonnet 4.6`, `Claude Haiku 4.5`).
+  - Codex: `Co-authored-by: Codex <noreply@openai.com>`
+  - Copilot: `Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>`
+
+Examples from this repo's history:
+
+```text
+[Feat] Trust-proxy aware client IP in access log
+[Fix] Master data parse + MySQL on-conflict syntax
+[Chore] Add Go-vs-Rust API response diff harness
+[Docs] Mark cutover complete in REWRITE_PLAN
+```

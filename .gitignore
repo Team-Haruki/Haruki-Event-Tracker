@@ -41,4 +41,16 @@ go.work.sum
 
 # Self tests
 haruki-tracker-configs.yaml
+haruki-tracker-configs.*.yaml
+*.bak
 Data/
+
+# Local-only secrets / artefacts (must never be committed)
+sshkey
+sshkey.pub
+*.pem
+.ssh_known_hosts
+logs/
+
+# Per-user agent state
+.claude/
