@@ -46,7 +46,22 @@ async fn main() -> ExitCode {
         }
     };
 
-    let router = api::router::build_router(ctx.state.clone());
+    let (trust, bad_cidrs) = haruki_event_tracker::api::access_log::ProxyTrust::from_config(
+        cfg.backend.enable_trust_proxy,
+        &cfg.backend.trusted_proxies,
+        &cfg.backend.proxy_header,
+    );
+    for raw in &bad_cidrs {
+        tracing::warn!(cidr = %raw, "ignored unparseable trusted_proxies entry");
+    }
+    if cfg.backend.enable_trust_proxy {
+        tracing::info!(
+            entries = trust.trusted.len(),
+            header = %trust.primary_header,
+            "trust proxy enabled"
+        );
+    }
+    let router = api::router::build_router(ctx.state.clone(), std::sync::Arc::new(trust));
     let bind_target = format!("{}:{}", cfg.backend.host, cfg.backend.port);
     let addr = match resolve_addr(&bind_target).await {
         Ok(a) => a,

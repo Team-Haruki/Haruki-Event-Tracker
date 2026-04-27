@@ -2,16 +2,18 @@
 //! router. The middleware stack mirrors the Go fiber app: panic catcher
 //! → compression (gzip+brotli) → access log.
 
+use std::sync::Arc;
+
 use axum::Router;
 use axum::routing::get;
 use tower_http::catch_panic::CatchPanicLayer;
 use tower_http::compression::CompressionLayer;
 
-use crate::api::access_log;
+use crate::api::access_log::{self, ProxyTrust};
 use crate::api::handler::{lines, ranking, status, trace, user, world_bloom};
 use crate::api::state::AppState;
 
-pub fn build_router(state: AppState) -> Router {
+pub fn build_router(state: AppState, trust: Arc<ProxyTrust>) -> Router {
     let event_routes = Router::new()
         .route(
             "/latest-ranking/user/{user_id}",
@@ -55,7 +57,7 @@ pub fn build_router(state: AppState) -> Router {
     Router::new()
         .nest("/event/{server}/{event_id}", event_routes)
         .with_state(state)
-        .layer(axum::middleware::from_fn(access_log::log))
+        .layer(axum::middleware::from_fn_with_state(trust, access_log::log))
         .layer(CompressionLayer::new().gzip(true).br(true))
         .layer(CatchPanicLayer::new())
 }
