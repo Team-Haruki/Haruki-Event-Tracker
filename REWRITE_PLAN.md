@@ -175,11 +175,11 @@ src/
 - [x] `api/handler/{ranking,trace,world_bloom,user,lines,status}.rs`:14 个路由全量移植,latest/trace 共用 404 语义(rank 查询无行 404,user 查询 ranking+user 双空才 404)
 - [x] `api/router.rs`:`/event/{server}/{event_id}` 子路由,挂载 CompressionLayer(gzip+br) → access log → CatchPanicLayer
 
-### Phase 7 — main / 调度 / 关停 `[ ]`
-- [ ] `main.rs`:`#[tokio::main]`,启动序列 config → logger → redis → sekai_api → 各 server → scheduler → axum
-- [ ] tokio-cron-scheduler 注册任务,`use_second_level_cron` 切换 5/6 段
-- [ ] `tokio::signal` 监听 SIGINT/SIGTERM
-- [ ] `shutdown.rs`:有序关停 axum → scheduler → trackers → redis → db
+### Phase 7 — main / 调度 / 关停 `[x]`
+- [x] `main.rs`:`#[tokio::main]`,config → logger → `app::build` → axum `serve().with_graceful_shutdown` → `shutdown::run`;SSL 配置打 warn 并退到 HTTP(由反代终结 TLS),后续阶段再补
+- [x] `app.rs`:`AppContext { state, dbs, trackers, scheduler }`;`build` 顺序:Redis ConnectionManager → Sekai API client → 每个 enabled server 建 DB engine → 建 daemon `init` 失败仅 warn(让首次 tick 重试)→ `JobScheduler::new().add(Job::new_async(cron, |_| daemon.lock().await.track_ranking_data()))` → `scheduler.start()`
+- [x] cron 兼容:`use_second_level_cron: false` 时给 5 段表达式补 `0 ` 前缀变 6 段(tokio-cron-scheduler 强制 6 段),保持旧 YAML 不动
+- [x] `shutdown.rs`:`signal()` 监听 SIGINT/SIGTERM(unix)或 Ctrl+C(windows);`run()` 顺序 scheduler.shutdown → drop(trackers,顺带丢 Redis ConnectionManager 句柄)→ 逐个 `Arc::try_unwrap(engine).close()`
 
 ### Phase 8 — CI / Docker / 切换 `[ ]`
 - [ ] `Dockerfile`:`rust:1.84-alpine` 多阶段构建
