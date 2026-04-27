@@ -5,6 +5,7 @@
 ## Requirements
 + `MySQL`, `SQLite`, `PostgreSQL` (Depending on your database choice)
 + `Redis` (For caching borderlines data)
++ Rust 1.85+ (only for building from source — releases ship pre-built binaries)
 
 ## How to Use
 1. Go to release page to download `HarukiEventTracker`

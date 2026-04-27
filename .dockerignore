@@ -1,0 +1,12 @@
+target/
+.git/
+.github/
+.idea/
+.vscode/
+*.log
+logs/
+haruki-tracker-configs.yaml
+Dockerfile
+.dockerignore
+README.md
+REWRITE_PLAN.md
