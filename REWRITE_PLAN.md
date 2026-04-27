@@ -181,13 +181,13 @@ src/
 - [x] cron 兼容:`use_second_level_cron: false` 时给 5 段表达式补 `0 ` 前缀变 6 段(tokio-cron-scheduler 强制 6 段),保持旧 YAML 不动
 - [x] `shutdown.rs`:`signal()` 监听 SIGINT/SIGTERM(unix)或 Ctrl+C(windows);`run()` 顺序 scheduler.shutdown → drop(trackers,顺带丢 Redis ConnectionManager 句柄)→ 逐个 `Arc::try_unwrap(engine).close()`
 
-### Phase 8 — CI / Docker / 切换 `[ ]`
-- [ ] `Dockerfile`:`rust:1.84-alpine` 多阶段构建
-- [ ] `.github/workflows/release.yml`:替换 setup-go → setup-rust + cross,矩阵保留四目标
-- [ ] `.github/workflows/docker.yml`:无需大改,确认构建参数
-- [ ] 删除 Go 源:`go.mod` / `go.sum` / `main.go` / `api/` / `tracker/` / `utils/` / `config/`
-- [ ] 更新 `README.md` 与 `CLAUDE.md`
-- [ ] 灰度计划:按 server 逐个切换,先切流量最小的服务器观察 24h
+### Phase 8 — CI / Docker / 切换 `[x]`
+- [x] `Dockerfile`:`rust:1.85-slim-bookworm` 多阶段构建(builder 装 cmake/perl 给 aws-lc-rs 用),runtime 用 `debian:bookworm-slim` + ca-certificates + tzdata;`ARG VERSION` 通过 `sed` 改写 `Cargo.toml`(规避 `env!("CARGO_PKG_VERSION")` 编译时锁死)
+- [x] `.github/workflows/release.yml`:`setup-go` → `dtolnay/rust-toolchain@stable` + `Swatinem/rust-cache`;矩阵 4 目标(linux-amd64/arm64 native runner、macos-arm64、windows-x64);Linux runner 装 `cmake build-essential perl`;tag 打入 Cargo.toml 后再 `cargo build --release --locked`
+- [x] `.github/workflows/docker.yml`:沿用,`--build-arg VERSION` 链路通过
+- [x] 删除 Go 源:`go.mod` / `go.sum` / `main.go` / `api/` / `tracker/` / `utils/` / `config/`
+- [x] 更新 `CLAUDE.md`(改写为 Rust 架构);README 标注 Rust 1.85+ 构建需求
+- [ ] 灰度计划:按 server 逐个切换,先切流量最小的服务器观察 24h(进入运营阶段,留作 follow-up)
 
 ## 5. 待确认事项
 
