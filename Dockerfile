@@ -13,8 +13,8 @@ RUN mkdir -p src && \
     rm -rf src
 
 COPY . .
-ARG VERSION=2.0.0-dev
-RUN if [ "$VERSION" != "2.0.0-dev" ]; then \
+ARG VERSION=3.0.0-dev
+RUN if [ "$VERSION" != "3.0.0-dev" ]; then \
         sed -i "s/^version = \".*\"/version = \"${VERSION#v}\"/" Cargo.toml; \
     fi && \
     find src -name '*.rs' -exec touch {} + && \
