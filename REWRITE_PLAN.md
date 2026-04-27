@@ -176,7 +176,7 @@ src/
 - [x] `api/router.rs`:`/event/{server}/{event_id}` 子路由,挂载 CompressionLayer(gzip+br) → access log → CatchPanicLayer
 
 ### Phase 7 — main / 调度 / 关停 `[x]`
-- [x] `main.rs`:`#[tokio::main]`,config → logger → `app::build` → axum `serve().with_graceful_shutdown` → `shutdown::run`;SSL 配置打 warn 并退到 HTTP(由反代终结 TLS),后续阶段再补
+- [x] `main.rs`:`#[tokio::main]`,config → logger → `app::build` → `axum_server::bind`(HTTP)/`bind_rustls`(HTTPS)统一走 `Handle::graceful_shutdown(10s)` → `shutdown::run`;SSL 走 `axum-server` + `rustls 0.23` + `aws_lc_rs`,启动时 `install_default()` 防止双 provider panic
 - [x] `app.rs`:`AppContext { state, dbs, trackers, scheduler }`;`build` 顺序:Redis ConnectionManager → Sekai API client → 每个 enabled server 建 DB engine → 建 daemon `init` 失败仅 warn(让首次 tick 重试)→ `JobScheduler::new().add(Job::new_async(cron, |_| daemon.lock().await.track_ranking_data()))` → `scheduler.start()`
 - [x] cron 兼容:`use_second_level_cron: false` 时给 5 段表达式补 `0 ` 前缀变 6 段(tokio-cron-scheduler 强制 6 段),保持旧 YAML 不动
 - [x] `shutdown.rs`:`signal()` 监听 SIGINT/SIGTERM(unix)或 Ctrl+C(windows);`run()` 顺序 scheduler.shutdown → drop(trackers,顺带丢 Redis ConnectionManager 句柄)→ 逐个 `Arc::try_unwrap(engine).close()`
