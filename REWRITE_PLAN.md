@@ -166,14 +166,14 @@ src/
 - [x] `tracker/daemon.rs`:`HarukiEventTracker` 编排,`track_ranking_data` 入口,新事件自动切换;WB chapter 状态变化逐章 finalize
 - 决策:Go 版 `tracker/world_bloom.rs` 拆分文件不复刻——WB 助手已落在 `diff.rs`,daemon 编排在 `daemon.rs`,空文件已删除
 
-### Phase 6 — HTTP API 层 `[ ]`
-- [ ] `api/state.rs`:AppState(`Arc<Inner>`)
-- [ ] `api/json.rs`:sonic-rs `Json<T>` 同时实现 `FromRequest` + `IntoResponse`
-- [ ] `api/error.rs`:ApiError → IntoResponse
-- [ ] `api/extract.rs`:CommonParams extractor
-- [ ] `api/access_log.rs`:Tower layer,对齐 fiber `${time} | ${status} | ${latency} | ${ip} | ${method} ${path}` 格式
-- [ ] `api/handler/{ranking,trace,world_bloom,lines,user,status}.rs`:14 个路由全量移植
-- [ ] `api/router.rs`:挂载 CompressionLayer、CatchPanicLayer、access log
+### Phase 6 — HTTP API 层 `[x]`
+- [x] `api/state.rs`:`AppState { Arc<Inner { dbs: HashMap<SekaiServerRegion, Arc<DatabaseEngine>> }> }`
+- [x] `api/json.rs`:sonic-rs 实现 `IntoResponse`(全部 GET 路由,无需 `FromRequest`)
+- [x] `api/error.rs`:`ApiError { InvalidServer, NotFound, BadRequest, Db(#[from] DbErr) }` → `{"error": "..."}` JSON,400/404/500 映射
+- [x] `api/extract.rs`:`resolve_engine(&AppState, &str)` 帮助函数,Path 元组直接用 axum 内置
+- [x] `api/access_log.rs`:`axum::middleware::from_fn` Tower 中间件,format `YYYY/MM/DD HH:MM:SS | status | latency | ip | METHOD path`,IP 优先 `X-Forwarded-For` / `X-Real-IP` 否则 `ConnectInfo<SocketAddr>`
+- [x] `api/handler/{ranking,trace,world_bloom,user,lines,status}.rs`:14 个路由全量移植,latest/trace 共用 404 语义(rank 查询无行 404,user 查询 ranking+user 双空才 404)
+- [x] `api/router.rs`:`/event/{server}/{event_id}` 子路由,挂载 CompressionLayer(gzip+br) → access log → CatchPanicLayer
 
 ### Phase 7 — main / 调度 / 关停 `[ ]`
 - [ ] `main.rs`:`#[tokio::main]`,启动序列 config → logger → redis → sekai_api → 各 server → scheduler → axum
