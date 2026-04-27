@@ -258,7 +258,7 @@ pub async fn batch_insert_event_rankings(
                 }
                 ins.on_conflict(
                     OnConflict::columns([event::Column::TimeId, event::Column::UserIdKey])
-                        .do_nothing()
+                        .do_nothing_on([event::Column::TimeId, event::Column::UserIdKey])
                         .to_owned(),
                 );
                 tx.execute(backend.build(&ins)).await?;
@@ -366,7 +366,11 @@ pub async fn batch_insert_world_bloom_rankings(
                         world_bloom::Column::UserIdKey,
                         world_bloom::Column::CharacterId,
                     ])
-                    .do_nothing()
+                    .do_nothing_on([
+                        world_bloom::Column::TimeId,
+                        world_bloom::Column::UserIdKey,
+                        world_bloom::Column::CharacterId,
+                    ])
                     .to_owned(),
                 );
                 tx.execute(backend.build(&ins)).await?;

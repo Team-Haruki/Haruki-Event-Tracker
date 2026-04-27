@@ -58,6 +58,7 @@ pub struct Event {
     #[serde(default)]
     pub virtual_live_id: i64,
     pub unit: SekaiUnit,
+    #[serde(default)]
     pub is_count_leader_character_play: bool,
     #[serde(default)]
     pub event_point_assetbundle_name: String,
