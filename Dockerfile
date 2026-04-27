@@ -1,10 +1,9 @@
-FROM rust:1.85-slim-bookworm AS builder
+FROM rust:1.85-alpine AS builder
 
 WORKDIR /app
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    pkg-config cmake build-essential perl \
-    && rm -rf /var/lib/apt/lists/*
+RUN apk add --no-cache \
+    musl-dev gcc g++ cmake make perl pkgconfig linux-headers
 
 COPY Cargo.toml Cargo.lock ./
 RUN mkdir -p src && \
@@ -18,13 +17,12 @@ ARG VERSION=2.0.0-dev
 RUN if [ "$VERSION" != "2.0.0-dev" ]; then \
         sed -i "s/^version = \".*\"/version = \"${VERSION#v}\"/" Cargo.toml; \
     fi && \
+    find src -name '*.rs' -exec touch {} + && \
     cargo build --release --bin haruki-event-tracker && \
     strip target/release/haruki-event-tracker
 
-FROM debian:bookworm-slim AS runtime
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates tzdata \
-    && rm -rf /var/lib/apt/lists/*
+FROM alpine:3.23 AS runtime
+RUN apk add --no-cache ca-certificates tzdata
 WORKDIR /app
 COPY --from=builder /app/target/release/haruki-event-tracker ./haruki-event-tracker
 RUN mkdir -p logs
