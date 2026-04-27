@@ -1,6 +1,13 @@
-//! Graceful shutdown. Mirrors the order in `api.Shutdown`:
-//! scheduler → trackers (via Drop) → DB engines. Redis closes when its
-//! `ConnectionManager` is dropped along with the trackers.
+//! Graceful shutdown order: scheduler → trackers → AppState → DB engines.
+//! `DatabaseEngine` (and the underlying sqlx pool) closes its connections
+//! via `Drop`, so we don't need exclusive ownership to clean up — letting
+//! the last `Arc` go out of scope is enough.
+//!
+//! Note: `tokio_cron_scheduler::JobScheduler::shutdown()` does *not*
+//! release the `Arc` clones it holds inside its job closures, so we
+//! cannot rely on `Arc::try_unwrap` to ever succeed for engines that
+//! tracker daemons reference. The previous version tried to and always
+//! emitted `engine still has live refs` warnings — that path is gone.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -8,6 +15,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio_cron_scheduler::JobScheduler;
 
+use crate::api::state::AppState;
 use crate::db::engine::DatabaseEngine;
 use crate::model::enums::SekaiServerRegion;
 use crate::tracker::daemon::HarukiEventTracker;
@@ -16,26 +24,16 @@ pub async fn run(
     mut scheduler: JobScheduler,
     trackers: HashMap<SekaiServerRegion, Arc<Mutex<HarukiEventTracker>>>,
     dbs: HashMap<SekaiServerRegion, Arc<DatabaseEngine>>,
+    state: AppState,
 ) {
     tracing::info!("shutting down scheduler");
     if let Err(err) = scheduler.shutdown().await {
         tracing::error!(%err, "scheduler shutdown failed");
     }
-
+    drop(scheduler);
     drop(trackers);
-
-    for (server, engine) in dbs {
-        match Arc::try_unwrap(engine) {
-            Ok(engine) => {
-                if let Err(err) = engine.close().await {
-                    tracing::error!(%server, %err, "db close failed");
-                }
-            }
-            Err(_) => {
-                tracing::warn!(%server, "db engine still has live refs; skipping close");
-            }
-        }
-    }
+    drop(state);
+    drop(dbs);
     tracing::info!("shutdown complete");
 }
 

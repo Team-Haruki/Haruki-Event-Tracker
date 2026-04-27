@@ -21,7 +21,13 @@ async fn main() -> ExitCode {
 
     let log_file =
         (!cfg.backend.main_log_file.is_empty()).then(|| cfg.backend.main_log_file.clone());
-    if let Err(err) = logger::init(&cfg.backend.log_level, log_file.as_deref()) {
+    let access_log_file =
+        (!cfg.backend.access_log_path.is_empty()).then(|| cfg.backend.access_log_path.clone());
+    if let Err(err) = logger::init(
+        &cfg.backend.log_level,
+        log_file.as_deref(),
+        access_log_file.as_deref(),
+    ) {
         eprintln!("failed to init logger: {err}");
         return ExitCode::from(1);
     }
@@ -93,7 +99,7 @@ async fn main() -> ExitCode {
         tracing::error!(%err, "server error");
     }
 
-    shutdown::run(ctx.scheduler, ctx.trackers, ctx.dbs).await;
+    shutdown::run(ctx.scheduler, ctx.trackers, ctx.dbs, ctx.state).await;
     tracing::info!("bye");
     ExitCode::SUCCESS
 }

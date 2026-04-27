@@ -5,13 +5,13 @@ use std::sync::Mutex;
 
 use chrono::Local;
 use tracing::{Event, Level, Subscriber};
-use tracing_subscriber::filter::LevelFilter;
+use tracing_subscriber::EnvFilter;
+use tracing_subscriber::filter::{LevelFilter, Targets};
 use tracing_subscriber::fmt::format::Writer;
 use tracing_subscriber::fmt::{self, FmtContext, FormatEvent, FormatFields};
-use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::layer::{Layer, SubscriberExt};
 use tracing_subscriber::registry::LookupSpan;
 use tracing_subscriber::util::SubscriberInitExt;
-use tracing_subscriber::EnvFilter;
 
 const COLOR_GREEN: &str = "\x1b[32m";
 const COLOR_BLUE: &str = "\x1b[34m";
@@ -19,6 +19,8 @@ const COLOR_MAGENTA: &str = "\x1b[35m";
 const COLOR_YELLOW: &str = "\x1b[33m";
 const COLOR_RED: &str = "\x1b[31m";
 const COLOR_RESET: &str = "\x1b[0m";
+
+const ACCESS_TARGET: &str = "access";
 
 #[derive(Debug, thiserror::Error)]
 pub enum LoggerError {
@@ -110,11 +112,38 @@ fn parse_level(level: &str) -> LevelFilter {
     }
 }
 
-/// Initialise the global tracing subscriber. Stdout always receives ANSI output;
-/// when `file` is `Some` and non-empty, a parallel layer mirrors the same events
-/// (sans ANSI) into the file. Caller may pass an empty string to disable file
-/// output, matching the Go config where `main_log_file: ""` is valid.
-pub fn init<P: AsRef<Path>>(level: &str, file: Option<P>) -> Result<(), LoggerError> {
+fn open_log_file(path: &Path) -> Result<std::fs::File, LoggerError> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent).map_err(|source| LoggerError::CreateDir {
+                path: parent.display().to_string(),
+                source,
+            })?;
+        }
+    }
+    OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|source| LoggerError::OpenFile {
+            path: path.display().to_string(),
+            source,
+        })
+}
+
+/// Initialise the global tracing subscriber.
+///
+/// - stdout: every event with ANSI colours.
+/// - `main_log_file` (optional): every event *except* `target = "access"`,
+///   no ANSI. Empty path disables.
+/// - `access_log_file` (optional): only `target = "access"` events, no ANSI.
+///   Empty path disables; access events still go to stdout (and the main
+///   file when no access path is configured) so dev runs don't lose them.
+pub fn init<P: AsRef<Path>>(
+    level: &str,
+    main_log_file: Option<P>,
+    access_log_file: Option<P>,
+) -> Result<(), LoggerError> {
     let level_filter = parse_level(level);
     let env_filter = EnvFilter::builder()
         .with_default_directive(level_filter.into())
@@ -124,38 +153,55 @@ pub fn init<P: AsRef<Path>>(level: &str, file: Option<P>) -> Result<(), LoggerEr
         .event_format(GoStyleFormat { ansi: true })
         .with_writer(io::stdout);
 
-    let file_layer = match file {
-        Some(p) if !p.as_ref().as_os_str().is_empty() => {
-            let path = p.as_ref();
-            if let Some(parent) = path.parent() {
-                if !parent.as_os_str().is_empty() {
-                    std::fs::create_dir_all(parent).map_err(|source| LoggerError::CreateDir {
-                        path: parent.display().to_string(),
-                        source,
-                    })?;
-                }
-            }
-            let f = OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(path)
-                .map_err(|source| LoggerError::OpenFile {
-                    path: path.display().to_string(),
-                    source,
-                })?;
+    let access_path = access_log_file
+        .as_ref()
+        .map(|p| p.as_ref())
+        .filter(|p| !p.as_os_str().is_empty());
+
+    let access_layer = match access_path {
+        Some(path) => {
+            let f = open_log_file(path)?;
             Some(
                 fmt::layer()
                     .event_format(GoStyleFormat { ansi: false })
-                    .with_writer(Mutex::new(f)),
+                    .with_writer(Mutex::new(f))
+                    .with_filter(Targets::new().with_target(ACCESS_TARGET, LevelFilter::TRACE)),
             )
         }
-        _ => None,
+        None => None,
+    };
+
+    let main_path = main_log_file
+        .as_ref()
+        .map(|p| p.as_ref())
+        .filter(|p| !p.as_os_str().is_empty());
+
+    let main_file_layer = match main_path {
+        Some(path) => {
+            let f = open_log_file(path)?;
+            // When access goes to its own file we exclude it from the main
+            // file; otherwise keep it in the main file so a single
+            // `main_log_file` config still captures everything.
+            let layer = fmt::layer()
+                .event_format(GoStyleFormat { ansi: false })
+                .with_writer(Mutex::new(f));
+            let layer = if access_path.is_some() {
+                layer
+                    .with_filter(Targets::new().with_target(ACCESS_TARGET, LevelFilter::OFF).with_default(LevelFilter::TRACE))
+                    .boxed()
+            } else {
+                layer.boxed()
+            };
+            Some(layer)
+        }
+        None => None,
     };
 
     tracing_subscriber::registry()
         .with(env_filter)
         .with(stdout_layer)
-        .with(file_layer)
+        .with(main_file_layer)
+        .with(access_layer)
         .try_init()?;
     Ok(())
 }
