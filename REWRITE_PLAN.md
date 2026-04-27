@@ -158,14 +158,13 @@ src/
 - [x] `event_time_remain` 复刻 Go 版多语言 remaining-time 格式化(JP/CN/TW/EN/KR);5 个单测覆盖
 - [x] `ParseError { Read, Parse }` thiserror 枚举,`#[tracing::instrument]` 覆盖入口
 
-### Phase 5 — Tracker 核心 `[ ]`
-- [ ] `tracker/diff.rs`:`diff_rank_based` + `merge_rankings`(**纯函数**)
-- [ ] `tracker/diff.rs` 单测:典型路径 / rank 重复 / 空数据 / cache hit 旁路
-- [ ] `tracker/cache.rs`:`detect_cache`(Redis hash 比对)
-- [ ] `tracker/state.rs`:`load_state_from_redis` / `save_state_to_redis` / ended flag,**key schema 与 Go 版字节一致**
-- [ ] `tracker/world_bloom.rs`:`handle_world_bloom` + `processWorldBloomChapter`
-- [ ] `tracker/base.rs`:EventTrackerBase 状态机
-- [ ] `tracker/daemon.rs`:HarukiEventTracker 编排,新事件自动切换
+### Phase 5 — Tracker 核心 `[x]`
+- [x] `tracker/diff.rs`:`diff_rank_based` + `merge_rankings` + `extract_world_bloom_rankings` + `build_event_records` + `build_world_bloom_rows`(**纯函数**,11 个单测)
+- [x] `tracker/cache.rs`:`detect_cache`(SHA-256 hex,与 Go `fmt.Sprintf("%x", hash)` 字节一致)
+- [x] `tracker/state.rs`:`load_rank_state` / `save_rank_state` / `check_event_ended_flag` / `set_event_ended_flag`,key schema 与 Go 版字节一致;Go 版死代码 `user_state` 不移植
+- [x] `tracker/base.rs`:`EventTrackerBase` 状态机(`init` / `record_ranking_data` / `handle_ranking_data` / `set_event_ended` / WB chapter setters);Go 版死代码 `prevEventState` / `prevUserState` / `lastUpdateTime` / `getFilterFunc` 不移植
+- [x] `tracker/daemon.rs`:`HarukiEventTracker` 编排,`track_ranking_data` 入口,新事件自动切换;WB chapter 状态变化逐章 finalize
+- 决策:Go 版 `tracker/world_bloom.rs` 拆分文件不复刻——WB 助手已落在 `diff.rs`,daemon 编排在 `daemon.rs`,空文件已删除
 
 ### Phase 6 — HTTP API 层 `[ ]`
 - [ ] `api/state.rs`:AppState(`Arc<Inner>`)

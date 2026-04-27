@@ -4,4 +4,3 @@ pub mod daemon;
 pub mod diff;
 pub mod parser;
 pub mod state;
-pub mod world_bloom;
