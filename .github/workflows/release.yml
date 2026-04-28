@@ -72,6 +72,16 @@ jobs:
             else
               sed -i "s/^version = \".*\"/version = \"${VERSION_NO_V}\"/" Cargo.toml
             fi
+            awk -v v="$VERSION_NO_V" '
+              /^name = "haruki-event-tracker"$/ {
+                print
+                getline
+                sub(/version = ".*"/, "version = \"" v "\"")
+                print
+                next
+              }
+              { print }
+            ' Cargo.lock > Cargo.lock.new && mv Cargo.lock.new Cargo.lock
           fi
 
       - name: Build (release)
