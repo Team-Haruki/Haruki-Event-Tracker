@@ -69,7 +69,7 @@ redis = { version = "0.27", features = [
 ] }
 
 # Scheduling
-tokio-cron-scheduler = "0.13"
+tokio-cron-scheduler = "0.15"
 
 # Logging / observability
 tracing = "0.1"
