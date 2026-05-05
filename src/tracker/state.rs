@@ -66,7 +66,7 @@ pub async fn save_rank_state(
     for (rank, state) in changed {
         let json = sonic_rs::to_string(state).map_err(|e| {
             redis::RedisError::from((
-                redis::ErrorKind::TypeError,
+                redis::ErrorKind::UnexpectedReturnType,
                 "encode rank_state",
                 e.to_string(),
             ))
@@ -99,7 +99,8 @@ pub async fn set_event_ended_flag(
     event_id: i64,
 ) -> Result<(), redis::RedisError> {
     let key = redis_key(server, event_id, "ended");
-    conn.set_ex::<_, _, ()>(&key, "true", ENDED_FLAG_TTL_SECS as u64).await
+    conn.set_ex::<_, _, ()>(&key, "true", ENDED_FLAG_TTL_SECS as u64)
+        .await
 }
 
 #[cfg(test)]
