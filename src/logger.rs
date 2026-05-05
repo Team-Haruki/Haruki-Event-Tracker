@@ -113,13 +113,13 @@ fn parse_level(level: &str) -> LevelFilter {
 }
 
 fn open_log_file(path: &Path) -> Result<std::fs::File, LoggerError> {
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent).map_err(|source| LoggerError::CreateDir {
-                path: parent.display().to_string(),
-                source,
-            })?;
-        }
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent).map_err(|source| LoggerError::CreateDir {
+            path: parent.display().to_string(),
+            source,
+        })?;
     }
     OpenOptions::new()
         .create(true)

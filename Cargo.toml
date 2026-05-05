@@ -2,7 +2,7 @@
 name = "haruki-event-tracker"
 version = "3.0.0-dev"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.88"
 license = "MIT"
 description = "Project Sekai event ranking tracker and query API."
 default-run = "haruki-event-tracker"

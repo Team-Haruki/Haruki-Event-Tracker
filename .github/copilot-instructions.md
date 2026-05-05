@@ -12,7 +12,7 @@ The repo was rewritten from Go on `rewrite/rust`. The Rust port has been live in
 
 ## Stack
 
-- Rust 1.85, edition 2024.
+- Rust 1.88, edition 2024.
 - HTTP: `axum` 0.8 + `tower-http` + `axum-server` (HTTP/HTTPS via the same handle, `aws_lc_rs` rustls provider).
 - DB: `sea-orm` 1.1 + `sea-query` 0.32 (MySQL / PostgreSQL / SQLite).
 - JSON: **sonic-rs everywhere** (`api::json::Json<T>` wraps it for handlers).

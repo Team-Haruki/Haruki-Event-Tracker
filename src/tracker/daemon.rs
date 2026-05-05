@@ -113,11 +113,11 @@ impl HarukiEventTracker {
             }
             _ => false,
         };
-        if need_init {
-            if let Err(err) = self.init().await {
-                tracing::error!(%err, "tracker init failed");
-                return;
-            }
+        if need_init
+            && let Err(err) = self.init().await
+        {
+            tracing::error!(%err, "tracker init failed");
+            return;
         }
 
         if self.inner.as_ref().map(|b| b.event_id()) == Some(event.event_id)

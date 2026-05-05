@@ -171,12 +171,11 @@ impl EventTrackerBase {
     #[tracing::instrument(skip(self), fields(server = %self.server, event_id = self.event_id, ended))]
     pub async fn set_event_ended(&mut self, ended: bool) {
         self.is_event_ended = ended;
-        if ended {
-            if let Err(err) =
+        if ended
+            && let Err(err) =
                 set_event_ended_flag(&mut self.redis, self.server, self.event_id).await
-            {
-                tracing::warn!(%err, "failed to write ended flag");
-            }
+        {
+            tracing::warn!(%err, "failed to write ended flag");
         }
     }
 

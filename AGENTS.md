@@ -15,7 +15,7 @@ Haruki Event Tracker scrapes ranking data from the Haruki Sekai API for *Project
 
 ## Build & run
 
-- MSRV: Rust 1.85 (edition 2024).
+- MSRV: Rust 1.88 (edition 2024).
 - Build: `cargo build --release --bin haruki-event-tracker`.
 - Test: `cargo test --lib`.
 - Lint: `cargo clippy --all-targets -- -D warnings` — keep clippy clean before committing.
