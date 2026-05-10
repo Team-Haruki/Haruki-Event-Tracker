@@ -1,7 +1,9 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-use super::enums::{SekaiEventStatus, SekaiEventType, SekaiServerRegion, SekaiUnit, SekaiWorldBloomType};
+use super::enums::{
+    SekaiEventStatus, SekaiEventType, SekaiServerRegion, SekaiUnit, SekaiWorldBloomType,
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorldBloomChapterStatus {
@@ -31,6 +33,7 @@ pub struct WorldBloom {
     pub event_id: i64,
     #[serde(default)]
     pub game_character_id: i64,
+    #[serde(default = "default_world_bloom_chapter_type")]
     pub world_bloom_chapter_type: SekaiWorldBloomType,
     pub chapter_no: i64,
     pub chapter_start_at: i64,
@@ -64,4 +67,36 @@ pub struct Event {
     pub event_point_assetbundle_name: String,
     #[serde(default)]
     pub standby_screen_display_start_at: i64,
+}
+
+fn default_world_bloom_chapter_type() -> SekaiWorldBloomType {
+    SekaiWorldBloomType::GameCharacter
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn world_bloom_chapter_type_defaults_to_game_character() {
+        let chapter: WorldBloom = sonic_rs::from_str(
+            r#"{
+                "id": 11201,
+                "eventId": 112,
+                "gameCharacterId": 18,
+                "chapterNo": 1,
+                "chapterStartAt": 1731124800000,
+                "aggregateAt": 1731383999000,
+                "chapterEndAt": 1731384599000,
+                "costume2dId": 404,
+                "isSupplemental": false
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            chapter.world_bloom_chapter_type,
+            SekaiWorldBloomType::GameCharacter
+        );
+    }
 }
