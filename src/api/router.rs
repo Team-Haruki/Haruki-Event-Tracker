@@ -10,7 +10,7 @@ use tower_http::catch_panic::CatchPanicLayer;
 use tower_http::compression::CompressionLayer;
 
 use crate::api::access_log::{self, ProxyTrust};
-use crate::api::handler::{lines, ranking, status, trace, user, world_bloom};
+use crate::api::handler::{health, lines, ranking, status, trace, user, world_bloom};
 use crate::api::state::AppState;
 
 pub fn build_router(state: AppState, trust: Arc<ProxyTrust>) -> Router {
@@ -30,6 +30,7 @@ pub fn build_router(state: AppState, trust: Arc<ProxyTrust>) -> Router {
         )
         .route("/trace-ranking/user/{user_id}", get(trace::all_by_user))
         .route("/trace-ranking/rank/{rank}", get(trace::all_by_rank))
+        .route("/trace-ranking/ranks", get(trace::all_by_ranks))
         .route(
             "/trace-world-bloom-ranking/character/{character_id}/user/{user_id}",
             get(trace::wb_all_by_user),
@@ -37,6 +38,10 @@ pub fn build_router(state: AppState, trust: Arc<ProxyTrust>) -> Router {
         .route(
             "/trace-world-bloom-ranking/character/{character_id}/rank/{rank}",
             get(trace::wb_all_by_rank),
+        )
+        .route(
+            "/trace-world-bloom-ranking/character/{character_id}/ranks",
+            get(trace::wb_all_by_ranks),
         )
         .route("/user-data/{user_id}", get(user::user_data))
         .route("/ranking-lines", get(lines::ranking_lines))
@@ -55,6 +60,8 @@ pub fn build_router(state: AppState, trust: Arc<ProxyTrust>) -> Router {
         .route("/status", get(status::event_status));
 
     Router::new()
+        .route("/livez", get(health::livez))
+        .route("/readyz", get(health::readyz))
         .nest("/event/{server}/{event_id}", event_routes)
         .with_state(state)
         .layer(axum::middleware::from_fn_with_state(trust, access_log::log))

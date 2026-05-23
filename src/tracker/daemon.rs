@@ -9,7 +9,6 @@
 //! can borrow it mutably for one full pass.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::db::engine::DatabaseEngine;
@@ -33,6 +32,7 @@ pub struct HarukiEventTracker {
     server: SekaiServerRegion,
     api: HarukiSekaiAPIClient,
     redis: redis::aio::ConnectionManager,
+    api_cache_redis: Option<redis::aio::ConnectionManager>,
     db: Arc<DatabaseEngine>,
     parser: EventDataParser,
     inner: Option<EventTrackerBase>,
@@ -43,17 +43,19 @@ impl HarukiEventTracker {
         server: SekaiServerRegion,
         api: HarukiSekaiAPIClient,
         redis: redis::aio::ConnectionManager,
+        api_cache_redis: Option<redis::aio::ConnectionManager>,
         db: Arc<DatabaseEngine>,
-        master_dir: impl Into<PathBuf>,
-    ) -> Self {
-        Self {
+        master_dir: impl AsRef<str>,
+    ) -> Result<Self, ParseError> {
+        Ok(Self {
             server,
-            parser: EventDataParser::new(server, master_dir),
+            parser: EventDataParser::new(server, master_dir)?,
             api,
             redis,
+            api_cache_redis,
             db,
             inner: None,
-        }
+        })
     }
 
     pub fn server(&self) -> SekaiServerRegion {
@@ -77,6 +79,7 @@ impl HarukiEventTracker {
             is_event_ended,
             self.db.clone(),
             self.redis.clone(),
+            self.api_cache_redis.clone(),
             self.api.clone(),
             event.chapter_statuses,
         );
@@ -113,9 +116,7 @@ impl HarukiEventTracker {
             }
             _ => false,
         };
-        if need_init
-            && let Err(err) = self.init().await
-        {
+        if need_init && let Err(err) = self.init().await {
             tracing::error!(%err, "tracker init failed");
             return;
         }

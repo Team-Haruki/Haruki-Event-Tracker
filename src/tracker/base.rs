@@ -16,6 +16,7 @@ use std::sync::Arc;
 use chrono::Utc;
 use thiserror::Error;
 
+use crate::api::cache::{abort_event_update, begin_event_update, finish_event_update};
 use crate::db::engine::DatabaseEngine;
 use crate::db::query::batch::{batch_insert_event_rankings, batch_insert_world_bloom_rankings};
 use crate::db::query::heartbeat::write_heartbeat;
@@ -23,9 +24,7 @@ use crate::db::schema::create_event_tables;
 use crate::model::enums::{SekaiEventType, SekaiServerRegion};
 use crate::model::event::WorldBloomChapterStatus;
 use crate::model::sekai::{BorderRankingResponse, PlayerRankingSchema, Top100RankingResponse};
-use crate::model::tracker::{
-    HandledRankingData, PlayerState, RankState, WorldBloomKey,
-};
+use crate::model::tracker::{HandledRankingData, PlayerState, RankState, WorldBloomKey};
 use crate::sekai_api::client::HarukiSekaiAPIClient;
 use crate::sekai_api::error::SekaiApiError;
 use crate::tracker::cache::detect_cache;
@@ -56,6 +55,7 @@ pub struct EventTrackerBase {
     is_world_bloom_chapter_ended: HashMap<i64, bool>,
     db: Arc<DatabaseEngine>,
     redis: redis::aio::ConnectionManager,
+    api_cache_redis: Option<redis::aio::ConnectionManager>,
     api: HarukiSekaiAPIClient,
     prev_rank_state: HashMap<i64, RankState>,
     prev_world_bloom_state: HashMap<WorldBloomKey, PlayerState>,
@@ -70,6 +70,7 @@ impl EventTrackerBase {
         is_event_ended: bool,
         db: Arc<DatabaseEngine>,
         redis: redis::aio::ConnectionManager,
+        api_cache_redis: Option<redis::aio::ConnectionManager>,
         api: HarukiSekaiAPIClient,
         world_bloom_statuses: HashMap<i64, WorldBloomChapterStatus>,
     ) -> Self {
@@ -88,6 +89,7 @@ impl EventTrackerBase {
             is_world_bloom_chapter_ended,
             db,
             redis,
+            api_cache_redis,
             api,
             prev_rank_state: HashMap::new(),
             prev_world_bloom_state: HashMap::new(),
@@ -109,14 +111,19 @@ impl EventTrackerBase {
     pub fn world_bloom_statuses(&self) -> &HashMap<i64, WorldBloomChapterStatus> {
         &self.world_bloom_statuses
     }
-    pub fn set_world_bloom_statuses(
-        &mut self,
-        statuses: HashMap<i64, WorldBloomChapterStatus>,
-    ) {
+    pub fn set_world_bloom_statuses(&mut self, statuses: HashMap<i64, WorldBloomChapterStatus>) {
         // Preserve "already finalized" entries; new chapters default to false.
         let mut next: HashMap<i64, bool> = statuses
             .keys()
-            .map(|&c| (c, self.is_world_bloom_chapter_ended.get(&c).copied().unwrap_or(false)))
+            .map(|&c| {
+                (
+                    c,
+                    self.is_world_bloom_chapter_ended
+                        .get(&c)
+                        .copied()
+                        .unwrap_or(false),
+                )
+            })
             .collect();
         std::mem::swap(&mut self.is_world_bloom_chapter_ended, &mut next);
         self.world_bloom_statuses = statuses;
@@ -207,34 +214,72 @@ impl EventTrackerBase {
         tracing::info!("recording ranking data");
         let mut batch_called = false;
         let mut changed_ranks: HashMap<i64, RankState> = HashMap::new();
+        let mut records = Vec::new();
 
         if !only_world_bloom && !data.rankings.is_empty() {
-            let (idx, changed) =
-                diff_rank_based(&data.rankings, &mut self.prev_rank_state);
+            let (idx, changed) = diff_rank_based(&data.rankings, &mut self.prev_rank_state);
             changed_ranks = changed;
             let diffed: Vec<&PlayerRankingSchema> =
                 idx.iter().map(|&i| &data.rankings[i]).collect();
-            let records = build_event_records(data.record_time, &diffed);
-            if !records.is_empty() {
-                batch_insert_event_rankings(&self.db, self.event_id, &records).await?;
-                batch_called = true;
-            }
+            records = build_event_records(data.record_time, &diffed);
         }
 
         let wl_rows = build_world_bloom_rows(data.record_time, &data.world_bloom_rankings);
+        let will_write = !records.is_empty() || !wl_rows.is_empty();
+        if will_write
+            && let Some(conn) = self.api_cache_redis.as_mut()
+            && let Err(err) = begin_event_update(conn, self.server, self.event_id).await
+        {
+            tracing::warn!(%err, "failed to mark API cache dirty");
+        }
+
+        if !records.is_empty() {
+            if let Err(err) = batch_insert_event_rankings(&self.db, self.event_id, &records).await {
+                if let Some(conn) = self.api_cache_redis.as_mut()
+                    && let Err(redis_err) =
+                        abort_event_update(conn, self.server, self.event_id).await
+                {
+                    tracing::warn!(%redis_err, "failed to clear API cache dirty after insert error");
+                }
+                return Err(err.into());
+            }
+            batch_called = true;
+        }
+
         if !wl_rows.is_empty() {
-            batch_insert_world_bloom_rankings(
+            if let Err(err) = batch_insert_world_bloom_rankings(
                 &self.db,
                 self.event_id,
                 &wl_rows,
                 &mut self.prev_world_bloom_state,
             )
-            .await?;
+            .await
+            {
+                if batch_called
+                    && let Some(conn) = self.api_cache_redis.as_mut()
+                    && let Err(redis_err) =
+                        finish_event_update(conn, self.server, self.event_id).await
+                {
+                    tracing::warn!(%redis_err, "failed to bump API cache epoch after partial write");
+                }
+                if !batch_called
+                    && let Some(conn) = self.api_cache_redis.as_mut()
+                    && let Err(redis_err) =
+                        abort_event_update(conn, self.server, self.event_id).await
+                {
+                    tracing::warn!(%redis_err, "failed to clear API cache dirty after insert error");
+                }
+                return Err(err.into());
+            }
             batch_called = true;
         }
 
         if !batch_called {
             write_heartbeat(&self.db, self.event_id, now, 0).await?;
+        } else if let Some(conn) = self.api_cache_redis.as_mut()
+            && let Err(err) = finish_event_update(conn, self.server, self.event_id).await
+        {
+            tracing::warn!(%err, "failed to bump API cache epoch");
         }
 
         if let Err(err) =
@@ -247,8 +292,7 @@ impl EventTrackerBase {
     }
 
     async fn handle_ranking_data(&mut self) -> Result<HandledRankingData, TrackerError> {
-        let top100: Top100RankingResponse =
-            self.api.get_top100(self.server, self.event_id).await?;
+        let top100: Top100RankingResponse = self.api.get_top100(self.server, self.event_id).await?;
         let (border_hash, border): ([u8; 32], BorderRankingResponse) =
             self.api.get_border(self.server, self.event_id).await?;
 
@@ -267,10 +311,7 @@ impl EventTrackerBase {
             HashMap::new()
         };
 
-        let cache_key = format!(
-            "{}-event-{}-main-border",
-            self.server, self.event_id
-        );
+        let cache_key = format!("{}-event-{}-main-border", self.server, self.event_id);
         let is_cached = match detect_cache(&mut self.redis, &cache_key, &border_hash).await {
             Ok(hit) => hit,
             Err(err) => {

@@ -9,6 +9,8 @@
 # 说明：
 # 1. 本文件为配置示例，请复制为 haruki-tracker-configs.yaml 后使用
 # 2. 修改配置后需要重启服务才能生效
+# 3. Rust 版本支持通过 HARUKI_CONFIG_URI 或 --config 指定配置文件位置；
+#    该位置可以是本地路径、file:// URI，或已编译 OpenDAL service 的 URI。
 # ============================================================================
 
 # ============================================================================
@@ -20,6 +22,22 @@ redis:
   host: localhost            # Redis 服务器地址
   port: 6379                 # Redis 服务器端口
   password: ""               # Redis 密码（如无密码请留空）
+
+# ============================================================================
+# API Redis 缓存配置
+# ============================================================================
+# 用途：Tracker 和 API 共享同一个 Redis 时，API 可以用短 TTL 降低热查询压力；
+#      Tracker 每次成功写入后会 bump event 级 epoch，让旧缓存立即失效。
+# 注意：redis_url 留空时复用上面的 redis 配置；TTL 为 0 时使用 default_ttl_secs。
+api_cache:
+  enabled: false
+  redis_url: ""              # 例如 redis://:password@redis:6379/0；留空复用 redis.host/port/password
+  default_ttl_secs: 2
+  latest_rank_ttl_secs: 1
+  trace_rank_ttl_secs: 3
+  batch_trace_rank_ttl_secs: 3
+  user_data_ttl_secs: 30
+  max_value_bytes: 1048576
 
 # ============================================================================
 # 后端 API 服务器配置
@@ -73,7 +91,7 @@ servers:
   # ----------------------------------------------------------------------------
   jp:
     enabled: false           # 是否启用该服务器的追踪（true/false）
-    master_data_dir: Data/haruki-sekai-master/master  # 游戏 Master 数据目录路径
+    master_data_dir: data/haruki-sekai-master/master  # 游戏 Master 数据目录路径，也可使用 OpenDAL URI，如 s3://bucket/jp/master?region=ap-northeast-1
 
     # tracker配置
     tracker:
@@ -95,10 +113,10 @@ servers:
       dialect: postgres      # 数据库类型：mysql, postgres, sqlite
 
       # 数据源名称（DSN）- 根据不同数据库类型格式不同：
-      # PostgreSQL: "host=localhost port=5432 user=username password=your_password dbname=database_name sslmode=disable TimeZone=UTC"
-      # MySQL:      "username:password@tcp(localhost:3306)/database_name?charset=utf8mb4&parseTime=True&loc=Local"
+      # PostgreSQL: "postgres://username:your_password@localhost:5432/database_name?sslmode=disable"
+      # MySQL:      "mysql://username:password@localhost:3306/database_name?charset=utf8mb4"
       # SQLite:     "file:./data.db?cache=shared&mode=rwc"
-      dsn: "host=localhost port=5432 user=haruki_user password=YOUR_PASSWORD_HERE dbname=haruki_tracker_jp sslmode=disable TimeZone=UTC"
+      dsn: "postgres://haruki_user:YOUR_PASSWORD_HERE@localhost:5432/haruki_tracker_jp?sslmode=disable"
 
       # 连接池配置
       max_open_conns: 100    # 最大打开连接数（建议 10-100）
@@ -126,7 +144,7 @@ servers:
   # ----------------------------------------------------------------------------
   en:
     enabled: false           # 是否启用国际服追踪
-    master_data_dir: Data/haruki-sekai-master/master
+    master_data_dir: data/haruki-sekai-en-master/master
     tracker:
       enabled: true
       use_second_level_cron: false
@@ -140,7 +158,7 @@ servers:
     gorm_config:
       enabled: true
       dialect: mysql         # 使用 MySQL 数据库
-      dsn: "username:password@tcp(localhost:3306)/haruki_tracker_en?charset=utf8mb4&parseTime=True&loc=Local"
+      dsn: "mysql://username:password@localhost:3306/haruki_tracker_en?charset=utf8mb4"
       max_open_conns: 100
       max_idle_conns: 10
       conn_max_lifetime: 1h
@@ -160,7 +178,7 @@ servers:
   # ----------------------------------------------------------------------------
   tw:
     enabled: false           # 是否启用台服追踪
-    master_data_dir: Data/haruki-sekai-master/master
+    master_data_dir: data/haruki-sekai-tc-master/master
     tracker:
       enabled: true
       use_second_level_cron: false
@@ -174,7 +192,7 @@ servers:
     gorm_config:
       enabled: true
       dialect: mysql
-      dsn: "username:password@tcp(localhost:3306)/haruki_tracker_tw?charset=utf8mb4&parseTime=True&loc=Local"
+      dsn: "mysql://username:password@localhost:3306/haruki_tracker_tw?charset=utf8mb4"
       max_open_conns: 100
       max_idle_conns: 10
       conn_max_lifetime: 1h
@@ -194,7 +212,7 @@ servers:
   # ----------------------------------------------------------------------------
   kr:
     enabled: false           # 是否启用韩服追踪
-    master_data_dir: Data/haruki-sekai-master/master
+    master_data_dir: data/haruki-sekai-kr-master/master
     tracker:
       enabled: true
       use_second_level_cron: false
@@ -208,7 +226,7 @@ servers:
     gorm_config:
       enabled: true
       dialect: mysql
-      dsn: "username:password@tcp(localhost:3306)/haruki_tracker_kr?charset=utf8mb4&parseTime=True&loc=Local"
+      dsn: "mysql://username:password@localhost:3306/haruki_tracker_kr?charset=utf8mb4"
       max_open_conns: 100
       max_idle_conns: 10
       conn_max_lifetime: 1h
@@ -228,7 +246,7 @@ servers:
   # ----------------------------------------------------------------------------
   cn:
     enabled: false           # 是否启用国服追踪（默认禁用，使用时请改为 true）
-    master_data_dir: Data/haruki-sekai-sc-master/master  # 国服使用简体中文 Master 数据
+    master_data_dir: data/haruki-sekai-sc-master/master  # 国服使用简体中文 Master 数据
     tracker:
       enabled: true
       use_second_level_cron: false
@@ -242,7 +260,7 @@ servers:
     gorm_config:
       enabled: true
       dialect: postgres      # 使用 PostgreSQL 数据库
-      dsn: "host=localhost port=5432 user=haruki_user password=YOUR_PASSWORD_HERE dbname=haruki_tracker_cn sslmode=disable TimeZone=Asia/Shanghai"
+      dsn: "postgres://haruki_user:YOUR_PASSWORD_HERE@localhost:5432/haruki_tracker_cn?sslmode=disable"
       max_open_conns: 100
       max_idle_conns: 10
       conn_max_lifetime: 1h
@@ -269,15 +287,17 @@ servers:
 #
 # 2. 数据库 DSN 配置示例：
 #    PostgreSQL:
-#      "host=localhost port=5432 user=myuser password=mypass dbname=mydb sslmode=disable TimeZone=UTC"
+#      "postgres://myuser:mypass@localhost:5432/mydb?sslmode=disable"
 #    MySQL:
-#      "myuser:mypass@tcp(localhost:3306)/mydb?charset=utf8mb4&parseTime=True&loc=Local"
+#      "mysql://myuser:mypass@localhost:3306/mydb?charset=utf8mb4"
 #    SQLite:
 #      "file:./tracker.db?cache=shared&mode=rwc"
 #
-# 3. 时区设置：
-#    - PostgreSQL 使用 TimeZone 参数：TimeZone=Asia/Shanghai
-#    - MySQL 使用 loc 参数：loc=Asia%2FShanghai
+# 3. Master data 读取：
+#    - 本地目录：data/haruki-sekai-master/master
+#    - file URI：file:///app/master/jp
+#    - S3/OpenDAL URI：s3://bucket/path/jp/master?region=ap-northeast-1
+#    - 当前镜像默认编译 OpenDAL fs / file / http(s) / s3 service。
 #
 # 4. 性能调优建议：
 #    - 高并发场景：增加 max_open_conns 到 200-500
@@ -290,4 +310,3 @@ servers:
 #    - 调试问题：临时使用 info 或 debug
 #
 # ============================================================================
-

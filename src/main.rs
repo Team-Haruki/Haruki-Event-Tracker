@@ -11,10 +11,11 @@ const SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    let cfg = match config::load_from_file(config::DEFAULT_CONFIG_FILE) {
+    let cfg_location = config::config_location_from_args_env();
+    let cfg = match config::load_from_location(&cfg_location).await {
         Ok(c) => c,
         Err(err) => {
-            eprintln!("failed to load {}: {err}", config::DEFAULT_CONFIG_FILE);
+            eprintln!("failed to load {cfg_location}: {err}");
             return ExitCode::from(1);
         }
     };
@@ -73,7 +74,10 @@ async fn main() -> ExitCode {
         let handle = handle.clone();
         async move {
             shutdown::signal().await;
-            tracing::info!(grace_secs = SHUTDOWN_GRACE.as_secs(), "starting graceful shutdown");
+            tracing::info!(
+                grace_secs = SHUTDOWN_GRACE.as_secs(),
+                "starting graceful shutdown"
+            );
             handle.graceful_shutdown(Some(SHUTDOWN_GRACE));
         }
     });
@@ -86,20 +90,19 @@ async fn main() -> ExitCode {
         // returns Err if one was already set — harmless in either case.
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
-        let tls = match RustlsConfig::from_pem_file(&cfg.backend.ssl_cert, &cfg.backend.ssl_key)
-            .await
-        {
-            Ok(c) => c,
-            Err(err) => {
-                tracing::error!(
-                    %err,
-                    cert = %cfg.backend.ssl_cert,
-                    key = %cfg.backend.ssl_key,
-                    "failed to load TLS cert/key"
-                );
-                return ExitCode::from(1);
-            }
-        };
+        let tls =
+            match RustlsConfig::from_pem_file(&cfg.backend.ssl_cert, &cfg.backend.ssl_key).await {
+                Ok(c) => c,
+                Err(err) => {
+                    tracing::error!(
+                        %err,
+                        cert = %cfg.backend.ssl_cert,
+                        key = %cfg.backend.ssl_key,
+                        "failed to load TLS cert/key"
+                    );
+                    return ExitCode::from(1);
+                }
+            };
         tracing::info!(addr = %addr, cert = %cfg.backend.ssl_cert, "HTTPS server listening");
         axum_server::bind_rustls(addr, tls)
             .handle(handle)
@@ -107,7 +110,10 @@ async fn main() -> ExitCode {
             .await
     } else {
         tracing::info!(addr = %addr, "HTTP server listening");
-        axum_server::bind(addr).handle(handle).serve(make_service).await
+        axum_server::bind(addr)
+            .handle(handle)
+            .serve(make_service)
+            .await
     };
 
     if let Err(err) = serve_result {

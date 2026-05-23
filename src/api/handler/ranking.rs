@@ -9,6 +9,7 @@
 
 use axum::extract::{Path, State};
 
+use crate::api::cache::{CacheTtl, rank_suffix, user_suffix};
 use crate::api::error::ApiError;
 use crate::api::extract::resolve_engine;
 use crate::api::json::Json;
@@ -23,15 +24,34 @@ pub async fn latest_by_user(
     Path((server, event_id, user_id)): Path<(String, i64, String)>,
 ) -> Result<Json<UserLatestRankingQueryResponseSchema>, ApiError> {
     let engine = resolve_engine(&state, &server)?;
-    let ranking = fetch_latest_ranking(&engine, event_id, &user_id).await?;
-    let user_data = get_user_data(&engine, event_id, &user_id).await.ok().flatten();
-    if ranking.is_none() && user_data.is_none() {
-        return Err(ApiError::NotFound);
-    }
-    Ok(Json(UserLatestRankingQueryResponseSchema {
-        rank_data: ranking.map(RecordedRankData::Normal),
-        user_data,
-    }))
+    let fetch = async {
+        let ranking = fetch_latest_ranking(&engine, event_id, &user_id).await?;
+        let user_data = get_user_data(&engine, event_id, &user_id)
+            .await
+            .ok()
+            .flatten();
+        if ranking.is_none() && user_data.is_none() {
+            return Err(ApiError::NotFound);
+        }
+        Ok(UserLatestRankingQueryResponseSchema {
+            rank_data: ranking.map(RecordedRankData::Normal),
+            user_data,
+        })
+    };
+    let response = if let Some(cache) = state.cache() {
+        cache
+            .get_or_fetch(
+                &server,
+                event_id,
+                user_suffix("latest", &user_id),
+                cache.ttl(CacheTtl::LatestRank),
+                fetch,
+            )
+            .await?
+    } else {
+        fetch.await?
+    };
+    Ok(Json(response))
 }
 
 #[tracing::instrument(skip(state), fields(server, event_id, rank))]
@@ -40,16 +60,32 @@ pub async fn latest_by_rank(
     Path((server, event_id, rank)): Path<(String, i64, i64)>,
 ) -> Result<Json<UserLatestRankingQueryResponseSchema>, ApiError> {
     let engine = resolve_engine(&state, &server)?;
-    let ranking = fetch_latest_ranking_by_rank(&engine, event_id, rank).await?;
-    let Some(ranking) = ranking else {
-        return Err(ApiError::NotFound);
+    let fetch = async {
+        let ranking = fetch_latest_ranking_by_rank(&engine, event_id, rank).await?;
+        let Some(ranking) = ranking else {
+            return Err(ApiError::NotFound);
+        };
+        let user_data = get_user_data(&engine, event_id, &ranking.user_id)
+            .await
+            .ok()
+            .flatten();
+        Ok(UserLatestRankingQueryResponseSchema {
+            rank_data: Some(RecordedRankData::Normal(ranking)),
+            user_data,
+        })
     };
-    let user_data = get_user_data(&engine, event_id, &ranking.user_id)
-        .await
-        .ok()
-        .flatten();
-    Ok(Json(UserLatestRankingQueryResponseSchema {
-        rank_data: Some(RecordedRankData::Normal(ranking)),
-        user_data,
-    }))
+    let response = if let Some(cache) = state.cache() {
+        cache
+            .get_or_fetch(
+                &server,
+                event_id,
+                rank_suffix("latest", rank),
+                cache.ttl(CacheTtl::LatestRank),
+                fetch,
+            )
+            .await?
+    } else {
+        fetch.await?
+    };
+    Ok(Json(response))
 }
