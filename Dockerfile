@@ -25,7 +25,11 @@ FROM alpine:3.23 AS runtime
 RUN apk add --no-cache ca-certificates tzdata
 WORKDIR /app
 COPY --from=builder /app/target/release/haruki-event-tracker ./haruki-event-tracker
-RUN mkdir -p logs
+RUN addgroup -S -g 101 haruki && \
+    adduser -S -D -H -u 100 -G haruki -h /app haruki && \
+    mkdir -p logs && \
+    chown -R haruki:haruki /app
+USER 100:101
 ENV TZ=Asia/Shanghai
 EXPOSE 8080
 CMD ["./haruki-event-tracker"]

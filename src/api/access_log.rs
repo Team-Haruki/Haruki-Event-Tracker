@@ -72,11 +72,7 @@ impl ProxyTrust {
     }
 }
 
-pub async fn log(
-    State(trust): State<Arc<ProxyTrust>>,
-    req: Request,
-    next: Next,
-) -> Response {
+pub async fn log(State(trust): State<Arc<ProxyTrust>>, req: Request, next: Next) -> Response {
     let started = Instant::now();
     let method = req.method().clone();
     let path = req
@@ -101,13 +97,16 @@ pub async fn log(
 }
 
 fn first_token(headers: &HeaderMap, name: &str) -> Option<String> {
-    headers.get(name).and_then(|v| v.to_str().ok()).and_then(|s| {
-        s.split(',')
-            .next()
-            .map(|t| t.trim())
-            .filter(|t| !t.is_empty())
-            .map(|t| t.to_owned())
-    })
+    headers
+        .get(name)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| {
+            s.split(',')
+                .next()
+                .map(|t| t.trim())
+                .filter(|t| !t.is_empty())
+                .map(|t| t.to_owned())
+        })
 }
 
 fn client_ip(req: &Request, trust: &ProxyTrust) -> String {
@@ -129,7 +128,8 @@ fn client_ip(req: &Request, trust: &ProxyTrust) -> String {
         }
     }
 
-    peer.map(|p| p.to_string()).unwrap_or_else(|| "-".to_owned())
+    peer.map(|p| p.to_string())
+        .unwrap_or_else(|| "-".to_owned())
 }
 
 #[cfg(test)]
@@ -142,7 +142,8 @@ mod tests {
         let mut req = HttpRequest::builder().uri("/").body(Body::empty()).unwrap();
         for (k, v) in headers {
             let name = HeaderName::from_bytes(k.as_bytes()).unwrap();
-            req.headers_mut().insert(name, HeaderValue::from_str(v).unwrap());
+            req.headers_mut()
+                .insert(name, HeaderValue::from_str(v).unwrap());
         }
         let ip: IpAddr = peer.parse().unwrap();
         let addr = SocketAddr::new(ip, 1234);
@@ -187,7 +188,11 @@ mod tests {
 
     #[test]
     fn unparseable_cidrs_are_collected_not_panic() {
-        let cidrs = vec!["10.0.0.0/8".to_owned(), "not-a-cidr".to_owned(), "::1".to_owned()];
+        let cidrs = vec![
+            "10.0.0.0/8".to_owned(),
+            "not-a-cidr".to_owned(),
+            "::1".to_owned(),
+        ];
         let (t, bad) = ProxyTrust::from_config(true, &cidrs, "");
         assert_eq!(t.trusted.len(), 2);
         assert_eq!(bad, vec!["not-a-cidr"]);
@@ -201,4 +206,3 @@ mod tests {
         assert_eq!(client_ip(&req, &t), "1.2.3.4");
     }
 }
-

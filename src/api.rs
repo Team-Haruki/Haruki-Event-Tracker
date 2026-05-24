@@ -1,4 +1,5 @@
 pub mod access_log;
+pub mod cache;
 pub mod error;
 pub mod extract;
 pub mod handler;

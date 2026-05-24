@@ -1,12 +1,16 @@
 use std::collections::HashMap;
+use std::env;
 use std::path::Path;
 
 use serde::Deserialize;
 
 use crate::model::db_config::DbConfig;
 use crate::model::enums::SekaiServerRegion;
+use crate::storage::{StorageError, StorageFile};
 
 pub const DEFAULT_CONFIG_FILE: &str = "haruki-tracker-configs.yaml";
+pub const CONFIG_URI_ENV: &str = "HARUKI_CONFIG_URI";
+pub const LEGACY_CONFIG_ENV: &str = "HARUKI_CONFIG";
 
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
@@ -22,6 +26,34 @@ pub struct RedisConfig {
     pub host: String,
     pub port: u16,
     pub password: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct ApiCacheConfig {
+    pub enabled: bool,
+    pub redis_url: String,
+    pub default_ttl_secs: u64,
+    pub latest_rank_ttl_secs: u64,
+    pub trace_rank_ttl_secs: u64,
+    pub batch_trace_rank_ttl_secs: u64,
+    pub user_data_ttl_secs: u64,
+    pub max_value_bytes: usize,
+}
+
+impl Default for ApiCacheConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            redis_url: String::new(),
+            default_ttl_secs: 2,
+            latest_rank_ttl_secs: 1,
+            trace_rank_ttl_secs: 3,
+            batch_trace_rank_ttl_secs: 3,
+            user_data_ttl_secs: 30,
+            max_value_bytes: 1024 * 1024,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -64,6 +96,7 @@ pub struct ServerConfig {
 #[serde(default)]
 pub struct Config {
     pub redis: RedisConfig,
+    pub api_cache: ApiCacheConfig,
     pub backend: BackendConfig,
     pub servers: HashMap<SekaiServerRegion, ServerConfig>,
     #[serde(rename = "sekai_api")]
@@ -77,6 +110,12 @@ pub enum ConfigError {
         path: String,
         #[source]
         source: std::io::Error,
+    },
+    #[error("read config `{location}`: {source}")]
+    ReadStorage {
+        location: String,
+        #[source]
+        source: Box<StorageError>,
     },
     #[error("parse config YAML `{path}`: {source}")]
     Parse {
@@ -96,4 +135,44 @@ pub fn load_from_file<P: AsRef<Path>>(path: P) -> Result<Config, ConfigError> {
         path: path_ref.display().to_string(),
         source: e,
     })
+}
+
+pub async fn load_from_location(location: &str) -> Result<Config, ConfigError> {
+    let raw = StorageFile::from_location(location)
+        .map_err(|source| ConfigError::ReadStorage {
+            location: location.to_owned(),
+            source: Box::new(source),
+        })?
+        .read_to_string()
+        .await
+        .map_err(|source| ConfigError::ReadStorage {
+            location: location.to_owned(),
+            source: Box::new(source),
+        })?;
+    serde_yaml::from_str(&raw).map_err(|source| ConfigError::Parse {
+        path: location.to_owned(),
+        source,
+    })
+}
+
+pub fn config_location_from_args_env() -> String {
+    let mut args = env::args().skip(1);
+    while let Some(arg) = args.next() {
+        if arg == "--config" {
+            if let Some(value) = args.next() {
+                return value;
+            }
+            break;
+        }
+        if let Some(value) = arg.strip_prefix("--config=") {
+            return value.to_owned();
+        }
+        if !arg.starts_with('-') {
+            return arg;
+        }
+    }
+
+    env::var(CONFIG_URI_ENV)
+        .or_else(|_| env::var(LEGACY_CONFIG_ENV))
+        .unwrap_or_else(|_| DEFAULT_CONFIG_FILE.to_owned())
 }

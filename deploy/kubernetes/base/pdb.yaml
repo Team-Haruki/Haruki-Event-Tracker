@@ -1,0 +1,11 @@
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: haruki-event-tracker
+  labels:
+    app.kubernetes.io/name: haruki-event-tracker
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: haruki-event-tracker

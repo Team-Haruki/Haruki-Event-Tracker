@@ -6,4 +6,5 @@ pub mod logger;
 pub mod model;
 pub mod sekai_api;
 pub mod shutdown;
+pub mod storage;
 pub mod tracker;

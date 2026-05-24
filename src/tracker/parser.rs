@@ -8,16 +8,15 @@
 //! read each call is fine.
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
 
 use chrono::Utc;
 use thiserror::Error;
-use tokio::fs;
 
 use crate::model::enums::{
     SekaiEventStatus, SekaiEventType, SekaiServerRegion, SekaiWorldBloomType,
 };
 use crate::model::event::{Event, EventStatus, WorldBloom, WorldBloomChapterStatus};
+use crate::storage::{StorageError, StorageRoot};
 
 #[derive(Debug, Error)]
 pub enum ParseError {
@@ -33,20 +32,28 @@ pub enum ParseError {
         #[source]
         source: sonic_rs::Error,
     },
+    #[error("master data storage: {0}")]
+    Storage(#[source] Box<StorageError>),
+}
+
+impl From<StorageError> for ParseError {
+    fn from(source: StorageError) -> Self {
+        Self::Storage(Box::new(source))
+    }
 }
 
 #[derive(Debug, Clone)]
 pub struct EventDataParser {
     server: SekaiServerRegion,
-    master_dir: PathBuf,
+    master_data: StorageRoot,
 }
 
 impl EventDataParser {
-    pub fn new(server: SekaiServerRegion, master_dir: impl Into<PathBuf>) -> Self {
-        Self {
+    pub fn new(server: SekaiServerRegion, master_dir: impl AsRef<str>) -> Result<Self, ParseError> {
+        Ok(Self {
             server,
-            master_dir: master_dir.into(),
-        }
+            master_data: StorageRoot::from_dir_location(master_dir.as_ref())?,
+        })
     }
 
     pub fn server(&self) -> SekaiServerRegion {
@@ -54,11 +61,11 @@ impl EventDataParser {
     }
 
     pub async fn load_event_data(&self) -> Result<Vec<Event>, ParseError> {
-        load_json(&self.master_dir.join("events.json")).await
+        self.load_json("events.json").await
     }
 
     pub async fn load_world_bloom_chapter_data(&self) -> Result<Vec<WorldBloom>, ParseError> {
-        load_json(&self.master_dir.join("worldBlooms.json")).await
+        self.load_json("worldBlooms.json").await
     }
 
     /// Returns one `WorldBloomChapterStatus` per `game_character_id` for
@@ -141,17 +148,17 @@ impl EventDataParser {
         }
         Ok(None)
     }
-}
 
-async fn load_json<T: for<'de> serde::Deserialize<'de>>(path: &Path) -> Result<T, ParseError> {
-    let bytes = fs::read(path).await.map_err(|source| ParseError::Read {
-        path: path.display().to_string(),
-        source,
-    })?;
-    sonic_rs::from_slice(&bytes).map_err(|source| ParseError::Parse {
-        path: path.display().to_string(),
-        source,
-    })
+    async fn load_json<T: for<'de> serde::Deserialize<'de>>(
+        &self,
+        path: &str,
+    ) -> Result<T, ParseError> {
+        let bytes = self.master_data.read(path).await?;
+        sonic_rs::from_slice(&bytes).map_err(|source| ParseError::Parse {
+            path: path.to_owned(),
+            source,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -250,16 +257,57 @@ mod tests {
         assert_eq!(event_time_remain(45.0, false, SekaiServerRegion::En), "0m");
     }
 
+    #[tokio::test]
+    async fn loads_current_event_from_file_uri_master_data() {
+        let dir = std::env::temp_dir().join(format!(
+            "haruki-parser-file-uri-test-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let now = Utc::now().timestamp_millis();
+        let events = format!(
+            r#"[{{
+                "id": 999998,
+                "eventType": "marathon",
+                "name": "Smoke",
+                "assetbundleName": "smoke",
+                "bgmAssetbundleName": "smoke_bgm",
+                "eventOnlyComponentDisplayStartAt": {start},
+                "startAt": {start},
+                "aggregateAt": {aggregate},
+                "rankingAnnounceAt": {aggregate},
+                "distributionStartAt": {start},
+                "eventOnlyComponentDisplayEndAt": {closed},
+                "closedAt": {closed},
+                "distributionEndAt": {closed},
+                "unit": "none"
+            }}]"#,
+            start = now - 60_000,
+            aggregate = now + 600_000,
+            closed = now + 1_200_000
+        );
+        std::fs::write(dir.join("events.json"), events).unwrap();
+        std::fs::write(dir.join("worldBlooms.json"), "[]").unwrap();
+
+        let uri = format!("file://{}", dir.display());
+        let parser = EventDataParser::new(SekaiServerRegion::Jp, uri).unwrap();
+        let event = parser.get_current_event_status().await.unwrap().unwrap();
+
+        assert_eq!(event.event_id, 999998);
+        assert_eq!(event.event_status, SekaiEventStatus::Ongoing);
+
+        let _ = std::fs::remove_file(dir.join("events.json"));
+        let _ = std::fs::remove_file(dir.join("worldBlooms.json"));
+        let _ = std::fs::remove_dir(dir);
+    }
+
     #[test]
     fn remain_under_hour() {
         assert_eq!(
             event_time_remain(125.0, true, SekaiServerRegion::En),
             "2m5s"
         );
-        assert_eq!(
-            event_time_remain(125.0, false, SekaiServerRegion::En),
-            "2m"
-        );
+        assert_eq!(event_time_remain(125.0, false, SekaiServerRegion::En), "2m");
     }
 
     #[test]

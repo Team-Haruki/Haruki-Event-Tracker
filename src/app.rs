@@ -14,12 +14,14 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio_cron_scheduler::{Job, JobScheduler, JobSchedulerError};
 
+use crate::api::cache::ApiCache;
 use crate::api::state::AppState;
-use crate::config::Config;
+use crate::config::{Config, RedisConfig};
 use crate::db::engine::{DatabaseEngine, EngineError};
 use crate::model::enums::SekaiServerRegion;
 use crate::sekai_api::client::{BuildError as SekaiClientError, HarukiSekaiAPIClient};
-use crate::tracker::daemon::HarukiEventTracker;
+use crate::tracker::daemon::{DaemonError, HarukiEventTracker};
+use crate::tracker::parser::ParseError;
 
 #[derive(Debug, thiserror::Error)]
 pub enum BootstrapError {
@@ -29,6 +31,10 @@ pub enum BootstrapError {
     Db(#[from] EngineError),
     #[error("sekai api client: {0}")]
     SekaiClient(#[from] SekaiClientError),
+    #[error("tracker: {0}")]
+    Tracker(#[from] DaemonError),
+    #[error("master data: {0}")]
+    MasterData(#[from] ParseError),
     #[error("scheduler: {0}")]
     Scheduler(#[from] JobSchedulerError),
 }
@@ -37,32 +43,58 @@ pub struct AppContext {
     pub state: AppState,
     pub dbs: HashMap<SekaiServerRegion, Arc<DatabaseEngine>>,
     pub trackers: HashMap<SekaiServerRegion, Arc<Mutex<HarukiEventTracker>>>,
-    pub scheduler: JobScheduler,
+    pub scheduler: Option<JobScheduler>,
 }
 
 pub async fn build(cfg: &Config) -> Result<AppContext, BootstrapError> {
-    tracing::info!("connecting Redis");
-    let redis_url = if cfg.redis.password.is_empty() {
-        format!("redis://{}:{}/", cfg.redis.host, cfg.redis.port)
-    } else {
-        format!(
-            "redis://:{}@{}:{}/",
-            cfg.redis.password, cfg.redis.host, cfg.redis.port
-        )
-    };
-    let client = redis::Client::open(redis_url)?;
-    let redis = redis::aio::ConnectionManager::new(client).await?;
-    tracing::info!("Redis ready");
+    let tracker_enabled = cfg
+        .servers
+        .values()
+        .any(|server_cfg| server_cfg.enabled && server_cfg.tracker.enabled);
 
-    let api = HarukiSekaiAPIClient::new(
-        cfg.sekai_api.api_endpoint.clone(),
-        &cfg.sekai_api.api_token,
-    )?;
+    let (redis, api) = if tracker_enabled {
+        tracing::info!("connecting Redis");
+        let redis_url = redis_url(&cfg.redis);
+        let client = redis::Client::open(redis_url)?;
+        let redis = redis::aio::ConnectionManager::new(client).await?;
+        tracing::info!("Redis ready");
+
+        let api = HarukiSekaiAPIClient::new(
+            cfg.sekai_api.api_endpoint.clone(),
+            &cfg.sekai_api.api_token,
+        )?;
+        (Some(redis), Some(api))
+    } else {
+        tracing::info!("all trackers disabled; running API only");
+        (None, None)
+    };
+
+    let (api_cache, api_cache_redis) = if cfg.api_cache.enabled {
+        let redis_url = if cfg.api_cache.redis_url.trim().is_empty() {
+            redis_url(&cfg.redis)
+        } else {
+            cfg.api_cache.redis_url.clone()
+        };
+        tracing::info!("connecting API cache Redis");
+        let client = redis::Client::open(redis_url)?;
+        let conn = redis::aio::ConnectionManager::new(client).await?;
+        tracing::info!("API cache Redis ready");
+        (
+            Some(ApiCache::new(conn.clone(), cfg.api_cache.clone())),
+            Some(conn),
+        )
+    } else {
+        (None, None)
+    };
 
     let mut dbs: HashMap<SekaiServerRegion, Arc<DatabaseEngine>> = HashMap::new();
     let mut trackers: HashMap<SekaiServerRegion, Arc<Mutex<HarukiEventTracker>>> = HashMap::new();
 
-    let scheduler = JobScheduler::new().await?;
+    let scheduler = if tracker_enabled {
+        Some(JobScheduler::new().await?)
+    } else {
+        None
+    };
 
     for (server, server_cfg) in &cfg.servers {
         if !server_cfg.enabled {
@@ -76,13 +108,22 @@ pub async fn build(cfg: &Config) -> Result<AppContext, BootstrapError> {
         if !server_cfg.tracker.enabled {
             continue;
         }
+        let redis = redis
+            .as_ref()
+            .expect("redis is initialized when any tracker is enabled")
+            .clone();
+        let api = api
+            .as_ref()
+            .expect("sekai api is initialized when any tracker is enabled")
+            .clone();
         let mut daemon = HarukiEventTracker::new(
             *server,
-            api.clone(),
-            redis.clone(),
+            api,
+            redis,
+            api_cache_redis.clone(),
             engine.clone(),
             &server_cfg.master_data_dir,
-        );
+        )?;
         if let Err(err) = daemon.init().await {
             tracing::warn!(%server, %err, "tracker init failed; will retry on first tick");
         }
@@ -103,18 +144,32 @@ pub async fn build(cfg: &Config) -> Result<AppContext, BootstrapError> {
                 daemon.lock().await.track_ranking_data().await;
             })
         })?;
-        scheduler.add(job).await?;
+        scheduler
+            .as_ref()
+            .expect("scheduler is initialized when any tracker is enabled")
+            .add(job)
+            .await?;
         tracing::info!(%server, cron = %cron_expr, "scheduled tracker");
     }
 
-    scheduler.start().await?;
-    tracing::info!("scheduler started");
+    if let Some(scheduler) = &scheduler {
+        scheduler.start().await?;
+        tracing::info!("scheduler started");
+    }
 
-    let state = AppState::new(dbs.clone());
+    let state = AppState::new(dbs.clone(), api_cache);
     Ok(AppContext {
         state,
         dbs,
         trackers,
         scheduler,
     })
+}
+
+fn redis_url(cfg: &RedisConfig) -> String {
+    if cfg.password.is_empty() {
+        format!("redis://{}:{}/", cfg.host, cfg.port)
+    } else {
+        format!("redis://:{}@{}:{}/", cfg.password, cfg.host, cfg.port)
+    }
 }

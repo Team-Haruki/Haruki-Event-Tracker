@@ -3,6 +3,7 @@
 
 use axum::extract::{Path, State};
 
+use crate::api::cache::{CacheTtl, user_suffix};
 use crate::api::error::ApiError;
 use crate::api::extract::resolve_engine;
 use crate::api::json::Json;
@@ -16,6 +17,23 @@ pub async fn user_data(
     Path((server, event_id, user_id)): Path<(String, i64, String)>,
 ) -> Result<Json<RecordedUserNameSchema>, ApiError> {
     let engine = resolve_engine(&state, &server)?;
-    let user = get_user_data(&engine, event_id, &user_id).await?;
-    user.map(Json).ok_or(ApiError::NotFound)
+    let fetch = async {
+        get_user_data(&engine, event_id, &user_id)
+            .await?
+            .ok_or(ApiError::NotFound)
+    };
+    let response = if let Some(cache) = state.cache() {
+        cache
+            .get_or_fetch(
+                &server,
+                event_id,
+                user_suffix("user-data", &user_id),
+                cache.ttl(CacheTtl::UserData),
+                fetch,
+            )
+            .await?
+    } else {
+        fetch.await?
+    };
+    Ok(Json(response))
 }

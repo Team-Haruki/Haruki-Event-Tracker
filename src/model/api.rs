@@ -1,7 +1,7 @@
 use sea_orm::FromQueryResult;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Serialize, FromQueryResult)]
+#[derive(Debug, Clone, Serialize, Deserialize, FromQueryResult)]
 #[serde(rename_all = "camelCase")]
 pub struct RecordedRankingSchema {
     pub timestamp: i64,
@@ -14,7 +14,7 @@ pub struct RecordedRankingSchema {
 /// JSON output is flat — fields are duplicated here rather than nested via
 /// `serde(flatten)` so this type can also be `FromQueryResult`-derived from
 /// the World Bloom join (which selects `character_id` as an extra column).
-#[derive(Debug, Clone, Serialize, FromQueryResult)]
+#[derive(Debug, Clone, Serialize, Deserialize, FromQueryResult)]
 #[serde(rename_all = "camelCase")]
 pub struct RecordedWorldBloomRankingSchema {
     pub timestamp: i64,
@@ -25,14 +25,14 @@ pub struct RecordedWorldBloomRankingSchema {
     pub character_id: Option<i64>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum RecordedRankData {
     Normal(RecordedRankingSchema),
     WorldBloom(RecordedWorldBloomRankingSchema),
 }
 
-#[derive(Debug, Clone, Serialize, FromQueryResult)]
+#[derive(Debug, Clone, Serialize, Deserialize, FromQueryResult)]
 #[serde(rename_all = "camelCase")]
 pub struct RecordedUserNameSchema {
     pub user_id: String,
@@ -41,7 +41,7 @@ pub struct RecordedUserNameSchema {
     pub cheerful_team_id: Option<i64>,
 }
 
-#[derive(Debug, Clone, Serialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct UserLatestRankingQueryResponseSchema {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -50,7 +50,7 @@ pub struct UserLatestRankingQueryResponseSchema {
     pub user_data: Option<RecordedUserNameSchema>,
 }
 
-#[derive(Debug, Clone, Serialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct UserAllRankingDataQueryResponseSchema {
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -59,7 +59,22 @@ pub struct UserAllRankingDataQueryResponseSchema {
     pub user_data: Option<RecordedUserNameSchema>,
 }
 
-#[derive(Debug, Clone, Serialize, FromQueryResult)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchAllRankingDataItemSchema {
+    pub rank: i64,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub rank_data: Vec<RecordedRankData>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchAllRankingDataQueryResponseSchema {
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub items: Vec<BatchAllRankingDataItemSchema>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, FromQueryResult)]
 #[serde(rename_all = "camelCase")]
 pub struct RankingLineScoreSchema {
     pub rank: i64,
@@ -67,7 +82,7 @@ pub struct RankingLineScoreSchema {
     pub timestamp: i64,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RankingScoreGrowthSchema {
     pub rank: i64,
@@ -83,7 +98,7 @@ pub struct RankingScoreGrowthSchema {
     pub growth: Option<i64>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EventStatusResponseSchema {
     pub timestamp: i64,

@@ -61,10 +61,7 @@ pub async fn fetch_latest_ranking(
     let time_tbl = Alias::new(intern(TableKind::TimeId, event_id));
     let stmt = ranking_select(event_id)
         .and_where(Expr::col((users_tbl, event_users::Column::UserId)).eq(user_id))
-        .order_by(
-            (time_tbl, time_id::Column::Timestamp),
-            Order::Desc,
-        )
+        .order_by((time_tbl, time_id::Column::Timestamp), Order::Desc)
         .limit(1)
         .to_owned();
 
@@ -102,7 +99,7 @@ pub async fn fetch_latest_ranking_by_rank(
     let event_tbl = Alias::new(intern(TableKind::Event, event_id));
     let time_tbl = Alias::new(intern(TableKind::TimeId, event_id));
     let stmt = ranking_select(event_id)
-        .and_where(Expr::col((event_tbl, event::Column::Rank)).eq(rank))
+        .and_where(Expr::col((event_tbl.clone(), event::Column::Rank)).eq(rank))
         .order_by((time_tbl, time_id::Column::Timestamp), Order::Desc)
         .limit(1)
         .to_owned();
@@ -122,7 +119,31 @@ pub async fn fetch_all_rankings_by_rank(
     let event_tbl = Alias::new(intern(TableKind::Event, event_id));
     let time_tbl = Alias::new(intern(TableKind::TimeId, event_id));
     let stmt = ranking_select(event_id)
-        .and_where(Expr::col((event_tbl, event::Column::Rank)).eq(rank))
+        .and_where(Expr::col((event_tbl.clone(), event::Column::Rank)).eq(rank))
+        .order_by((time_tbl, time_id::Column::Timestamp), Order::Asc)
+        .to_owned();
+
+    let backend = engine.backend();
+    RecordedRankingSchema::find_by_statement(backend.build(&stmt))
+        .all(engine.conn())
+        .await
+}
+
+#[tracing::instrument(skip(engine, ranks), fields(event_id, n = ranks.len()))]
+pub async fn fetch_all_rankings_by_ranks(
+    engine: &DatabaseEngine,
+    event_id: i64,
+    ranks: &[i64],
+) -> Result<Vec<RecordedRankingSchema>, DbErr> {
+    if ranks.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let event_tbl = Alias::new(intern(TableKind::Event, event_id));
+    let time_tbl = Alias::new(intern(TableKind::TimeId, event_id));
+    let stmt = ranking_select(event_id)
+        .and_where(Expr::col((event_tbl.clone(), event::Column::Rank)).is_in(ranks.to_vec()))
+        .order_by((event_tbl.clone(), event::Column::Rank), Order::Asc)
         .order_by((time_tbl, time_id::Column::Timestamp), Order::Asc)
         .to_owned();
 

@@ -1,3 +1,4 @@
+pub mod health;
 pub mod lines;
 pub mod ranking;
 pub mod status;

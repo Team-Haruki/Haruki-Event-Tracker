@@ -8,6 +8,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use crate::api::cache::ApiCache;
 use crate::db::engine::DatabaseEngine;
 use crate::model::enums::SekaiServerRegion;
 
@@ -18,16 +19,31 @@ pub struct AppState {
 
 struct Inner {
     dbs: HashMap<SekaiServerRegion, Arc<DatabaseEngine>>,
+    cache: Option<ApiCache>,
 }
 
 impl AppState {
-    pub fn new(dbs: HashMap<SekaiServerRegion, Arc<DatabaseEngine>>) -> Self {
+    pub fn new(
+        dbs: HashMap<SekaiServerRegion, Arc<DatabaseEngine>>,
+        cache: Option<ApiCache>,
+    ) -> Self {
         Self {
-            inner: Arc::new(Inner { dbs }),
+            inner: Arc::new(Inner { dbs, cache }),
         }
     }
 
     pub fn db(&self, server: SekaiServerRegion) -> Option<&Arc<DatabaseEngine>> {
         self.inner.dbs.get(&server)
+    }
+
+    pub fn dbs(&self) -> impl Iterator<Item = (SekaiServerRegion, Arc<DatabaseEngine>)> + '_ {
+        self.inner
+            .dbs
+            .iter()
+            .map(|(&server, db)| (server, db.clone()))
+    }
+
+    pub fn cache(&self) -> Option<&ApiCache> {
+        self.inner.cache.as_ref()
     }
 }

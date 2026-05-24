@@ -65,7 +65,7 @@ pub async fn fetch_latest_world_bloom_ranking(
     let time_tbl = Alias::new(intern(TableKind::TimeId, event_id));
     let stmt = wl_select(event_id)
         .and_where(Expr::col((users_tbl, event_users::Column::UserId)).eq(user_id))
-        .and_where(Expr::col((wl_tbl, world_bloom::Column::CharacterId)).eq(character_id))
+        .and_where(Expr::col((wl_tbl.clone(), world_bloom::Column::CharacterId)).eq(character_id))
         .order_by((time_tbl, time_id::Column::Timestamp), Order::Desc)
         .limit(1)
         .to_owned();
@@ -88,7 +88,7 @@ pub async fn fetch_all_world_bloom_rankings(
     let time_tbl = Alias::new(intern(TableKind::TimeId, event_id));
     let stmt = wl_select(event_id)
         .and_where(Expr::col((users_tbl, event_users::Column::UserId)).eq(user_id))
-        .and_where(Expr::col((wl_tbl, world_bloom::Column::CharacterId)).eq(character_id))
+        .and_where(Expr::col((wl_tbl.clone(), world_bloom::Column::CharacterId)).eq(character_id))
         .order_by((time_tbl, time_id::Column::Timestamp), Order::Asc)
         .to_owned();
 
@@ -109,7 +109,7 @@ pub async fn fetch_latest_world_bloom_ranking_by_rank(
     let time_tbl = Alias::new(intern(TableKind::TimeId, event_id));
     let stmt = wl_select(event_id)
         .and_where(Expr::col((wl_tbl.clone(), world_bloom::Column::Rank)).eq(rank))
-        .and_where(Expr::col((wl_tbl, world_bloom::Column::CharacterId)).eq(character_id))
+        .and_where(Expr::col((wl_tbl.clone(), world_bloom::Column::CharacterId)).eq(character_id))
         .order_by((time_tbl, time_id::Column::Timestamp), Order::Desc)
         .limit(1)
         .to_owned();
@@ -131,7 +131,33 @@ pub async fn fetch_all_world_bloom_rankings_by_rank(
     let time_tbl = Alias::new(intern(TableKind::TimeId, event_id));
     let stmt = wl_select(event_id)
         .and_where(Expr::col((wl_tbl.clone(), world_bloom::Column::Rank)).eq(rank))
-        .and_where(Expr::col((wl_tbl, world_bloom::Column::CharacterId)).eq(character_id))
+        .and_where(Expr::col((wl_tbl.clone(), world_bloom::Column::CharacterId)).eq(character_id))
+        .order_by((time_tbl, time_id::Column::Timestamp), Order::Asc)
+        .to_owned();
+
+    let backend = engine.backend();
+    RecordedWorldBloomRankingSchema::find_by_statement(backend.build(&stmt))
+        .all(engine.conn())
+        .await
+}
+
+#[tracing::instrument(skip(engine, ranks), fields(event_id, n = ranks.len(), character_id))]
+pub async fn fetch_all_world_bloom_rankings_by_ranks(
+    engine: &DatabaseEngine,
+    event_id: i64,
+    ranks: &[i64],
+    character_id: i64,
+) -> Result<Vec<RecordedWorldBloomRankingSchema>, DbErr> {
+    if ranks.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let wl_tbl = Alias::new(intern(TableKind::WorldBloom, event_id));
+    let time_tbl = Alias::new(intern(TableKind::TimeId, event_id));
+    let stmt = wl_select(event_id)
+        .and_where(Expr::col((wl_tbl.clone(), world_bloom::Column::Rank)).is_in(ranks.to_vec()))
+        .and_where(Expr::col((wl_tbl.clone(), world_bloom::Column::CharacterId)).eq(character_id))
+        .order_by((wl_tbl.clone(), world_bloom::Column::Rank), Order::Asc)
         .order_by((time_tbl, time_id::Column::Timestamp), Order::Asc)
         .to_owned();
 

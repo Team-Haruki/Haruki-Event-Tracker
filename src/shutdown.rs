@@ -21,16 +21,17 @@ use crate::model::enums::SekaiServerRegion;
 use crate::tracker::daemon::HarukiEventTracker;
 
 pub async fn run(
-    mut scheduler: JobScheduler,
+    scheduler: Option<JobScheduler>,
     trackers: HashMap<SekaiServerRegion, Arc<Mutex<HarukiEventTracker>>>,
     dbs: HashMap<SekaiServerRegion, Arc<DatabaseEngine>>,
     state: AppState,
 ) {
-    tracing::info!("shutting down scheduler");
-    if let Err(err) = scheduler.shutdown().await {
-        tracing::error!(%err, "scheduler shutdown failed");
+    if let Some(mut scheduler) = scheduler {
+        tracing::info!("shutting down scheduler");
+        if let Err(err) = scheduler.shutdown().await {
+            tracing::error!(%err, "scheduler shutdown failed");
+        }
     }
-    drop(scheduler);
     drop(trackers);
     drop(state);
     drop(dbs);
@@ -42,8 +43,7 @@ pub async fn signal() {
     #[cfg(unix)]
     {
         use tokio::signal::unix::{SignalKind, signal};
-        let mut sigint =
-            signal(SignalKind::interrupt()).expect("failed to install SIGINT handler");
+        let mut sigint = signal(SignalKind::interrupt()).expect("failed to install SIGINT handler");
         let mut sigterm =
             signal(SignalKind::terminate()).expect("failed to install SIGTERM handler");
         tokio::select! {

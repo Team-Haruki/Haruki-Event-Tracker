@@ -1,11 +1,14 @@
 target/
+data/
+deploy/
+.tmp/
 .git/
 .github/
 .idea/
 .vscode/
 *.log
 logs/
-haruki-tracker-configs.yaml
+haruki-tracker-configs*.yaml
 Dockerfile
 .dockerignore
 README.md
