@@ -165,6 +165,7 @@ fn dirty_key(server: &str, event_id: i64) -> String {
 }
 
 fn base_key(server: &str, event_id: i64) -> String {
+    let server = server.to_ascii_lowercase();
     format!("haruki:tracker:{server}:{event_id}:api_cache")
 }
 
@@ -222,7 +223,7 @@ mod tests {
     #[test]
     fn builds_epoch_value_keys() {
         assert_eq!(
-            value_key("jp", 137, 3, "trace:rank:100"),
+            value_key("JP", 137, 3, "trace:rank:100"),
             "haruki:tracker:jp:137:api_cache:v3:trace:rank:100"
         );
         assert_eq!(

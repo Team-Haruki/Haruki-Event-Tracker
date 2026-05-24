@@ -1,10 +1,15 @@
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
+use futures::future;
 use serde::Serialize;
+use std::time::Duration;
+use tokio::time;
 
 use crate::api::json::Json;
 use crate::api::state::AppState;
+
+const DB_PING_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Serialize)]
 pub struct LiveResponse {
@@ -30,26 +35,30 @@ pub async fn livez() -> Json<LiveResponse> {
 }
 
 pub async fn readyz(State(state): State<AppState>) -> Response {
-    let mut databases = Vec::new();
-    let mut ready = true;
-
-    for (server, db) in state.dbs() {
-        match db.ping().await {
-            Ok(()) => databases.push(DatabaseStatus {
+    let checks = state.dbs().map(|(server, db)| async move {
+        match time::timeout(DB_PING_TIMEOUT, db.ping()).await {
+            Ok(Ok(())) => DatabaseStatus {
                 server: server.to_string(),
                 status: "ok",
                 error: None,
-            }),
-            Err(err) => {
-                ready = false;
-                databases.push(DatabaseStatus {
-                    server: server.to_string(),
-                    status: "error",
-                    error: Some(err.to_string()),
-                });
-            }
+            },
+            Ok(Err(err)) => DatabaseStatus {
+                server: server.to_string(),
+                status: "error",
+                error: Some(err.to_string()),
+            },
+            Err(_) => DatabaseStatus {
+                server: server.to_string(),
+                status: "error",
+                error: Some(format!(
+                    "database ping timed out after {}s",
+                    DB_PING_TIMEOUT.as_secs()
+                )),
+            },
         }
-    }
+    });
+    let databases = future::join_all(checks).await;
+    let ready = databases.iter().all(|db| db.status == "ok");
 
     let status = if ready {
         StatusCode::OK

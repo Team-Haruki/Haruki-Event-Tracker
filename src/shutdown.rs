@@ -31,7 +31,6 @@ pub async fn run(
         if let Err(err) = scheduler.shutdown().await {
             tracing::error!(%err, "scheduler shutdown failed");
         }
-        drop(scheduler);
     }
     drop(trackers);
     drop(state);
