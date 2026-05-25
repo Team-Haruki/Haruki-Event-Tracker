@@ -1,7 +1,7 @@
 //! `event_<id>_users` lookups (Go: `GetUserData`).
 
 use sea_orm::sea_query::{Alias, Expr, Query};
-use sea_orm::{DbErr, FromQueryResult};
+use sea_orm::{DbErr, ExprTrait, FromQueryResult};
 
 use crate::db::engine::DatabaseEngine;
 use crate::db::entity::event_users;

@@ -7,7 +7,7 @@
 
 use futures::future;
 use sea_orm::sea_query::{Alias, Expr, Order, Query};
-use sea_orm::{DbErr, FromQueryResult};
+use sea_orm::{DbErr, ExprTrait, FromQueryResult};
 
 use crate::db::engine::DatabaseEngine;
 use crate::db::entity::{event, time_id, world_bloom};

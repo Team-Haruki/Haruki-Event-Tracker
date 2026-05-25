@@ -39,23 +39,24 @@ tower-http = { version = "0.6", features = [
 ] }
 
 # HTTP client
-reqwest = { version = "0.12", default-features = false, features = [
-    "rustls-tls",
+reqwest = { version = "0.13", default-features = false, features = [
+    "rustls",
     "gzip",
     "brotli",
     "stream",
 ] }
 
 # ORM / DB
-sea-orm = { version = "1.1", features = [
+sea-orm = { version = "2.0.0-rc.38", default-features = false, features = [
     "runtime-tokio-rustls",
     "sqlx-mysql",
     "sqlx-postgres",
     "sqlx-sqlite",
     "macros",
     "with-chrono",
+    "sqlite-use-returning-for-3_35",
 ] }
-sea-query = "0.32"
+sea-query = "=1.0.0-rc.33"
 
 # JSON
 sonic-rs = "0.5"

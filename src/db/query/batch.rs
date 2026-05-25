@@ -10,7 +10,7 @@ use std::collections::{HashMap, HashSet};
 
 use sea_orm::sea_query::{Alias, Expr, OnConflict, Query};
 use sea_orm::{
-    ConnectionTrait, DatabaseBackend, DatabaseTransaction, DbErr, FromQueryResult,
+    ConnectionTrait, DatabaseBackend, DatabaseTransaction, DbErr, ExprTrait, FromQueryResult,
     TransactionError, TransactionTrait,
 };
 
@@ -64,7 +64,7 @@ pub(crate) async fn batch_get_or_create_time_ids(
             .columns([time_id::Column::Timestamp, time_id::Column::Status])
             .values_panic([ts.into(), status.into()])
             .to_owned();
-        tx.execute(backend.build(&ins)).await?;
+        tx.execute(&ins).await?;
 
         let row = TimeIdRow::find_by_statement(backend.build(&sel))
             .one(tx)
@@ -129,7 +129,7 @@ pub(crate) async fn batch_get_or_create_user_id_keys(
                 if let Some(ct) = info.cheerful_team_id {
                     upd.value(event_users::Column::CheerfulTeamId, ct);
                 }
-                tx.execute(backend.build(&upd)).await?;
+                tx.execute(&upd).await?;
             }
             out.insert(user_id.clone(), row.user_id_key);
             continue;
@@ -148,7 +148,7 @@ pub(crate) async fn batch_get_or_create_user_id_keys(
                 info.cheerful_team_id.into(),
             ])
             .to_owned();
-        tx.execute(backend.build(&ins)).await?;
+        tx.execute(&ins).await?;
 
         let row = UserKeyRow::find_by_statement(backend.build(&sel))
             .one(tx)
@@ -261,7 +261,7 @@ pub async fn batch_insert_event_rankings(
                         .do_nothing_on([event::Column::TimeId, event::Column::UserIdKey])
                         .to_owned(),
                 );
-                tx.execute(backend.build(&ins)).await?;
+                tx.execute(&ins).await?;
                 Ok(())
             })
         })
@@ -373,7 +373,7 @@ pub async fn batch_insert_world_bloom_rankings(
                     ])
                     .to_owned(),
                 );
-                tx.execute(backend.build(&ins)).await?;
+                tx.execute(&ins).await?;
                 Ok(state)
             })
         })

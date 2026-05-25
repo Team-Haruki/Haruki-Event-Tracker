@@ -45,7 +45,7 @@ pub async fn create_event_tables(
     let conn = engine.conn();
     for mut stmt in creates {
         stmt.if_not_exists();
-        conn.execute(backend.build(&stmt)).await?;
+        conn.execute(&stmt).await?;
     }
     create_query_indexes(engine, event_id, is_world_bloom).await?;
     Ok(())
@@ -89,7 +89,7 @@ async fn create_query_indexes(
         if supports_index_if_not_exists(backend) {
             stmt.if_not_exists();
         }
-        if let Err(err) = conn.execute(backend.build(&stmt)).await
+        if let Err(err) = conn.execute(&stmt).await
             && !is_duplicate_index_error(&err)
         {
             return Err(err);
