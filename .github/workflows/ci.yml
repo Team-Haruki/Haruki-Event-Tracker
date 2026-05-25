@@ -2,40 +2,45 @@ name: CI
 
 on:
   push:
-    branches: ["**"]
+    branches: [main]
   pull_request:
-    branches: ["**"]
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
 
 jobs:
-  check:
-    name: Check / Clippy / Test
+  rust:
+    name: Rust checks
     runs-on: ubuntu-latest
-
     steps:
-      - name: Checkout code
+      - name: Checkout
         uses: actions/checkout@v6
 
-      - name: Install Rust toolchain
+      - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: stable
-          components: clippy
+          components: rustfmt, clippy
 
-      - name: Install build deps
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y pkg-config cmake build-essential perl
-
-      - name: Cache cargo registry / target
+      - name: Cache Rust artifacts
         uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: ci
 
-      - name: cargo check
-        run: cargo check --all-targets
+      - name: Check formatting
+        run: cargo fmt --all -- --check
 
-      - name: cargo clippy
-        run: cargo clippy --all-targets -- -D warnings
+      - name: Check build
+        run: cargo check --locked --all-targets
 
-      - name: cargo test
-        run: cargo test --lib
+      - name: Run Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      - name: Run tests
+        run: cargo test --locked

@@ -4,150 +4,94 @@ on:
   push:
     tags:
       - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  BINARY_NAME: haruki-event-tracker
 
 jobs:
   build:
-    name: Build (${{ matrix.name }})
-    runs-on: ${{ matrix.runner }}
+    name: Build ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - name: linux-amd64
-            runner: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-latest
+            name: linux-x64
             archive: tar.gz
-          - name: linux-arm64
-            runner: ubuntu-22.04-arm
-            target: aarch64-unknown-linux-gnu
+          - os: macos-latest
+            name: macos-arm64
             archive: tar.gz
-          - name: macos-arm64
-            runner: macos-latest
-            target: aarch64-apple-darwin
-            archive: tar.gz
-          - name: windows-x64
-            runner: windows-latest
-            target: x86_64-pc-windows-msvc
+          - os: windows-latest
+            name: windows-x64
             archive: zip
-
     steps:
-      - name: Checkout code
+      - name: Checkout
         uses: actions/checkout@v6
         with:
           fetch-depth: 0
 
-      - name: Get version
-        id: version
-        shell: bash
-        run: |
-          VERSION="${GITHUB_REF##*/}"
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "Version: $VERSION"
-
-      - name: Install Rust toolchain
+      - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: stable
-          targets: ${{ matrix.target }}
 
-      - name: Install Linux build deps
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y pkg-config cmake build-essential perl
-
-      - name: Cache cargo registry / target
+      - name: Cache Rust artifacts
         uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: release-${{ matrix.target }}
 
-      - name: Pin crate version to tag
-        shell: bash
-        run: |
-          VERSION="${{ steps.version.outputs.version }}"
-          VERSION_NO_V="${VERSION#v}"
-          if [ -n "$VERSION_NO_V" ] && [ "$VERSION_NO_V" != "$VERSION" ]; then
-            if [ "$RUNNER_OS" = "macOS" ]; then
-              sed -i '' "s/^version = \".*\"/version = \"${VERSION_NO_V}\"/" Cargo.toml
-            else
-              sed -i "s/^version = \".*\"/version = \"${VERSION_NO_V}\"/" Cargo.toml
-            fi
-            awk -v v="$VERSION_NO_V" '
-              /^name = "haruki-event-tracker"$/ {
-                print
-                getline
-                sub(/version = ".*"/, "version = \"" v "\"")
-                print
-                next
-              }
-              { print }
-            ' Cargo.lock > Cargo.lock.new && mv Cargo.lock.new Cargo.lock
-          fi
+      - name: Build release binary
+        run: cargo build --release --locked
 
-      - name: Build (release)
-        shell: bash
-        run: cargo build --release --locked --target ${{ matrix.target }} --bin haruki-event-tracker
-
-      - name: Stage artifact
-        shell: bash
+      - name: Package archive (Unix)
+        if: runner.os != 'Windows'
         run: |
           mkdir -p dist
-          BIN=haruki-event-tracker
-          if [ "$RUNNER_OS" = "Windows" ]; then BIN="$BIN.exe"; fi
-          OUT_BIN="HarukiEventTracker"
-          if [ "$RUNNER_OS" = "Windows" ]; then OUT_BIN="$OUT_BIN.exe"; fi
-          cp "target/${{ matrix.target }}/release/$BIN" "dist/$OUT_BIN"
-          cd dist
-          if [ "${{ matrix.archive }}" = "zip" ]; then
-            7z a "HarukiEventTracker-${{ matrix.name }}.zip" "$OUT_BIN" >/dev/null
-          else
-            tar -czf "HarukiEventTracker-${{ matrix.name }}.tar.gz" "$OUT_BIN"
-          fi
+          cp "target/release/${{ env.BINARY_NAME }}" "dist/${{ env.BINARY_NAME }}"
+          tar -czf "dist/${{ env.BINARY_NAME }}-${{ matrix.name }}.tar.gz" -C dist "${{ env.BINARY_NAME }}"
 
-      - name: Upload artifacts
+      - name: Package archive (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist
+          Copy-Item "target/release/${{ env.BINARY_NAME }}.exe" "dist/${{ env.BINARY_NAME }}.exe"
+          Compress-Archive -Path "dist/${{ env.BINARY_NAME }}.exe" -DestinationPath "dist/${{ env.BINARY_NAME }}-${{ matrix.name }}.zip" -Force
+
+      - name: Upload packaged artifact
         uses: actions/upload-artifact@v7
         with:
-          name: ${{ matrix.name }}
-          path: dist/HarukiEventTracker-${{ matrix.name }}.*
+          name: ${{ env.BINARY_NAME }}-${{ matrix.name }}
+          path: dist/${{ env.BINARY_NAME }}-${{ matrix.name }}.${{ matrix.archive }}
+          if-no-files-found: error
 
-  release:
+  publish:
+    name: Publish GitHub Release
     needs: build
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    concurrency:
-      group: release-${{ github.ref_name }}
-      cancel-in-progress: false
-    if: github.event_name == 'push' && contains(github.ref, 'refs/tags/')
-
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
     steps:
-      - name: Checkout repo
-        uses: actions/checkout@v6
-        with:
-          fetch-depth: 0
-
-      - name: Download all artifacts
+      - name: Download packaged artifacts
         uses: actions/download-artifact@v8
         with:
           path: artifacts
 
-      - name: Create or update Release (idempotent)
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Generate checksums
         run: |
-          TAG="${GITHUB_REF_NAME}"
-          TITLE="Release ${TAG}"
-          REPO="${GITHUB_REPOSITORY}"
-          if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
-            gh release edit "$TAG" --repo "$REPO" --title "$TITLE" --latest
-          else
-            gh release create "$TAG" --repo "$REPO" --title "$TITLE" --generate-notes --latest
-          fi
+          cd artifacts
+          find . -type f \( -name "*.tar.gz" -o -name "*.zip" \) -exec sha256sum {} \; > "SHA256SUMS-${{ github.ref_name }}.txt"
 
-      - name: Upload Release Assets (overwrite)
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          TAG="${GITHUB_REF_NAME}"
-          REPO="${GITHUB_REPOSITORY}"
-          gh release upload "$TAG" artifacts/**/* --repo "$REPO" --clobber
+      - name: Upload release assets
+        uses: softprops/action-gh-release@v3
+        with:
+          files: |
+            artifacts/**/*.tar.gz
+            artifacts/**/*.zip
+            artifacts/SHA256SUMS-${{ github.ref_name }}.txt
+          generate_release_notes: true
