@@ -61,7 +61,7 @@ sea-query = "=1.0.0-rc.33"
 # JSON
 sonic-rs = "0.5"
 serde = { version = "1", features = ["derive"] }
-serde_yaml = "0.9"
+serde_yaml = { package = "yaml_serde", version = "0.10" }
 
 # Redis
 redis = { version = "1.2", features = [
