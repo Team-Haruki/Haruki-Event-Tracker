@@ -90,7 +90,13 @@ where
                 tgt = target,
             )?;
         } else {
-            write!(writer, "[{ts}][{lvl}][{tgt}] ", ts = now, lvl = level_label, tgt = target)?;
+            write!(
+                writer,
+                "[{ts}][{lvl}][{tgt}] ",
+                ts = now,
+                lvl = level_label,
+                tgt = target
+            )?;
         }
 
         ctx.field_format().format_fields(writer.by_ref(), event)?;
@@ -187,7 +193,11 @@ pub fn init<P: AsRef<Path>>(
                 .with_writer(Mutex::new(f));
             let layer = if access_path.is_some() {
                 layer
-                    .with_filter(Targets::new().with_target(ACCESS_TARGET, LevelFilter::OFF).with_default(LevelFilter::TRACE))
+                    .with_filter(
+                        Targets::new()
+                            .with_target(ACCESS_TARGET, LevelFilter::OFF)
+                            .with_default(LevelFilter::TRACE),
+                    )
                     .boxed()
             } else {
                 layer.boxed()

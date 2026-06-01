@@ -70,9 +70,7 @@ pub(crate) async fn batch_get_or_create_time_ids(
             .one(tx)
             .await?
             .ok_or_else(|| {
-                DbErr::Custom(format!(
-                    "inserted time_id row vanished for timestamp={ts}"
-                ))
+                DbErr::Custom(format!("inserted time_id row vanished for timestamp={ts}"))
             })?;
         out.insert(ts, row.time_id);
     }
@@ -211,11 +209,14 @@ pub async fn batch_insert_event_rankings(
     let users_tbl = intern(TableKind::EventUsers, event_id);
     let event_tbl = intern(TableKind::Event, event_id);
 
-    let (timestamps, users) = collect_dims(
-        records
-            .iter()
-            .map(|r| (r.timestamp, r.user_id.as_str(), r.name.as_str(), r.cheerful_team_id)),
-    );
+    let (timestamps, users) = collect_dims(records.iter().map(|r| {
+        (
+            r.timestamp,
+            r.user_id.as_str(),
+            r.name.as_str(),
+            r.cheerful_team_id,
+        )
+    }));
     let owned: Vec<OwnedRecord> = records
         .iter()
         .map(|r| OwnedRecord {

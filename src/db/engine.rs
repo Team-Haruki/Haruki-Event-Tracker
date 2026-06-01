@@ -40,10 +40,14 @@ impl DatabaseEngine {
         } else {
             DEFAULT_MIN_CONN
         });
-        opts.max_lifetime(parse_simple_duration(&cfg.conn_max_lifetime).unwrap_or(DEFAULT_LIFETIME));
+        opts.max_lifetime(
+            parse_simple_duration(&cfg.conn_max_lifetime).unwrap_or(DEFAULT_LIFETIME),
+        );
         opts.sqlx_logging(false);
 
-        let conn = Database::connect(opts).await.map_err(EngineError::Connect)?;
+        let conn = Database::connect(opts)
+            .await
+            .map_err(EngineError::Connect)?;
         Ok(Self { conn, backend })
     }
 
@@ -105,9 +109,15 @@ mod tests {
 
     #[test]
     fn parses_durations() {
-        assert_eq!(parse_simple_duration("200ms"), Some(Duration::from_millis(200)));
+        assert_eq!(
+            parse_simple_duration("200ms"),
+            Some(Duration::from_millis(200))
+        );
         assert_eq!(parse_simple_duration("1h"), Some(Duration::from_secs(3600)));
-        assert_eq!(parse_simple_duration("30m"), Some(Duration::from_secs(1800)));
+        assert_eq!(
+            parse_simple_duration("30m"),
+            Some(Duration::from_secs(1800))
+        );
         assert_eq!(parse_simple_duration("60s"), Some(Duration::from_secs(60)));
         assert_eq!(parse_simple_duration(""), None);
         assert_eq!(parse_simple_duration("h"), None);
@@ -117,8 +127,14 @@ mod tests {
     #[test]
     fn parses_dialects() {
         assert_eq!(parse_backend("MySQL").unwrap(), DatabaseBackend::MySql);
-        assert_eq!(parse_backend("postgres").unwrap(), DatabaseBackend::Postgres);
-        assert_eq!(parse_backend("postgresql").unwrap(), DatabaseBackend::Postgres);
+        assert_eq!(
+            parse_backend("postgres").unwrap(),
+            DatabaseBackend::Postgres
+        );
+        assert_eq!(
+            parse_backend("postgresql").unwrap(),
+            DatabaseBackend::Postgres
+        );
         assert_eq!(parse_backend("sqlite").unwrap(), DatabaseBackend::Sqlite);
         assert!(matches!(
             parse_backend("nope"),
