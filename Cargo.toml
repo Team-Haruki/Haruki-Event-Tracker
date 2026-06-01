@@ -93,7 +93,7 @@ chrono = { version = "0.4", default-features = false, features = [
 ] }
 sha2 = "0.11"
 ipnet = "2"
-opendal = { version = "0.56", default-features = false, features = ["services-fs", "services-s3", "services-http", "reqwest-rustls-tls", "executors-tokio", "auto-register-services", "layers-retry", "layers-timeout"] }
+opendal = { version = "0.57", default-features = false, features = ["services-fs", "services-s3", "services-http", "reqwest-rustls-tls", "executors-tokio", "auto-register-services", "layers-retry", "layers-timeout"] }
 
 [dev-dependencies]
 tokio = { version = "1.52", features = ["full", "test-util", "macros"] }
