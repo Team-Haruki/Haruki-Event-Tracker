@@ -67,7 +67,9 @@ pub async fn fetch_ranking_score_growths(
                     .equals((Alias::new(time_tbl), time_id::Column::TimeId)),
             )
             .and_where(Expr::col((Alias::new(event_tbl), event::Column::Rank)).eq(rank))
-            .and_where(Expr::col((Alias::new(time_tbl), time_id::Column::Timestamp)).gte(start_time))
+            .and_where(
+                Expr::col((Alias::new(time_tbl), time_id::Column::Timestamp)).gte(start_time),
+            )
             .order_by(
                 (Alias::new(time_tbl), time_id::Column::Timestamp),
                 Order::Asc,
@@ -125,7 +127,9 @@ pub async fn fetch_world_bloom_ranking_score_growths(
             .and_where(
                 Expr::col((Alias::new(wl_tbl), world_bloom::Column::CharacterId)).eq(character_id),
             )
-            .and_where(Expr::col((Alias::new(time_tbl), time_id::Column::Timestamp)).gte(start_time))
+            .and_where(
+                Expr::col((Alias::new(time_tbl), time_id::Column::Timestamp)).gte(start_time),
+            )
             .order_by(
                 (Alias::new(time_tbl), time_id::Column::Timestamp),
                 Order::Asc,

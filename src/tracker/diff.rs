@@ -107,7 +107,11 @@ pub fn process_world_bloom_chapter(
 ) -> Option<(i64, Vec<PlayerRankingSchema>)> {
     let char_id = chapter.base.game_character_id?;
     let status = statuses.get(&char_id)?;
-    if chapter.base.is_world_bloom_chapter_aggregate.unwrap_or(false) {
+    if chapter
+        .base
+        .is_world_bloom_chapter_aggregate
+        .unwrap_or(false)
+    {
         return None;
     }
     let chapter_ended = is_chapter_ended.get(&char_id).copied().unwrap_or(false);
@@ -156,9 +160,14 @@ pub fn extract_world_bloom_rankings(
         }
     }
     for chapter in top100_chapters {
-        if let Some((char_id, rankings)) = process_world_bloom_chapter(chapter, statuses, is_chapter_ended) {
+        if let Some((char_id, rankings)) =
+            process_world_bloom_chapter(chapter, statuses, is_chapter_ended)
+        {
             let border = borders_by_char.remove(&char_id).unwrap_or_default();
-            out.insert(char_id, merge_world_bloom_rankings_for_character(rankings, border));
+            out.insert(
+                char_id,
+                merge_world_bloom_rankings_for_character(rankings, border),
+            );
         }
     }
     out
@@ -181,14 +190,15 @@ pub fn build_event_records(
             continue;
         };
         let user_id = uid.to_string();
-        seen.entry(user_id.clone()).or_insert(PlayerEventRankingRecordSchema {
-            timestamp: record_time,
-            user_id,
-            name,
-            score,
-            rank,
-            cheerful_team_id: extract_cheerful_team_id(r),
-        });
+        seen.entry(user_id.clone())
+            .or_insert(PlayerEventRankingRecordSchema {
+                timestamp: record_time,
+                user_id,
+                name,
+                score,
+                rank,
+                cheerful_team_id: extract_cheerful_team_id(r),
+            });
     }
     seen.into_values().collect()
 }
