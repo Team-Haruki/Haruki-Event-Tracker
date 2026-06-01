@@ -60,7 +60,10 @@ pub async fn fetch_ranking_lines(
     });
 
     let results = future::join_all(futs).await;
-    Ok(results.into_iter().filter_map(|r| r.ok().flatten()).collect())
+    Ok(results
+        .into_iter()
+        .filter_map(|r| r.ok().flatten())
+        .collect())
 }
 
 #[tracing::instrument(skip(engine, ranks), fields(event_id, character_id, ranks_len = ranks.len()))]
@@ -113,5 +116,8 @@ pub async fn fetch_world_bloom_ranking_lines(
     });
 
     let results = future::join_all(futs).await;
-    Ok(results.into_iter().filter_map(|r| r.ok().flatten()).collect())
+    Ok(results
+        .into_iter()
+        .filter_map(|r| r.ok().flatten())
+        .collect())
 }
