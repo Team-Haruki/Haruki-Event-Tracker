@@ -55,7 +55,10 @@ pub async fn fetch_latest_heartbeat(
     let backend = engine.backend();
     let table = intern(TableKind::TimeId, event_id);
     let stmt = Query::select()
-        .expr_as(Expr::col(time_id::Column::Timestamp), Alias::new("timestamp"))
+        .expr_as(
+            Expr::col(time_id::Column::Timestamp),
+            Alias::new("timestamp"),
+        )
         .expr_as(Expr::col(time_id::Column::Status), Alias::new("status"))
         .from(Alias::new(table))
         .order_by(time_id::Column::Timestamp, Order::Desc)
@@ -67,4 +70,3 @@ pub async fn fetch_latest_heartbeat(
         .await?;
     Ok(row.map(|r| (r.timestamp, r.status)))
 }
-
