@@ -40,11 +40,9 @@ impl ColumnTrait for Column {
     type EntityName = Entity;
     fn def(&self) -> ColumnDef {
         match self {
-            Self::TimeId
-            | Self::UserIdKey
-            | Self::CharacterId
-            | Self::Score
-            | Self::Rank => ColumnType::BigInteger.def(),
+            Self::TimeId | Self::UserIdKey | Self::CharacterId | Self::Score | Self::Rank => {
+                ColumnType::BigInteger.def()
+            }
         }
     }
 }
