@@ -1,4 +1,4 @@
-FROM rust:1.95-alpine AS builder
+FROM rust:1.96-alpine AS builder
 
 WORKDIR /app
 
