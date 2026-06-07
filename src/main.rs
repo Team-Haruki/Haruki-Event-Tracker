@@ -34,7 +34,7 @@ async fn main() -> ExitCode {
     }
 
     tracing::info!(
-        "========================= Haruki Event Tracker {} =========================",
+        "===== Haruki Event Tracker v{} =====",
         env!("CARGO_PKG_VERSION")
     );
     tracing::info!("Powered by Haruki Dev Team");
