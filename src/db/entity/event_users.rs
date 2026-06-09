@@ -4,6 +4,8 @@
 //! deduplicated to the autoincremented `user_id_key`, which is what the
 //! ranking tables actually reference. `name` and `cheerful_team_id` are
 //! refreshed in place when the user updates them.
+//! `unique_id` is a public, salted one-way identifier used by the API when
+//! UID anonymization is enabled.
 //!
 //! Column types mirror `EventUsersTable` in `utils/gorm/tables.go`:
 //! `user_id varchar(30)`, `name varchar(300)`, `cheerful_team_id` nullable.
@@ -25,6 +27,7 @@ impl EntityName for Entity {
 pub struct Model {
     pub user_id_key: i64,
     pub user_id: String,
+    pub unique_id: Option<String>,
     pub name: String,
     pub cheerful_team_id: Option<i64>,
 }
@@ -33,6 +36,7 @@ pub struct Model {
 pub enum Column {
     UserIdKey,
     UserId,
+    UniqueId,
     Name,
     CheerfulTeamId,
 }
@@ -43,6 +47,10 @@ impl ColumnTrait for Column {
         match self {
             Self::UserIdKey => ColumnType::BigInteger.def(),
             Self::UserId => ColumnType::String(StringLen::N(30)).def().unique(),
+            Self::UniqueId => ColumnType::String(StringLen::N(64))
+                .def()
+                .unique()
+                .nullable(),
             Self::Name => ColumnType::String(StringLen::N(300)).def(),
             Self::CheerfulTeamId => ColumnType::BigInteger.def().nullable(),
         }

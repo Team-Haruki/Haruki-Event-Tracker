@@ -59,6 +59,11 @@ impl DatabaseEngine {
         self.backend
     }
 
+    #[cfg(test)]
+    pub(crate) fn from_connection(conn: DatabaseConnection, backend: DatabaseBackend) -> Self {
+        Self { conn, backend }
+    }
+
     pub async fn ping(&self) -> Result<(), DbErr> {
         self.conn.ping().await
     }

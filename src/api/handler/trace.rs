@@ -11,7 +11,7 @@ use crate::api::cache::{
     CacheTtl, batch_rank_suffix, rank_suffix, user_suffix, wb_batch_rank_suffix, wb_rank_suffix,
 };
 use crate::api::error::ApiError;
-use crate::api::extract::{parse_rank_query, resolve_engine};
+use crate::api::extract::{parse_rank_query, prepare_user_id_mode, resolve_region_engine};
 use crate::api::json::Json;
 use crate::api::state::AppState;
 use crate::db::query::ranking::{
@@ -32,10 +32,11 @@ pub async fn all_by_user(
     State(state): State<AppState>,
     Path((server, event_id, user_id)): Path<(String, i64, String)>,
 ) -> Result<Json<UserAllRankingDataQueryResponseSchema>, ApiError> {
-    let engine = resolve_engine(&state, &server)?;
+    let (region, engine) = resolve_region_engine(&state, &server)?;
+    let mode = prepare_user_id_mode(&state, &engine, region, event_id).await?;
     let fetch = async {
-        let rankings = fetch_all_rankings(&engine, event_id, &user_id).await?;
-        let user_data = get_user_data(&engine, event_id, &user_id)
+        let rankings = fetch_all_rankings(&engine, event_id, &user_id, mode).await?;
+        let user_data = get_user_data(&engine, event_id, &user_id, mode)
             .await
             .ok()
             .flatten();
@@ -68,9 +69,10 @@ pub async fn all_by_rank(
     State(state): State<AppState>,
     Path((server, event_id, rank)): Path<(String, i64, i64)>,
 ) -> Result<Json<UserAllRankingDataQueryResponseSchema>, ApiError> {
-    let engine = resolve_engine(&state, &server)?;
+    let (region, engine) = resolve_region_engine(&state, &server)?;
+    let mode = prepare_user_id_mode(&state, &engine, region, event_id).await?;
     let fetch = async {
-        let rankings = fetch_all_rankings_by_rank(&engine, event_id, rank).await?;
+        let rankings = fetch_all_rankings_by_rank(&engine, event_id, rank, mode).await?;
         if rankings.is_empty() {
             return Err(ApiError::NotFound);
         }
@@ -102,11 +104,12 @@ pub async fn all_by_ranks(
     RawQuery(raw_query): RawQuery,
 ) -> Result<Json<BatchAllRankingDataQueryResponseSchema>, ApiError> {
     let ranks = parse_rank_query(raw_query.as_deref())?;
-    let engine = resolve_engine(&state, &server)?;
+    let (region, engine) = resolve_region_engine(&state, &server)?;
+    let mode = prepare_user_id_mode(&state, &engine, region, event_id).await?;
     let suffix = batch_rank_suffix("trace", &ranks);
     let fetch_ranks = ranks.clone();
     let fetch = async {
-        let rankings = fetch_all_rankings_by_ranks(&engine, event_id, &fetch_ranks).await?;
+        let rankings = fetch_all_rankings_by_ranks(&engine, event_id, &fetch_ranks, mode).await?;
         if rankings.is_empty() {
             return Err(ApiError::NotFound);
         }
@@ -150,11 +153,12 @@ pub async fn wb_all_by_user(
     State(state): State<AppState>,
     Path((server, event_id, character_id, user_id)): Path<(String, i64, i64, String)>,
 ) -> Result<Json<UserAllRankingDataQueryResponseSchema>, ApiError> {
-    let engine = resolve_engine(&state, &server)?;
+    let (region, engine) = resolve_region_engine(&state, &server)?;
+    let mode = prepare_user_id_mode(&state, &engine, region, event_id).await?;
     let fetch = async {
         let rankings =
-            fetch_all_world_bloom_rankings(&engine, event_id, &user_id, character_id).await?;
-        let user_data = get_user_data(&engine, event_id, &user_id)
+            fetch_all_world_bloom_rankings(&engine, event_id, &user_id, character_id, mode).await?;
+        let user_data = get_user_data(&engine, event_id, &user_id, mode)
             .await
             .ok()
             .flatten();
@@ -192,13 +196,19 @@ pub async fn wb_all_by_ranks(
     RawQuery(raw_query): RawQuery,
 ) -> Result<Json<BatchAllRankingDataQueryResponseSchema>, ApiError> {
     let ranks = parse_rank_query(raw_query.as_deref())?;
-    let engine = resolve_engine(&state, &server)?;
+    let (region, engine) = resolve_region_engine(&state, &server)?;
+    let mode = prepare_user_id_mode(&state, &engine, region, event_id).await?;
     let suffix = wb_batch_rank_suffix("trace", character_id, &ranks);
     let fetch_ranks = ranks.clone();
     let fetch = async {
-        let rankings =
-            fetch_all_world_bloom_rankings_by_ranks(&engine, event_id, &fetch_ranks, character_id)
-                .await?;
+        let rankings = fetch_all_world_bloom_rankings_by_ranks(
+            &engine,
+            event_id,
+            &fetch_ranks,
+            character_id,
+            mode,
+        )
+        .await?;
         if rankings.is_empty() {
             return Err(ApiError::NotFound);
         }
@@ -242,10 +252,12 @@ pub async fn wb_all_by_rank(
     State(state): State<AppState>,
     Path((server, event_id, character_id, rank)): Path<(String, i64, i64, i64)>,
 ) -> Result<Json<UserAllRankingDataQueryResponseSchema>, ApiError> {
-    let engine = resolve_engine(&state, &server)?;
+    let (region, engine) = resolve_region_engine(&state, &server)?;
+    let mode = prepare_user_id_mode(&state, &engine, region, event_id).await?;
     let fetch = async {
         let rankings =
-            fetch_all_world_bloom_rankings_by_rank(&engine, event_id, rank, character_id).await?;
+            fetch_all_world_bloom_rankings_by_rank(&engine, event_id, rank, character_id, mode)
+                .await?;
         if rankings.is_empty() {
             return Err(ApiError::NotFound);
         }

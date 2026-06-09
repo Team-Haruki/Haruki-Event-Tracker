@@ -10,10 +10,11 @@ use sea_orm::{DbErr, ExprTrait, FromQueryResult};
 
 use crate::db::engine::DatabaseEngine;
 use crate::db::entity::{event_users, time_id, world_bloom};
+use crate::db::query::user::PublicUserIdMode;
 use crate::db::table_name::{TableKind, intern};
 use crate::model::api::RecordedWorldBloomRankingSchema;
 
-fn wl_select(event_id: i64) -> SelectStatement {
+fn wl_select(event_id: i64, mode: PublicUserIdMode) -> SelectStatement {
     let wl_tbl = Alias::new(intern(TableKind::WorldBloom, event_id));
     let time_tbl = Alias::new(intern(TableKind::TimeId, event_id));
     let users_tbl = Alias::new(intern(TableKind::EventUsers, event_id));
@@ -24,7 +25,7 @@ fn wl_select(event_id: i64) -> SelectStatement {
             Alias::new("timestamp"),
         )
         .expr_as(
-            Expr::col((users_tbl.clone(), event_users::Column::UserId)),
+            Expr::col((users_tbl.clone(), mode.output_column())),
             Alias::new("user_id"),
         )
         .expr_as(
@@ -59,12 +60,13 @@ pub async fn fetch_latest_world_bloom_ranking(
     event_id: i64,
     user_id: &str,
     character_id: i64,
+    mode: PublicUserIdMode,
 ) -> Result<Option<RecordedWorldBloomRankingSchema>, DbErr> {
     let users_tbl = Alias::new(intern(TableKind::EventUsers, event_id));
     let wl_tbl = Alias::new(intern(TableKind::WorldBloom, event_id));
     let time_tbl = Alias::new(intern(TableKind::TimeId, event_id));
-    let stmt = wl_select(event_id)
-        .and_where(Expr::col((users_tbl, event_users::Column::UserId)).eq(user_id))
+    let stmt = wl_select(event_id, mode)
+        .and_where(Expr::col((users_tbl, mode.output_column())).eq(user_id))
         .and_where(Expr::col((wl_tbl.clone(), world_bloom::Column::CharacterId)).eq(character_id))
         .order_by((time_tbl, time_id::Column::Timestamp), Order::Desc)
         .limit(1)
@@ -82,12 +84,13 @@ pub async fn fetch_all_world_bloom_rankings(
     event_id: i64,
     user_id: &str,
     character_id: i64,
+    mode: PublicUserIdMode,
 ) -> Result<Vec<RecordedWorldBloomRankingSchema>, DbErr> {
     let users_tbl = Alias::new(intern(TableKind::EventUsers, event_id));
     let wl_tbl = Alias::new(intern(TableKind::WorldBloom, event_id));
     let time_tbl = Alias::new(intern(TableKind::TimeId, event_id));
-    let stmt = wl_select(event_id)
-        .and_where(Expr::col((users_tbl, event_users::Column::UserId)).eq(user_id))
+    let stmt = wl_select(event_id, mode)
+        .and_where(Expr::col((users_tbl, mode.output_column())).eq(user_id))
         .and_where(Expr::col((wl_tbl.clone(), world_bloom::Column::CharacterId)).eq(character_id))
         .order_by((time_tbl, time_id::Column::Timestamp), Order::Asc)
         .to_owned();
@@ -104,10 +107,11 @@ pub async fn fetch_latest_world_bloom_ranking_by_rank(
     event_id: i64,
     rank: i64,
     character_id: i64,
+    mode: PublicUserIdMode,
 ) -> Result<Option<RecordedWorldBloomRankingSchema>, DbErr> {
     let wl_tbl = Alias::new(intern(TableKind::WorldBloom, event_id));
     let time_tbl = Alias::new(intern(TableKind::TimeId, event_id));
-    let stmt = wl_select(event_id)
+    let stmt = wl_select(event_id, mode)
         .and_where(Expr::col((wl_tbl.clone(), world_bloom::Column::Rank)).eq(rank))
         .and_where(Expr::col((wl_tbl.clone(), world_bloom::Column::CharacterId)).eq(character_id))
         .order_by((time_tbl, time_id::Column::Timestamp), Order::Desc)
@@ -126,10 +130,11 @@ pub async fn fetch_all_world_bloom_rankings_by_rank(
     event_id: i64,
     rank: i64,
     character_id: i64,
+    mode: PublicUserIdMode,
 ) -> Result<Vec<RecordedWorldBloomRankingSchema>, DbErr> {
     let wl_tbl = Alias::new(intern(TableKind::WorldBloom, event_id));
     let time_tbl = Alias::new(intern(TableKind::TimeId, event_id));
-    let stmt = wl_select(event_id)
+    let stmt = wl_select(event_id, mode)
         .and_where(Expr::col((wl_tbl.clone(), world_bloom::Column::Rank)).eq(rank))
         .and_where(Expr::col((wl_tbl.clone(), world_bloom::Column::CharacterId)).eq(character_id))
         .order_by((time_tbl, time_id::Column::Timestamp), Order::Asc)
@@ -147,6 +152,7 @@ pub async fn fetch_all_world_bloom_rankings_by_ranks(
     event_id: i64,
     ranks: &[i64],
     character_id: i64,
+    mode: PublicUserIdMode,
 ) -> Result<Vec<RecordedWorldBloomRankingSchema>, DbErr> {
     if ranks.is_empty() {
         return Ok(Vec::new());
@@ -154,7 +160,7 @@ pub async fn fetch_all_world_bloom_rankings_by_ranks(
 
     let wl_tbl = Alias::new(intern(TableKind::WorldBloom, event_id));
     let time_tbl = Alias::new(intern(TableKind::TimeId, event_id));
-    let stmt = wl_select(event_id)
+    let stmt = wl_select(event_id, mode)
         .and_where(Expr::col((wl_tbl.clone(), world_bloom::Column::Rank)).is_in(ranks.to_vec()))
         .and_where(Expr::col((wl_tbl.clone(), world_bloom::Column::CharacterId)).eq(character_id))
         .order_by((wl_tbl.clone(), world_bloom::Column::Rank), Order::Asc)

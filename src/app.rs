@@ -19,6 +19,7 @@ use crate::api::state::AppState;
 use crate::config::{Config, RedisConfig};
 use crate::db::engine::{DatabaseEngine, EngineError};
 use crate::model::enums::SekaiServerRegion;
+use crate::privacy::UidAnonymizer;
 use crate::sekai_api::client::{BuildError as SekaiClientError, HarukiSekaiAPIClient};
 use crate::tracker::daemon::{DaemonError, HarukiEventTracker};
 use crate::tracker::parser::ParseError;
@@ -37,6 +38,8 @@ pub enum BootstrapError {
     MasterData(#[from] ParseError),
     #[error("scheduler: {0}")]
     Scheduler(#[from] JobSchedulerError),
+    #[error("privacy config: {0}")]
+    Privacy(String),
 }
 
 pub struct AppContext {
@@ -47,6 +50,7 @@ pub struct AppContext {
 }
 
 pub async fn build(cfg: &Config) -> Result<AppContext, BootstrapError> {
+    let anonymizer = build_anonymizer(cfg)?;
     let tracker_enabled = cfg
         .servers
         .values()
@@ -122,6 +126,7 @@ pub async fn build(cfg: &Config) -> Result<AppContext, BootstrapError> {
             redis,
             api_cache_redis.clone(),
             engine.clone(),
+            anonymizer.clone(),
             &server_cfg.master_data_dir,
         )?;
         if let Err(err) = daemon.init().await {
@@ -157,13 +162,26 @@ pub async fn build(cfg: &Config) -> Result<AppContext, BootstrapError> {
         tracing::info!("scheduler started");
     }
 
-    let state = AppState::new(dbs.clone(), api_cache);
+    let state = AppState::new(dbs.clone(), api_cache, anonymizer);
     Ok(AppContext {
         state,
         dbs,
         trackers,
         scheduler,
     })
+}
+
+fn build_anonymizer(cfg: &Config) -> Result<UidAnonymizer, BootstrapError> {
+    let uid = &cfg.privacy.uid_anonymization;
+    if !uid.enabled {
+        return Ok(UidAnonymizer::disabled());
+    }
+    if uid.salt.trim().is_empty() {
+        return Err(BootstrapError::Privacy(
+            "privacy.uid_anonymization.salt is required when enabled".into(),
+        ));
+    }
+    Ok(UidAnonymizer::enabled(uid.salt.clone()))
 }
 
 fn redis_url(cfg: &RedisConfig) -> String {

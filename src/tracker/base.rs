@@ -18,6 +18,7 @@ use thiserror::Error;
 
 use crate::api::cache::{abort_event_update, begin_event_update, finish_event_update};
 use crate::db::engine::DatabaseEngine;
+use crate::db::privacy::ensure_user_unique_ids;
 use crate::db::query::batch::{batch_insert_event_rankings, batch_insert_world_bloom_rankings};
 use crate::db::query::heartbeat::write_heartbeat;
 use crate::db::schema::create_event_tables;
@@ -25,6 +26,7 @@ use crate::model::enums::{SekaiEventType, SekaiServerRegion};
 use crate::model::event::WorldBloomChapterStatus;
 use crate::model::sekai::{BorderRankingResponse, PlayerRankingSchema, Top100RankingResponse};
 use crate::model::tracker::{HandledRankingData, PlayerState, RankState, WorldBloomKey};
+use crate::privacy::UidAnonymizer;
 use crate::sekai_api::client::HarukiSekaiAPIClient;
 use crate::sekai_api::error::SekaiApiError;
 use crate::tracker::cache::detect_cache;
@@ -57,6 +59,7 @@ pub struct EventTrackerBase {
     redis: redis::aio::ConnectionManager,
     api_cache_redis: Option<redis::aio::ConnectionManager>,
     api: HarukiSekaiAPIClient,
+    anonymizer: UidAnonymizer,
     prev_rank_state: HashMap<i64, RankState>,
     prev_world_bloom_state: HashMap<WorldBloomKey, PlayerState>,
 }
@@ -72,6 +75,7 @@ impl EventTrackerBase {
         redis: redis::aio::ConnectionManager,
         api_cache_redis: Option<redis::aio::ConnectionManager>,
         api: HarukiSekaiAPIClient,
+        anonymizer: UidAnonymizer,
         world_bloom_statuses: HashMap<i64, WorldBloomChapterStatus>,
     ) -> Self {
         let is_world_bloom_chapter_ended =
@@ -91,6 +95,7 @@ impl EventTrackerBase {
             redis,
             api_cache_redis,
             api,
+            anonymizer,
             prev_rank_state: HashMap::new(),
             prev_world_bloom_state: HashMap::new(),
         }
@@ -169,6 +174,7 @@ impl EventTrackerBase {
             self.event_type == SekaiEventType::WorldBloom,
         )
         .await?;
+        ensure_user_unique_ids(&self.db, self.server, self.event_id, &self.anonymizer).await?;
         tracing::info!("tracker initialized");
         Ok(())
     }
@@ -234,7 +240,15 @@ impl EventTrackerBase {
         }
 
         if !records.is_empty() {
-            if let Err(err) = batch_insert_event_rankings(&self.db, self.event_id, &records).await {
+            if let Err(err) = batch_insert_event_rankings(
+                &self.db,
+                self.server,
+                self.event_id,
+                &self.anonymizer,
+                &records,
+            )
+            .await
+            {
                 if let Some(conn) = self.api_cache_redis.as_mut()
                     && let Err(redis_err) =
                         abort_event_update(conn, self.server, self.event_id).await
@@ -249,7 +263,9 @@ impl EventTrackerBase {
         if !wl_rows.is_empty() {
             if let Err(err) = batch_insert_world_bloom_rankings(
                 &self.db,
+                self.server,
                 self.event_id,
+                &self.anonymizer,
                 &wl_rows,
                 &mut self.prev_world_bloom_state,
             )

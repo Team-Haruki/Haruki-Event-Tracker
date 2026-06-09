@@ -14,6 +14,7 @@ use std::sync::Arc;
 use crate::db::engine::DatabaseEngine;
 use crate::model::enums::{SekaiEventStatus, SekaiEventType, SekaiServerRegion};
 use crate::model::event::{EventStatus, WorldBloomChapterStatus};
+use crate::privacy::UidAnonymizer;
 use crate::sekai_api::client::HarukiSekaiAPIClient;
 use crate::tracker::base::{EventTrackerBase, TrackerError};
 use crate::tracker::parser::{EventDataParser, ParseError};
@@ -34,6 +35,7 @@ pub struct HarukiEventTracker {
     redis: redis::aio::ConnectionManager,
     api_cache_redis: Option<redis::aio::ConnectionManager>,
     db: Arc<DatabaseEngine>,
+    anonymizer: UidAnonymizer,
     parser: EventDataParser,
     inner: Option<EventTrackerBase>,
 }
@@ -45,6 +47,7 @@ impl HarukiEventTracker {
         redis: redis::aio::ConnectionManager,
         api_cache_redis: Option<redis::aio::ConnectionManager>,
         db: Arc<DatabaseEngine>,
+        anonymizer: UidAnonymizer,
         master_dir: impl AsRef<str>,
     ) -> Result<Self, ParseError> {
         Ok(Self {
@@ -54,6 +57,7 @@ impl HarukiEventTracker {
             redis,
             api_cache_redis,
             db,
+            anonymizer,
             inner: None,
         })
     }
@@ -81,6 +85,7 @@ impl HarukiEventTracker {
             self.redis.clone(),
             self.api_cache_redis.clone(),
             self.api.clone(),
+            self.anonymizer.clone(),
             event.chapter_statuses,
         );
         base.init().await?;

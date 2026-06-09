@@ -11,6 +11,7 @@ use std::sync::Arc;
 use crate::api::cache::ApiCache;
 use crate::db::engine::DatabaseEngine;
 use crate::model::enums::SekaiServerRegion;
+use crate::privacy::UidAnonymizer;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -20,15 +21,21 @@ pub struct AppState {
 struct Inner {
     dbs: HashMap<SekaiServerRegion, Arc<DatabaseEngine>>,
     cache: Option<ApiCache>,
+    anonymizer: UidAnonymizer,
 }
 
 impl AppState {
     pub fn new(
         dbs: HashMap<SekaiServerRegion, Arc<DatabaseEngine>>,
         cache: Option<ApiCache>,
+        anonymizer: UidAnonymizer,
     ) -> Self {
         Self {
-            inner: Arc::new(Inner { dbs, cache }),
+            inner: Arc::new(Inner {
+                dbs,
+                cache,
+                anonymizer,
+            }),
         }
     }
 
@@ -45,5 +52,9 @@ impl AppState {
 
     pub fn cache(&self) -> Option<&ApiCache> {
         self.inner.cache.as_ref()
+    }
+
+    pub fn anonymizer(&self) -> &UidAnonymizer {
+        &self.inner.anonymizer
     }
 }

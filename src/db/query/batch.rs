@@ -17,9 +17,11 @@ use sea_orm::{
 use crate::db::engine::DatabaseEngine;
 use crate::db::entity::{event, event_users, time_id, world_bloom};
 use crate::db::table_name::{TableKind, intern};
+use crate::model::enums::SekaiServerRegion;
 use crate::model::tracker::{
     PlayerEventRankingRecordSchema, PlayerState, PlayerWorldBloomRankingRecordSchema, WorldBloomKey,
 };
+use crate::privacy::UidAnonymizer;
 
 #[derive(FromQueryResult)]
 struct TimeIdRow {
@@ -29,6 +31,7 @@ struct TimeIdRow {
 #[derive(FromQueryResult)]
 struct UserKeyRow {
     user_id_key: i64,
+    unique_id: Option<String>,
     name: String,
     cheerful_team_id: Option<i64>,
 }
@@ -81,6 +84,7 @@ pub(crate) async fn batch_get_or_create_time_ids(
 pub(crate) struct UserDimRow {
     pub name: String,
     pub cheerful_team_id: Option<i64>,
+    pub unique_id: Option<String>,
 }
 
 /// Look up `user_id_key` per `user_id`, inserting a new row when missing.
@@ -93,21 +97,30 @@ pub(crate) async fn batch_get_or_create_user_id_keys(
     users: &HashMap<String, UserDimRow>,
 ) -> Result<HashMap<String, i64>, DbErr> {
     let mut out = HashMap::with_capacity(users.len());
+    let use_unique_ids = users.values().any(|u| u.unique_id.is_some());
     for (user_id, info) in users {
-        let sel = Query::select()
-            .expr_as(
-                Expr::col(event_users::Column::UserIdKey),
-                Alias::new("user_id_key"),
-            )
-            .expr_as(Expr::col(event_users::Column::Name), Alias::new("name"))
-            .expr_as(
-                Expr::col(event_users::Column::CheerfulTeamId),
-                Alias::new("cheerful_team_id"),
-            )
-            .from(Alias::new(table_name))
-            .and_where(Expr::col(event_users::Column::UserId).eq(user_id.as_str()))
-            .limit(1)
-            .to_owned();
+        let mut sel = Query::select();
+        sel.expr_as(
+            Expr::col(event_users::Column::UserIdKey),
+            Alias::new("user_id_key"),
+        )
+        .expr_as(Expr::col(event_users::Column::Name), Alias::new("name"));
+        if use_unique_ids {
+            sel.expr_as(
+                Expr::col(event_users::Column::UniqueId),
+                Alias::new("unique_id"),
+            );
+        } else {
+            sel.expr_as(Expr::val(Option::<String>::None), Alias::new("unique_id"));
+        }
+        sel.expr_as(
+            Expr::col(event_users::Column::CheerfulTeamId),
+            Alias::new("cheerful_team_id"),
+        )
+        .from(Alias::new(table_name))
+        .and_where(Expr::col(event_users::Column::UserId).eq(user_id.as_str()))
+        .limit(1);
+        let sel = sel.to_owned();
 
         if let Some(row) = UserKeyRow::find_by_statement(backend.build(&sel))
             .one(tx)
@@ -129,13 +142,35 @@ pub(crate) async fn batch_get_or_create_user_id_keys(
                 }
                 tx.execute(&upd).await?;
             }
+            if use_unique_ids && row.unique_id != info.unique_id {
+                let upd = Query::update()
+                    .table(Alias::new(table_name))
+                    .value(event_users::Column::UniqueId, info.unique_id.clone())
+                    .and_where(Expr::col(event_users::Column::UserIdKey).eq(row.user_id_key))
+                    .to_owned();
+                tx.execute(&upd).await?;
+            }
             out.insert(user_id.clone(), row.user_id_key);
             continue;
         }
 
-        let ins = Query::insert()
-            .into_table(Alias::new(table_name))
-            .columns([
+        let mut ins = Query::insert();
+        ins.into_table(Alias::new(table_name));
+        if use_unique_ids {
+            ins.columns([
+                event_users::Column::UserId,
+                event_users::Column::UniqueId,
+                event_users::Column::Name,
+                event_users::Column::CheerfulTeamId,
+            ])
+            .values_panic([
+                user_id.as_str().into(),
+                info.unique_id.clone().into(),
+                info.name.clone().into(),
+                info.cheerful_team_id.into(),
+            ]);
+        } else {
+            ins.columns([
                 event_users::Column::UserId,
                 event_users::Column::Name,
                 event_users::Column::CheerfulTeamId,
@@ -144,8 +179,9 @@ pub(crate) async fn batch_get_or_create_user_id_keys(
                 user_id.as_str().into(),
                 info.name.clone().into(),
                 info.cheerful_team_id.into(),
-            ])
-            .to_owned();
+            ]);
+        }
+        let ins = ins.to_owned();
         tx.execute(&ins).await?;
 
         let row = UserKeyRow::find_by_statement(backend.build(&sel))
@@ -179,7 +215,12 @@ struct OwnedWlRecord {
     rank: i64,
 }
 
-fn collect_dims<'a, I>(records: I) -> (HashSet<i64>, HashMap<String, UserDimRow>)
+fn collect_dims<'a, I>(
+    server: SekaiServerRegion,
+    event_id: i64,
+    anonymizer: &UidAnonymizer,
+    records: I,
+) -> (HashSet<i64>, HashMap<String, UserDimRow>)
 where
     I: Iterator<Item = (i64, &'a str, &'a str, Option<i64>)>,
 {
@@ -190,6 +231,9 @@ where
         users.entry(user_id.to_string()).or_insert(UserDimRow {
             name: name.to_string(),
             cheerful_team_id,
+            unique_id: anonymizer
+                .is_enabled()
+                .then(|| anonymizer.public_user_id(server, event_id, user_id)),
         });
     }
     (timestamps, users)
@@ -198,7 +242,9 @@ where
 #[tracing::instrument(skip(engine, records), fields(event_id, n = records.len()))]
 pub async fn batch_insert_event_rankings(
     engine: &DatabaseEngine,
+    server: SekaiServerRegion,
     event_id: i64,
+    anonymizer: &UidAnonymizer,
     records: &[PlayerEventRankingRecordSchema],
 ) -> Result<(), DbErr> {
     if records.is_empty() {
@@ -209,14 +255,19 @@ pub async fn batch_insert_event_rankings(
     let users_tbl = intern(TableKind::EventUsers, event_id);
     let event_tbl = intern(TableKind::Event, event_id);
 
-    let (timestamps, users) = collect_dims(records.iter().map(|r| {
-        (
-            r.timestamp,
-            r.user_id.as_str(),
-            r.name.as_str(),
-            r.cheerful_team_id,
-        )
-    }));
+    let (timestamps, users) = collect_dims(
+        server,
+        event_id,
+        anonymizer,
+        records.iter().map(|r| {
+            (
+                r.timestamp,
+                r.user_id.as_str(),
+                r.name.as_str(),
+                r.cheerful_team_id,
+            )
+        }),
+    );
     let owned: Vec<OwnedRecord> = records
         .iter()
         .map(|r| OwnedRecord {
@@ -273,7 +324,9 @@ pub async fn batch_insert_event_rankings(
 #[tracing::instrument(skip(engine, records, prev_state), fields(event_id, n = records.len()))]
 pub async fn batch_insert_world_bloom_rankings(
     engine: &DatabaseEngine,
+    server: SekaiServerRegion,
     event_id: i64,
+    anonymizer: &UidAnonymizer,
     records: &[PlayerWorldBloomRankingRecordSchema],
     prev_state: &mut HashMap<WorldBloomKey, PlayerState>,
 ) -> Result<(), DbErr> {
@@ -285,14 +338,19 @@ pub async fn batch_insert_world_bloom_rankings(
     let users_tbl = intern(TableKind::EventUsers, event_id);
     let wl_tbl = intern(TableKind::WorldBloom, event_id);
 
-    let (timestamps, users) = collect_dims(records.iter().map(|r| {
-        (
-            r.base.timestamp,
-            r.base.user_id.as_str(),
-            r.base.name.as_str(),
-            r.base.cheerful_team_id,
-        )
-    }));
+    let (timestamps, users) = collect_dims(
+        server,
+        event_id,
+        anonymizer,
+        records.iter().map(|r| {
+            (
+                r.base.timestamp,
+                r.base.user_id.as_str(),
+                r.base.name.as_str(),
+                r.base.cheerful_team_id,
+            )
+        }),
+    );
     let owned: Vec<OwnedWlRecord> = records
         .iter()
         .map(|r| OwnedWlRecord {

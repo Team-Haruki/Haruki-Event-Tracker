@@ -10,12 +10,13 @@ use sea_orm::{DbErr, ExprTrait, FromQueryResult};
 
 use crate::db::engine::DatabaseEngine;
 use crate::db::entity::{event, event_users, time_id};
+use crate::db::query::user::PublicUserIdMode;
 use crate::db::table_name::{TableKind, intern};
 use crate::model::api::RecordedRankingSchema;
 
 /// Build the shared `SELECT t.timestamp, u.user_id, e.score, e.rank FROM event_<id> e
 /// INNER JOIN event_<id>_time_id t ... INNER JOIN event_<id>_users u ...` query.
-fn ranking_select(event_id: i64) -> SelectStatement {
+fn ranking_select(event_id: i64, mode: PublicUserIdMode) -> SelectStatement {
     let event_tbl = Alias::new(intern(TableKind::Event, event_id));
     let time_tbl = Alias::new(intern(TableKind::TimeId, event_id));
     let users_tbl = Alias::new(intern(TableKind::EventUsers, event_id));
@@ -26,7 +27,7 @@ fn ranking_select(event_id: i64) -> SelectStatement {
             Alias::new("timestamp"),
         )
         .expr_as(
-            Expr::col((users_tbl.clone(), event_users::Column::UserId)),
+            Expr::col((users_tbl.clone(), mode.output_column())),
             Alias::new("user_id"),
         )
         .expr_as(
@@ -56,11 +57,12 @@ pub async fn fetch_latest_ranking(
     engine: &DatabaseEngine,
     event_id: i64,
     user_id: &str,
+    mode: PublicUserIdMode,
 ) -> Result<Option<RecordedRankingSchema>, DbErr> {
     let users_tbl = Alias::new(intern(TableKind::EventUsers, event_id));
     let time_tbl = Alias::new(intern(TableKind::TimeId, event_id));
-    let stmt = ranking_select(event_id)
-        .and_where(Expr::col((users_tbl, event_users::Column::UserId)).eq(user_id))
+    let stmt = ranking_select(event_id, mode)
+        .and_where(Expr::col((users_tbl, mode.output_column())).eq(user_id))
         .order_by((time_tbl, time_id::Column::Timestamp), Order::Desc)
         .limit(1)
         .to_owned();
@@ -76,11 +78,12 @@ pub async fn fetch_all_rankings(
     engine: &DatabaseEngine,
     event_id: i64,
     user_id: &str,
+    mode: PublicUserIdMode,
 ) -> Result<Vec<RecordedRankingSchema>, DbErr> {
     let users_tbl = Alias::new(intern(TableKind::EventUsers, event_id));
     let time_tbl = Alias::new(intern(TableKind::TimeId, event_id));
-    let stmt = ranking_select(event_id)
-        .and_where(Expr::col((users_tbl, event_users::Column::UserId)).eq(user_id))
+    let stmt = ranking_select(event_id, mode)
+        .and_where(Expr::col((users_tbl, mode.output_column())).eq(user_id))
         .order_by((time_tbl, time_id::Column::Timestamp), Order::Asc)
         .to_owned();
 
@@ -95,10 +98,11 @@ pub async fn fetch_latest_ranking_by_rank(
     engine: &DatabaseEngine,
     event_id: i64,
     rank: i64,
+    mode: PublicUserIdMode,
 ) -> Result<Option<RecordedRankingSchema>, DbErr> {
     let event_tbl = Alias::new(intern(TableKind::Event, event_id));
     let time_tbl = Alias::new(intern(TableKind::TimeId, event_id));
-    let stmt = ranking_select(event_id)
+    let stmt = ranking_select(event_id, mode)
         .and_where(Expr::col((event_tbl.clone(), event::Column::Rank)).eq(rank))
         .order_by((time_tbl, time_id::Column::Timestamp), Order::Desc)
         .limit(1)
@@ -115,10 +119,11 @@ pub async fn fetch_all_rankings_by_rank(
     engine: &DatabaseEngine,
     event_id: i64,
     rank: i64,
+    mode: PublicUserIdMode,
 ) -> Result<Vec<RecordedRankingSchema>, DbErr> {
     let event_tbl = Alias::new(intern(TableKind::Event, event_id));
     let time_tbl = Alias::new(intern(TableKind::TimeId, event_id));
-    let stmt = ranking_select(event_id)
+    let stmt = ranking_select(event_id, mode)
         .and_where(Expr::col((event_tbl.clone(), event::Column::Rank)).eq(rank))
         .order_by((time_tbl, time_id::Column::Timestamp), Order::Asc)
         .to_owned();
@@ -134,6 +139,7 @@ pub async fn fetch_all_rankings_by_ranks(
     engine: &DatabaseEngine,
     event_id: i64,
     ranks: &[i64],
+    mode: PublicUserIdMode,
 ) -> Result<Vec<RecordedRankingSchema>, DbErr> {
     if ranks.is_empty() {
         return Ok(Vec::new());
@@ -141,7 +147,7 @@ pub async fn fetch_all_rankings_by_ranks(
 
     let event_tbl = Alias::new(intern(TableKind::Event, event_id));
     let time_tbl = Alias::new(intern(TableKind::TimeId, event_id));
-    let stmt = ranking_select(event_id)
+    let stmt = ranking_select(event_id, mode)
         .and_where(Expr::col((event_tbl.clone(), event::Column::Rank)).is_in(ranks.to_vec()))
         .order_by((event_tbl.clone(), event::Column::Rank), Order::Asc)
         .order_by((time_tbl, time_id::Column::Timestamp), Order::Asc)

@@ -7,17 +7,42 @@ use std::sync::Arc;
 use crate::api::error::ApiError;
 use crate::api::state::AppState;
 use crate::db::engine::DatabaseEngine;
+use crate::db::privacy::ensure_user_unique_ids;
+use crate::db::query::user::PublicUserIdMode;
 use crate::model::enums::SekaiServerRegion;
 
 const MAX_BATCH_RANKS: usize = 100;
 
 pub fn resolve_engine(state: &AppState, server: &str) -> Result<Arc<DatabaseEngine>, ApiError> {
+    let (_, engine) = resolve_region_engine(state, server)?;
+    Ok(engine)
+}
+
+pub fn resolve_region_engine(
+    state: &AppState,
+    server: &str,
+) -> Result<(SekaiServerRegion, Arc<DatabaseEngine>), ApiError> {
     let region = SekaiServerRegion::parse(server)
         .ok_or_else(|| ApiError::InvalidServer(server.to_owned()))?;
     state
         .db(region)
         .cloned()
+        .map(|engine| (region, engine))
         .ok_or_else(|| ApiError::InvalidServer(server.to_owned()))
+}
+
+pub async fn prepare_user_id_mode(
+    state: &AppState,
+    engine: &DatabaseEngine,
+    server: SekaiServerRegion,
+    event_id: i64,
+) -> Result<PublicUserIdMode, ApiError> {
+    if state.anonymizer().is_enabled() {
+        ensure_user_unique_ids(engine, server, event_id, state.anonymizer()).await?;
+        Ok(PublicUserIdMode::Unique)
+    } else {
+        Ok(PublicUserIdMode::Raw)
+    }
 }
 
 pub fn parse_rank_query(raw: Option<&str>) -> Result<Vec<i64>, ApiError> {

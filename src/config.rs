@@ -65,6 +65,19 @@ pub struct SekaiApiConfig {
 
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
+pub struct UidAnonymizationConfig {
+    pub enabled: bool,
+    pub salt: String,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct PrivacyConfig {
+    pub uid_anonymization: UidAnonymizationConfig,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
 pub struct BackendConfig {
     pub host: String,
     pub port: u16,
@@ -97,6 +110,7 @@ pub struct ServerConfig {
 pub struct Config {
     pub redis: RedisConfig,
     pub api_cache: ApiCacheConfig,
+    pub privacy: PrivacyConfig,
     pub backend: BackendConfig,
     pub servers: HashMap<SekaiServerRegion, ServerConfig>,
     #[serde(rename = "sekai_api")]
