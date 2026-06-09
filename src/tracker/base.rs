@@ -18,14 +18,18 @@ use thiserror::Error;
 
 use crate::api::cache::{abort_event_update, begin_event_update, finish_event_update};
 use crate::db::engine::DatabaseEngine;
-use crate::db::privacy::ensure_user_unique_ids;
-use crate::db::query::batch::{batch_insert_event_rankings, batch_insert_world_bloom_rankings};
+use crate::db::privacy::ensure_user_table_extensions;
+use crate::db::query::batch::{
+    batch_insert_event_rankings, batch_insert_world_bloom_rankings, batch_upsert_event_users,
+};
 use crate::db::query::heartbeat::write_heartbeat;
 use crate::db::schema::create_event_tables;
 use crate::model::enums::{SekaiEventType, SekaiServerRegion};
 use crate::model::event::WorldBloomChapterStatus;
 use crate::model::sekai::{BorderRankingResponse, PlayerRankingSchema, Top100RankingResponse};
-use crate::model::tracker::{HandledRankingData, PlayerState, RankState, WorldBloomKey};
+use crate::model::tracker::{
+    HandledRankingData, PlayerEventRankingRecordSchema, PlayerState, RankState, WorldBloomKey,
+};
 use crate::privacy::UidAnonymizer;
 use crate::sekai_api::client::HarukiSekaiAPIClient;
 use crate::sekai_api::error::SekaiApiError;
@@ -60,6 +64,8 @@ pub struct EventTrackerBase {
     api_cache_redis: Option<redis::aio::ConnectionManager>,
     api: HarukiSekaiAPIClient,
     anonymizer: UidAnonymizer,
+    post_end_user_refresh_interval_secs: u64,
+    last_post_end_user_refresh_at: Option<i64>,
     prev_rank_state: HashMap<i64, RankState>,
     prev_world_bloom_state: HashMap<WorldBloomKey, PlayerState>,
 }
@@ -76,6 +82,7 @@ impl EventTrackerBase {
         api_cache_redis: Option<redis::aio::ConnectionManager>,
         api: HarukiSekaiAPIClient,
         anonymizer: UidAnonymizer,
+        post_end_user_refresh_interval_secs: u64,
         world_bloom_statuses: HashMap<i64, WorldBloomChapterStatus>,
     ) -> Self {
         let is_world_bloom_chapter_ended =
@@ -96,6 +103,8 @@ impl EventTrackerBase {
             api_cache_redis,
             api,
             anonymizer,
+            post_end_user_refresh_interval_secs,
+            last_post_end_user_refresh_at: None,
             prev_rank_state: HashMap::new(),
             prev_world_bloom_state: HashMap::new(),
         }
@@ -174,7 +183,8 @@ impl EventTrackerBase {
             self.event_type == SekaiEventType::WorldBloom,
         )
         .await?;
-        ensure_user_unique_ids(&self.db, self.server, self.event_id, &self.anonymizer).await?;
+        ensure_user_table_extensions(&self.db, self.server, self.event_id, &self.anonymizer)
+            .await?;
         tracing::info!("tracker initialized");
         Ok(())
     }
@@ -190,6 +200,62 @@ impl EventTrackerBase {
         {
             tracing::warn!(%err, "failed to write ended flag");
         }
+    }
+
+    #[tracing::instrument(skip(self), fields(server = %self.server, event_id = self.event_id))]
+    pub async fn refresh_user_profiles_after_end(&mut self) -> Result<(), TrackerError> {
+        let now = Utc::now().timestamp();
+        if !self.should_refresh_user_profiles_after_end(now) {
+            tracing::debug!("post-end user refresh interval not reached");
+            return Ok(());
+        }
+
+        tracing::info!("refreshing post-end user profiles");
+        let data = self.handle_ranking_data().await?;
+        let records = collect_visible_user_records(data.record_time, &data);
+        if records.is_empty() {
+            self.last_post_end_user_refresh_at = Some(now);
+            return Ok(());
+        }
+
+        if let Some(conn) = self.api_cache_redis.as_mut()
+            && let Err(err) = begin_event_update(conn, self.server, self.event_id).await
+        {
+            tracing::warn!(%err, "failed to mark API cache dirty");
+        }
+
+        if let Err(err) = batch_upsert_event_users(
+            &self.db,
+            self.server,
+            self.event_id,
+            &self.anonymizer,
+            &records,
+        )
+        .await
+        {
+            if let Some(conn) = self.api_cache_redis.as_mut()
+                && let Err(redis_err) = abort_event_update(conn, self.server, self.event_id).await
+            {
+                tracing::warn!(%redis_err, "failed to clear API cache dirty after user refresh error");
+            }
+            return Err(err.into());
+        }
+
+        if let Some(conn) = self.api_cache_redis.as_mut()
+            && let Err(err) = finish_event_update(conn, self.server, self.event_id).await
+        {
+            tracing::warn!(%err, "failed to bump API cache epoch after user refresh");
+        }
+        self.last_post_end_user_refresh_at = Some(now);
+        Ok(())
+    }
+
+    fn should_refresh_user_profiles_after_end(&self, now: i64) -> bool {
+        should_refresh_after_end(
+            self.last_post_end_user_refresh_at,
+            now,
+            self.post_end_user_refresh_interval_secs,
+        )
     }
 
     /// One tracker tick. Fetches upstream, diffs, persists, writes
@@ -347,5 +413,42 @@ impl EventTrackerBase {
             rankings,
             world_bloom_rankings,
         })
+    }
+}
+
+fn collect_visible_user_records(
+    record_time: i64,
+    data: &HandledRankingData,
+) -> Vec<PlayerEventRankingRecordSchema> {
+    let refs: Vec<&PlayerRankingSchema> = data.rankings.iter().collect();
+    let mut out = build_event_records(record_time, &refs);
+    out.extend(
+        build_world_bloom_rows(record_time, &data.world_bloom_rankings)
+            .into_iter()
+            .map(|row| row.base),
+    );
+    out
+}
+
+fn should_refresh_after_end(last: Option<i64>, now: i64, interval_secs: u64) -> bool {
+    if interval_secs == 0 {
+        return true;
+    }
+    let Ok(interval) = i64::try_from(interval_secs) else {
+        return false;
+    };
+    last.is_none_or(|last| now.saturating_sub(last) >= interval)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_refresh_after_end;
+
+    #[test]
+    fn post_end_refresh_gate_respects_interval() {
+        assert!(should_refresh_after_end(None, 100, 3600));
+        assert!(!should_refresh_after_end(Some(100), 200, 3600));
+        assert!(should_refresh_after_end(Some(100), 3700, 3600));
+        assert!(should_refresh_after_end(Some(100), 101, 0));
     }
 }

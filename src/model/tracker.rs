@@ -1,7 +1,15 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-use super::sekai::PlayerRankingSchema;
+use super::sekai::{PlayerRankingSchema, UserCard, UserPlayerFrame, UserProfileHonor};
+
+#[derive(Debug, Clone, Default)]
+pub struct PlayerProfileSchema {
+    pub card: Option<UserCard>,
+    pub profile_word: Option<String>,
+    pub profile_honors: Vec<UserProfileHonor>,
+    pub player_frames: Vec<UserPlayerFrame>,
+}
 
 #[derive(Debug, Clone)]
 pub struct PlayerEventRankingRecordSchema {
@@ -11,6 +19,7 @@ pub struct PlayerEventRankingRecordSchema {
     pub score: i64,
     pub rank: i64,
     pub cheerful_team_id: Option<i64>,
+    pub profile: PlayerProfileSchema,
 }
 
 #[derive(Debug, Clone)]

@@ -1,6 +1,8 @@
 use sea_orm::FromQueryResult;
 use serde::{Deserialize, Serialize};
 
+use crate::model::sekai::{UserPlayerFrame, UserProfileHonor};
+
 #[derive(Debug, Clone, Serialize, Deserialize, FromQueryResult)]
 #[serde(rename_all = "camelCase")]
 pub struct RecordedRankingSchema {
@@ -32,13 +34,29 @@ pub enum RecordedRankData {
     WorldBloom(RecordedWorldBloomRankingSchema),
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, FromQueryResult)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RecordedUserNameSchema {
     pub user_id: String,
     pub name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cheerful_team_id: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub card_id: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub card_level: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub card_master_rank: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub card_special_training_status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub card_default_image: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub profile_word: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub profile_honors: Vec<UserProfileHonor>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub user_player_frames: Vec<UserPlayerFrame>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

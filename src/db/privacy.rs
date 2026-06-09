@@ -20,14 +20,41 @@ pub async fn ensure_user_unique_ids(
     event_id: i64,
     anonymizer: &UidAnonymizer,
 ) -> Result<(), DbErr> {
+    ensure_user_table_extensions(engine, server, event_id, anonymizer).await
+}
+
+pub async fn ensure_user_table_extensions(
+    engine: &DatabaseEngine,
+    server: SekaiServerRegion,
+    event_id: i64,
+    anonymizer: &UidAnonymizer,
+) -> Result<(), DbErr> {
+    let table = intern(TableKind::EventUsers, event_id);
+    ensure_profile_columns(engine, table).await?;
+
     if !anonymizer.is_enabled() {
         return Ok(());
     }
 
-    let table = intern(TableKind::EventUsers, event_id);
     ensure_unique_id_column(engine, table).await?;
     backfill_unique_ids(engine, server, event_id, table, anonymizer).await?;
     ensure_unique_id_index(engine, event_id, table).await?;
+    Ok(())
+}
+
+async fn ensure_profile_columns(engine: &DatabaseEngine, table: &'static str) -> Result<(), DbErr> {
+    for (column, ty) in [
+        ("card_id", "BIGINT"),
+        ("card_level", "BIGINT"),
+        ("card_master_rank", "BIGINT"),
+        ("card_special_training_status", "VARCHAR(64)"),
+        ("card_default_image", "VARCHAR(64)"),
+        ("profile_word", "VARCHAR(300)"),
+        ("profile_honors_json", "TEXT"),
+        ("player_frames_json", "TEXT"),
+    ] {
+        ensure_column(engine, table, column, ty).await?;
+    }
     Ok(())
 }
 
@@ -35,13 +62,23 @@ async fn ensure_unique_id_column(
     engine: &DatabaseEngine,
     table: &'static str,
 ) -> Result<(), DbErr> {
+    ensure_column(engine, table, "unique_id", "VARCHAR(64)").await
+}
+
+async fn ensure_column(
+    engine: &DatabaseEngine,
+    table: &'static str,
+    column: &str,
+    ty: &str,
+) -> Result<(), DbErr> {
     let backend = engine.backend();
     let stmt = Statement::from_string(
         backend,
         format!(
-            "ALTER TABLE {} ADD COLUMN {} VARCHAR(64)",
+            "ALTER TABLE {} ADD COLUMN {} {}",
             quote_ident(backend, table),
-            quote_ident(backend, "unique_id")
+            quote_ident(backend, column),
+            ty
         ),
     );
 

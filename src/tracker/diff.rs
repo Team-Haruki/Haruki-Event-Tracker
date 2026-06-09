@@ -22,7 +22,8 @@ use crate::model::sekai::{
     PlayerRankingSchema, UserWorldBloomChapterRanking, UserWorldBloomChapterRankingBorder,
 };
 use crate::model::tracker::{
-    PlayerEventRankingRecordSchema, PlayerWorldBloomRankingRecordSchema, RankState,
+    PlayerEventRankingRecordSchema, PlayerProfileSchema, PlayerWorldBloomRankingRecordSchema,
+    RankState,
 };
 
 /// Pull `cheerful_carnival_team_id` out of a player ranking, if present.
@@ -30,6 +31,15 @@ pub fn extract_cheerful_team_id(r: &PlayerRankingSchema) -> Option<i64> {
     r.user_cheerful_carnival
         .as_ref()
         .and_then(|c| c.cheerful_carnival_team_id)
+}
+
+pub fn extract_player_profile(r: &PlayerRankingSchema) -> PlayerProfileSchema {
+    PlayerProfileSchema {
+        card: r.user_card.clone(),
+        profile_word: r.user_profile.as_ref().and_then(|p| p.word.clone()),
+        profile_honors: r.user_profile_honors.clone(),
+        player_frames: r.user_player_frames.clone(),
+    }
 }
 
 /// Indices into `rankings` whose `(user_id, score)` differ from
@@ -198,6 +208,7 @@ pub fn build_event_records(
                 score,
                 rank,
                 cheerful_team_id: extract_cheerful_team_id(r),
+                profile: extract_player_profile(r),
             });
     }
     seen.into_values().collect()
@@ -224,6 +235,7 @@ pub fn build_world_bloom_rows(
                     score,
                     rank,
                     cheerful_team_id: extract_cheerful_team_id(r),
+                    profile: extract_player_profile(r),
                 },
                 character_id,
             });
@@ -239,11 +251,17 @@ mod tests {
 
     fn ranking(rank: i64, user_id: i64, score: i64, name: &str) -> PlayerRankingSchema {
         PlayerRankingSchema {
+            is_own: None,
             name: Some(name.to_string()),
             rank: Some(rank),
             score: Some(score),
             user_id: Some(user_id),
+            user_card: None,
+            user_profile: None,
+            user_profile_honors: Vec::new(),
             user_cheerful_carnival: None,
+            user_honor_missions: Vec::new(),
+            user_player_frames: Vec::new(),
         }
     }
 
@@ -296,11 +314,17 @@ mod tests {
     #[test]
     fn diff_skips_rows_with_missing_fields() {
         let rows = vec![PlayerRankingSchema {
+            is_own: None,
             name: Some("a".into()),
             rank: None,
             score: Some(1),
             user_id: Some(1),
+            user_card: None,
+            user_profile: None,
+            user_profile_honors: Vec::new(),
             user_cheerful_carnival: None,
+            user_honor_missions: Vec::new(),
+            user_player_frames: Vec::new(),
         }];
         let mut state = HashMap::new();
         let (changed, deltas) = diff_rank_based(&rows, &mut state);
@@ -324,11 +348,17 @@ mod tests {
     fn merge_drops_border_rows_with_no_rank() {
         let top = vec![ranking(1, 100, 1000, "a")];
         let border = vec![PlayerRankingSchema {
+            is_own: None,
             name: Some("x".into()),
             rank: None,
             score: Some(0),
             user_id: Some(2),
+            user_card: None,
+            user_profile: None,
+            user_profile_honors: Vec::new(),
             user_cheerful_carnival: None,
+            user_honor_missions: Vec::new(),
+            user_player_frames: Vec::new(),
         }];
         let merged = merge_rankings(top, border);
         assert_eq!(merged.len(), 1);
@@ -340,6 +370,9 @@ mod tests {
         assert_eq!(extract_cheerful_team_id(&r), None);
         r.user_cheerful_carnival = Some(UserCheerfulCarnival {
             cheerful_carnival_team_id: Some(7),
+            event_id: None,
+            register_at: None,
+            team_change_count: None,
         });
         assert_eq!(extract_cheerful_team_id(&r), Some(7));
     }

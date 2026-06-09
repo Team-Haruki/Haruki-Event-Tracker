@@ -36,11 +36,13 @@ pub struct HarukiEventTracker {
     api_cache_redis: Option<redis::aio::ConnectionManager>,
     db: Arc<DatabaseEngine>,
     anonymizer: UidAnonymizer,
+    post_end_user_refresh_interval_secs: u64,
     parser: EventDataParser,
     inner: Option<EventTrackerBase>,
 }
 
 impl HarukiEventTracker {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         server: SekaiServerRegion,
         api: HarukiSekaiAPIClient,
@@ -48,6 +50,7 @@ impl HarukiEventTracker {
         api_cache_redis: Option<redis::aio::ConnectionManager>,
         db: Arc<DatabaseEngine>,
         anonymizer: UidAnonymizer,
+        post_end_user_refresh_interval_secs: u64,
         master_dir: impl AsRef<str>,
     ) -> Result<Self, ParseError> {
         Ok(Self {
@@ -58,6 +61,7 @@ impl HarukiEventTracker {
             api_cache_redis,
             db,
             anonymizer,
+            post_end_user_refresh_interval_secs,
             inner: None,
         })
     }
@@ -86,6 +90,7 @@ impl HarukiEventTracker {
             self.api_cache_redis.clone(),
             self.api.clone(),
             self.anonymizer.clone(),
+            self.post_end_user_refresh_interval_secs,
             event.chapter_statuses,
         );
         base.init().await?;
@@ -149,7 +154,13 @@ impl HarukiEventTracker {
             return false;
         };
         if base.is_event_ended() {
-            tracing::info!(event_id = event.event_id, "event already ended, skipping");
+            if let Err(err) = base.refresh_user_profiles_after_end().await {
+                tracing::error!(
+                    %err,
+                    event_id = event.event_id,
+                    "post-end user profile refresh failed"
+                );
+            }
             return true;
         }
         if event.event_status == SekaiEventStatus::Aggregating {

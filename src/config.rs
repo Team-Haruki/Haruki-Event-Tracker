@@ -12,12 +12,24 @@ pub const DEFAULT_CONFIG_FILE: &str = "haruki-tracker-configs.yaml";
 pub const CONFIG_URI_ENV: &str = "HARUKI_CONFIG_URI";
 pub const LEGACY_CONFIG_ENV: &str = "HARUKI_CONFIG";
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct TrackerConfig {
     pub enabled: bool,
     pub use_second_level_cron: bool,
     pub cron: String,
+    pub post_end_user_refresh_interval_secs: u64,
+}
+
+impl Default for TrackerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            use_second_level_cron: false,
+            cron: String::new(),
+            post_end_user_refresh_interval_secs: 3600,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]

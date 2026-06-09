@@ -7,7 +7,7 @@ use std::sync::Arc;
 use crate::api::error::ApiError;
 use crate::api::state::AppState;
 use crate::db::engine::DatabaseEngine;
-use crate::db::privacy::ensure_user_unique_ids;
+use crate::db::privacy::ensure_user_table_extensions;
 use crate::db::query::user::PublicUserIdMode;
 use crate::model::enums::SekaiServerRegion;
 
@@ -37,8 +37,8 @@ pub async fn prepare_user_id_mode(
     server: SekaiServerRegion,
     event_id: i64,
 ) -> Result<PublicUserIdMode, ApiError> {
+    ensure_user_table_extensions(engine, server, event_id, state.anonymizer()).await?;
     if state.anonymizer().is_enabled() {
-        ensure_user_unique_ids(engine, server, event_id, state.anonymizer()).await?;
         Ok(PublicUserIdMode::Unique)
     } else {
         Ok(PublicUserIdMode::Raw)

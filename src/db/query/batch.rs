@@ -34,6 +34,14 @@ struct UserKeyRow {
     unique_id: Option<String>,
     name: String,
     cheerful_team_id: Option<i64>,
+    card_id: Option<i64>,
+    card_level: Option<i64>,
+    card_master_rank: Option<i64>,
+    card_special_training_status: Option<String>,
+    card_default_image: Option<String>,
+    profile_word: Option<String>,
+    profile_honors_json: Option<String>,
+    player_frames_json: Option<String>,
 }
 
 /// Look up `time_id` per timestamp, inserting a new row with `status` when
@@ -85,6 +93,51 @@ pub(crate) struct UserDimRow {
     pub name: String,
     pub cheerful_team_id: Option<i64>,
     pub unique_id: Option<String>,
+    pub card_id: Option<i64>,
+    pub card_level: Option<i64>,
+    pub card_master_rank: Option<i64>,
+    pub card_special_training_status: Option<String>,
+    pub card_default_image: Option<String>,
+    pub profile_word: Option<String>,
+    pub profile_honors_json: Option<String>,
+    pub player_frames_json: Option<String>,
+}
+
+impl UserDimRow {
+    fn from_record(
+        server: SekaiServerRegion,
+        event_id: i64,
+        anonymizer: &UidAnonymizer,
+        r: &PlayerEventRankingRecordSchema,
+    ) -> Self {
+        let card = r.profile.card.as_ref();
+        Self {
+            name: r.name.clone(),
+            cheerful_team_id: r.cheerful_team_id,
+            unique_id: anonymizer
+                .is_enabled()
+                .then(|| anonymizer.public_user_id(server, event_id, &r.user_id)),
+            card_id: card.and_then(|c| c.card_id),
+            card_level: card.and_then(|c| c.level),
+            card_master_rank: card.and_then(|c| c.master_rank),
+            card_special_training_status: card.and_then(|c| c.special_training_status.clone()),
+            card_default_image: card.and_then(|c| c.default_image.clone()),
+            profile_word: r.profile.profile_word.clone(),
+            profile_honors_json: json_array_or_none(&r.profile.profile_honors),
+            player_frames_json: json_array_or_none(&r.profile.player_frames),
+        }
+    }
+}
+
+fn json_array_or_none<T>(values: &[T]) -> Option<String>
+where
+    T: serde::Serialize,
+{
+    if values.is_empty() {
+        None
+    } else {
+        sonic_rs::to_string(values).ok()
+    }
 }
 
 /// Look up `user_id_key` per `user_id`, inserting a new row when missing.
@@ -116,6 +169,38 @@ pub(crate) async fn batch_get_or_create_user_id_keys(
         sel.expr_as(
             Expr::col(event_users::Column::CheerfulTeamId),
             Alias::new("cheerful_team_id"),
+        )
+        .expr_as(
+            Expr::col(event_users::Column::CardId),
+            Alias::new("card_id"),
+        )
+        .expr_as(
+            Expr::col(event_users::Column::CardLevel),
+            Alias::new("card_level"),
+        )
+        .expr_as(
+            Expr::col(event_users::Column::CardMasterRank),
+            Alias::new("card_master_rank"),
+        )
+        .expr_as(
+            Expr::col(event_users::Column::CardSpecialTrainingStatus),
+            Alias::new("card_special_training_status"),
+        )
+        .expr_as(
+            Expr::col(event_users::Column::CardDefaultImage),
+            Alias::new("card_default_image"),
+        )
+        .expr_as(
+            Expr::col(event_users::Column::ProfileWord),
+            Alias::new("profile_word"),
+        )
+        .expr_as(
+            Expr::col(event_users::Column::ProfileHonorsJson),
+            Alias::new("profile_honors_json"),
+        )
+        .expr_as(
+            Expr::col(event_users::Column::PlayerFramesJson),
+            Alias::new("player_frames_json"),
         )
         .from(Alias::new(table_name))
         .and_where(Expr::col(event_users::Column::UserId).eq(user_id.as_str()))
@@ -150,6 +235,41 @@ pub(crate) async fn batch_get_or_create_user_id_keys(
                     .to_owned();
                 tx.execute(&upd).await?;
             }
+            if row.card_id != info.card_id
+                || row.card_level != info.card_level
+                || row.card_master_rank != info.card_master_rank
+                || row.card_special_training_status != info.card_special_training_status
+                || row.card_default_image != info.card_default_image
+                || row.profile_word != info.profile_word
+                || row.profile_honors_json != info.profile_honors_json
+                || row.player_frames_json != info.player_frames_json
+            {
+                let upd = Query::update()
+                    .table(Alias::new(table_name))
+                    .value(event_users::Column::CardId, info.card_id)
+                    .value(event_users::Column::CardLevel, info.card_level)
+                    .value(event_users::Column::CardMasterRank, info.card_master_rank)
+                    .value(
+                        event_users::Column::CardSpecialTrainingStatus,
+                        info.card_special_training_status.clone(),
+                    )
+                    .value(
+                        event_users::Column::CardDefaultImage,
+                        info.card_default_image.clone(),
+                    )
+                    .value(event_users::Column::ProfileWord, info.profile_word.clone())
+                    .value(
+                        event_users::Column::ProfileHonorsJson,
+                        info.profile_honors_json.clone(),
+                    )
+                    .value(
+                        event_users::Column::PlayerFramesJson,
+                        info.player_frames_json.clone(),
+                    )
+                    .and_where(Expr::col(event_users::Column::UserIdKey).eq(row.user_id_key))
+                    .to_owned();
+                tx.execute(&upd).await?;
+            }
             out.insert(user_id.clone(), row.user_id_key);
             continue;
         }
@@ -162,23 +282,55 @@ pub(crate) async fn batch_get_or_create_user_id_keys(
                 event_users::Column::UniqueId,
                 event_users::Column::Name,
                 event_users::Column::CheerfulTeamId,
+                event_users::Column::CardId,
+                event_users::Column::CardLevel,
+                event_users::Column::CardMasterRank,
+                event_users::Column::CardSpecialTrainingStatus,
+                event_users::Column::CardDefaultImage,
+                event_users::Column::ProfileWord,
+                event_users::Column::ProfileHonorsJson,
+                event_users::Column::PlayerFramesJson,
             ])
             .values_panic([
                 user_id.as_str().into(),
                 info.unique_id.clone().into(),
                 info.name.clone().into(),
                 info.cheerful_team_id.into(),
+                info.card_id.into(),
+                info.card_level.into(),
+                info.card_master_rank.into(),
+                info.card_special_training_status.clone().into(),
+                info.card_default_image.clone().into(),
+                info.profile_word.clone().into(),
+                info.profile_honors_json.clone().into(),
+                info.player_frames_json.clone().into(),
             ]);
         } else {
             ins.columns([
                 event_users::Column::UserId,
                 event_users::Column::Name,
                 event_users::Column::CheerfulTeamId,
+                event_users::Column::CardId,
+                event_users::Column::CardLevel,
+                event_users::Column::CardMasterRank,
+                event_users::Column::CardSpecialTrainingStatus,
+                event_users::Column::CardDefaultImage,
+                event_users::Column::ProfileWord,
+                event_users::Column::ProfileHonorsJson,
+                event_users::Column::PlayerFramesJson,
             ])
             .values_panic([
                 user_id.as_str().into(),
                 info.name.clone().into(),
                 info.cheerful_team_id.into(),
+                info.card_id.into(),
+                info.card_level.into(),
+                info.card_master_rank.into(),
+                info.card_special_training_status.clone().into(),
+                info.card_default_image.clone().into(),
+                info.profile_word.clone().into(),
+                info.profile_honors_json.clone().into(),
+                info.player_frames_json.clone().into(),
             ]);
         }
         let ins = ins.to_owned();
@@ -222,21 +374,62 @@ fn collect_dims<'a, I>(
     records: I,
 ) -> (HashSet<i64>, HashMap<String, UserDimRow>)
 where
-    I: Iterator<Item = (i64, &'a str, &'a str, Option<i64>)>,
+    I: Iterator<Item = &'a PlayerEventRankingRecordSchema>,
 {
     let mut timestamps = HashSet::new();
     let mut users: HashMap<String, UserDimRow> = HashMap::new();
-    for (ts, user_id, name, cheerful_team_id) in records {
-        timestamps.insert(ts);
-        users.entry(user_id.to_string()).or_insert(UserDimRow {
-            name: name.to_string(),
-            cheerful_team_id,
-            unique_id: anonymizer
-                .is_enabled()
-                .then(|| anonymizer.public_user_id(server, event_id, user_id)),
-        });
+    for r in records {
+        timestamps.insert(r.timestamp);
+        users
+            .entry(r.user_id.clone())
+            .or_insert_with(|| UserDimRow::from_record(server, event_id, anonymizer, r));
     }
     (timestamps, users)
+}
+
+fn collect_users<'a, I>(
+    server: SekaiServerRegion,
+    event_id: i64,
+    anonymizer: &UidAnonymizer,
+    records: I,
+) -> HashMap<String, UserDimRow>
+where
+    I: Iterator<Item = &'a PlayerEventRankingRecordSchema>,
+{
+    let mut users = HashMap::new();
+    for r in records {
+        users
+            .entry(r.user_id.clone())
+            .or_insert_with(|| UserDimRow::from_record(server, event_id, anonymizer, r));
+    }
+    users
+}
+
+#[tracing::instrument(skip(engine, records), fields(event_id, n = records.len()))]
+pub async fn batch_upsert_event_users(
+    engine: &DatabaseEngine,
+    server: SekaiServerRegion,
+    event_id: i64,
+    anonymizer: &UidAnonymizer,
+    records: &[PlayerEventRankingRecordSchema],
+) -> Result<(), DbErr> {
+    if records.is_empty() {
+        return Ok(());
+    }
+    let backend = engine.backend();
+    let users_tbl = intern(TableKind::EventUsers, event_id);
+    let users = collect_users(server, event_id, anonymizer, records.iter());
+
+    engine
+        .conn()
+        .transaction::<_, (), DbErr>(move |tx| {
+            Box::pin(async move {
+                batch_get_or_create_user_id_keys(tx, backend, users_tbl, &users).await?;
+                Ok(())
+            })
+        })
+        .await
+        .map_err(unwrap_tx_err)
 }
 
 #[tracing::instrument(skip(engine, records), fields(event_id, n = records.len()))]
@@ -255,19 +448,7 @@ pub async fn batch_insert_event_rankings(
     let users_tbl = intern(TableKind::EventUsers, event_id);
     let event_tbl = intern(TableKind::Event, event_id);
 
-    let (timestamps, users) = collect_dims(
-        server,
-        event_id,
-        anonymizer,
-        records.iter().map(|r| {
-            (
-                r.timestamp,
-                r.user_id.as_str(),
-                r.name.as_str(),
-                r.cheerful_team_id,
-            )
-        }),
-    );
+    let (timestamps, users) = collect_dims(server, event_id, anonymizer, records.iter());
     let owned: Vec<OwnedRecord> = records
         .iter()
         .map(|r| OwnedRecord {
@@ -342,14 +523,7 @@ pub async fn batch_insert_world_bloom_rankings(
         server,
         event_id,
         anonymizer,
-        records.iter().map(|r| {
-            (
-                r.base.timestamp,
-                r.base.user_id.as_str(),
-                r.base.name.as_str(),
-                r.base.cheerful_team_id,
-            )
-        }),
+        records.iter().map(|r| &r.base),
     );
     let owned: Vec<OwnedWlRecord> = records
         .iter()
@@ -446,5 +620,97 @@ pub async fn batch_insert_world_bloom_rankings(
 fn unwrap_tx_err(e: TransactionError<DbErr>) -> DbErr {
     match e {
         TransactionError::Connection(err) | TransactionError::Transaction(err) => err,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use sea_orm::sea_query::{Alias, Expr, Func, Query};
+    use sea_orm::{Database, DatabaseBackend, FromQueryResult};
+
+    use super::*;
+    use crate::db::engine::DatabaseEngine;
+    use crate::db::query::user::{PublicUserIdMode, get_user_data};
+    use crate::db::schema::create_event_tables;
+    use crate::model::sekai::{UserCard, UserPlayerFrame, UserProfileHonor};
+    use crate::model::tracker::PlayerProfileSchema;
+
+    #[derive(FromQueryResult)]
+    struct CountRow {
+        n: i64,
+    }
+
+    #[tokio::test]
+    async fn users_only_upsert_updates_profile_without_ranking_rows() {
+        let conn = Database::connect("sqlite::memory:").await.unwrap();
+        let engine = DatabaseEngine::from_connection(conn, DatabaseBackend::Sqlite);
+        let event_id = 5151;
+        create_event_tables(&engine, SekaiServerRegion::Jp, event_id, false)
+            .await
+            .unwrap();
+
+        let records = vec![PlayerEventRankingRecordSchema {
+            timestamp: 1_710_000_000,
+            user_id: "100".into(),
+            name: "Miku".into(),
+            score: 123,
+            rank: 1,
+            cheerful_team_id: None,
+            profile: PlayerProfileSchema {
+                card: Some(UserCard {
+                    card_id: Some(1404),
+                    level: Some(60),
+                    master_rank: Some(5),
+                    special_training_status: Some("done".into()),
+                    default_image: Some("special_training".into()),
+                }),
+                profile_word: Some("hello".into()),
+                profile_honors: vec![UserProfileHonor {
+                    seq: Some(1),
+                    profile_honor_type: Some("normal".into()),
+                    honor_id: Some(95),
+                    honor_level: Some(9),
+                    bonds_honor_view_type: Some("none".into()),
+                    bonds_honor_word_id: Some(0),
+                }],
+                player_frames: vec![UserPlayerFrame {
+                    player_frame_id: Some(10050),
+                    player_frame_attach_status: Some("first".into()),
+                }],
+            },
+        }];
+
+        batch_upsert_event_users(
+            &engine,
+            SekaiServerRegion::Jp,
+            event_id,
+            &UidAnonymizer::disabled(),
+            &records,
+        )
+        .await
+        .unwrap();
+
+        let user = get_user_data(&engine, event_id, "100", PublicUserIdMode::Raw)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(user.card_id, Some(1404));
+        assert_eq!(user.profile_word.as_deref(), Some("hello"));
+        assert_eq!(user.profile_honors[0].honor_id, Some(95));
+        assert_eq!(user.user_player_frames[0].player_frame_id, Some(10050));
+
+        let stmt = Query::select()
+            .expr_as(
+                Func::count(Expr::col(event::Column::TimeId)),
+                Alias::new("n"),
+            )
+            .from(Alias::new(intern(TableKind::Event, event_id)))
+            .to_owned();
+        let count = CountRow::find_by_statement(engine.backend().build(&stmt))
+            .one(engine.conn())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(count.n, 0);
     }
 }

@@ -30,6 +30,14 @@ pub struct Model {
     pub unique_id: Option<String>,
     pub name: String,
     pub cheerful_team_id: Option<i64>,
+    pub card_id: Option<i64>,
+    pub card_level: Option<i64>,
+    pub card_master_rank: Option<i64>,
+    pub card_special_training_status: Option<String>,
+    pub card_default_image: Option<String>,
+    pub profile_word: Option<String>,
+    pub profile_honors_json: Option<String>,
+    pub player_frames_json: Option<String>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveColumn)]
@@ -39,6 +47,14 @@ pub enum Column {
     UniqueId,
     Name,
     CheerfulTeamId,
+    CardId,
+    CardLevel,
+    CardMasterRank,
+    CardSpecialTrainingStatus,
+    CardDefaultImage,
+    ProfileWord,
+    ProfileHonorsJson,
+    PlayerFramesJson,
 }
 
 impl ColumnTrait for Column {
@@ -53,6 +69,16 @@ impl ColumnTrait for Column {
                 .nullable(),
             Self::Name => ColumnType::String(StringLen::N(300)).def(),
             Self::CheerfulTeamId => ColumnType::BigInteger.def().nullable(),
+            Self::CardId | Self::CardLevel | Self::CardMasterRank => {
+                ColumnType::BigInteger.def().nullable()
+            }
+            Self::CardSpecialTrainingStatus | Self::CardDefaultImage => {
+                ColumnType::String(StringLen::N(64)).def().nullable()
+            }
+            Self::ProfileWord => ColumnType::String(StringLen::N(300)).def().nullable(),
+            Self::ProfileHonorsJson | Self::PlayerFramesJson => {
+                ColumnType::String(StringLen::None).def().nullable()
+            }
         }
     }
 }

@@ -127,6 +127,7 @@ pub async fn build(cfg: &Config) -> Result<AppContext, BootstrapError> {
             api_cache_redis.clone(),
             engine.clone(),
             anonymizer.clone(),
+            server_cfg.tracker.post_end_user_refresh_interval_secs,
             &server_cfg.master_data_dir,
         )?;
         if let Err(err) = daemon.init().await {
