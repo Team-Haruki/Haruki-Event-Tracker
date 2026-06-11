@@ -51,7 +51,7 @@ pub async fn create_event_tables(
     Ok(())
 }
 
-async fn create_query_indexes(
+pub async fn create_query_indexes(
     engine: &DatabaseEngine,
     event_id: i64,
     is_world_bloom: bool,
@@ -67,7 +67,26 @@ async fn create_query_indexes(
         event_index(event_id, event_tbl, "user_time", |idx| {
             idx.col(event::Column::UserIdKey).col(event::Column::TimeId);
         }),
+        event_index(event_id, event_tbl, "time_rank", |idx| {
+            idx.col(event::Column::TimeId).col(event::Column::Rank);
+        }),
+        event_index(event_id, event_tbl, "time_score", |idx| {
+            idx.col(event::Column::TimeId).col(event::Column::Score);
+        }),
     ];
+
+    let users_tbl = intern(TableKind::EventUsers, event_id);
+    indexes.extend([
+        event_index(event_id, users_tbl, "users_name", |idx| {
+            idx.col(event_users::Column::Name);
+        }),
+        event_index(event_id, users_tbl, "users_card_id", |idx| {
+            idx.col(event_users::Column::CardId);
+        }),
+        event_index(event_id, users_tbl, "users_cheerful_team", |idx| {
+            idx.col(event_users::Column::CheerfulTeamId);
+        }),
+    ]);
 
     if is_world_bloom {
         let wl_tbl = intern(TableKind::WorldBloom, event_id);
@@ -81,6 +100,11 @@ async fn create_query_indexes(
                 idx.col(world_bloom::Column::CharacterId)
                     .col(world_bloom::Column::UserIdKey)
                     .col(world_bloom::Column::TimeId);
+            }),
+            event_index(event_id, wl_tbl, "wl_char_time_rank", |idx| {
+                idx.col(world_bloom::Column::CharacterId)
+                    .col(world_bloom::Column::TimeId)
+                    .col(world_bloom::Column::Rank);
             }),
         ]);
     }

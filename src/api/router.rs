@@ -10,7 +10,7 @@ use tower_http::catch_panic::CatchPanicLayer;
 use tower_http::compression::CompressionLayer;
 
 use crate::api::access_log::{self, ProxyTrust};
-use crate::api::handler::{health, lines, ranking, status, trace, user, world_bloom};
+use crate::api::handler::{health, lines, ranking, status, trace, user, web, world_bloom};
 use crate::api::state::AppState;
 
 pub fn build_router(state: AppState, trust: Arc<ProxyTrust>) -> Router {
@@ -44,6 +44,17 @@ pub fn build_router(state: AppState, trust: Arc<ProxyTrust>) -> Router {
             get(trace::wb_all_by_ranks),
         )
         .route("/user-data/{user_id}", get(user::user_data))
+        .route("/web/rankings", get(web::rankings))
+        .route(
+            "/web/world-bloom-rankings/character/{character_id}",
+            get(web::world_bloom_rankings),
+        )
+        .route("/web/trace-ranking/user/{user_id}", get(web::user_trace))
+        .route(
+            "/web/trace-world-bloom-ranking/character/{character_id}/user/{user_id}",
+            get(web::world_bloom_user_trace),
+        )
+        .route("/web/users", get(web::users))
         .route("/ranking-lines", get(lines::ranking_lines))
         .route(
             "/ranking-score-growth/interval/{interval}",
