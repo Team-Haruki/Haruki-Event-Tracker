@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::api::cache::ApiCache;
+use crate::api::realtime::RealtimeHub;
 use crate::db::engine::DatabaseEngine;
 use crate::model::enums::SekaiServerRegion;
 use crate::privacy::UidAnonymizer;
@@ -22,6 +23,7 @@ struct Inner {
     dbs: HashMap<SekaiServerRegion, Arc<DatabaseEngine>>,
     cache: Option<ApiCache>,
     anonymizer: UidAnonymizer,
+    realtime: RealtimeHub,
 }
 
 impl AppState {
@@ -29,12 +31,14 @@ impl AppState {
         dbs: HashMap<SekaiServerRegion, Arc<DatabaseEngine>>,
         cache: Option<ApiCache>,
         anonymizer: UidAnonymizer,
+        realtime: RealtimeHub,
     ) -> Self {
         Self {
             inner: Arc::new(Inner {
                 dbs,
                 cache,
                 anonymizer,
+                realtime,
             }),
         }
     }
@@ -56,5 +60,9 @@ impl AppState {
 
     pub fn anonymizer(&self) -> &UidAnonymizer {
         &self.inner.anonymizer
+    }
+
+    pub fn realtime(&self) -> &RealtimeHub {
+        &self.inner.realtime
     }
 }

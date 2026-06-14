@@ -11,6 +11,9 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use chrono::Utc;
+
+use crate::api::realtime::{RealtimeHub, RealtimeTopic};
 use crate::db::engine::DatabaseEngine;
 use crate::model::enums::{SekaiEventStatus, SekaiEventType, SekaiServerRegion};
 use crate::model::event::{EventStatus, WorldBloomChapterStatus};
@@ -35,6 +38,7 @@ pub struct HarukiEventTracker {
     redis: redis::aio::ConnectionManager,
     api_cache_redis: Option<redis::aio::ConnectionManager>,
     db: Arc<DatabaseEngine>,
+    realtime: RealtimeHub,
     anonymizer: UidAnonymizer,
     post_end_user_refresh_interval_secs: u64,
     parser: EventDataParser,
@@ -49,6 +53,7 @@ impl HarukiEventTracker {
         redis: redis::aio::ConnectionManager,
         api_cache_redis: Option<redis::aio::ConnectionManager>,
         db: Arc<DatabaseEngine>,
+        realtime: RealtimeHub,
         anonymizer: UidAnonymizer,
         post_end_user_refresh_interval_secs: u64,
         master_dir: impl AsRef<str>,
@@ -60,6 +65,7 @@ impl HarukiEventTracker {
             redis,
             api_cache_redis,
             db,
+            realtime,
             anonymizer,
             post_end_user_refresh_interval_secs,
             inner: None,
@@ -141,8 +147,12 @@ impl HarukiEventTracker {
             return;
         };
         tracing::info!(event_id = event.event_id, "tracking ranking data");
-        if let Err(err) = base.record_ranking_data(false).await {
-            tracing::error!(%err, event_id = event.event_id, "record_ranking_data failed");
+        match base.record_ranking_data(false).await {
+            Ok(true) => self.notify_update(event.event_id),
+            Ok(false) => {}
+            Err(err) => {
+                tracing::error!(%err, event_id = event.event_id, "record_ranking_data failed")
+            }
         }
     }
 
@@ -167,35 +177,52 @@ impl HarukiEventTracker {
             tracing::info!(event_id = event.event_id, "event aggregating, skipping");
             return true;
         }
-        if Self::handle_event_ended(base, event).await {
+        let realtime = self.realtime.clone();
+        let server = self.server;
+        if Self::handle_event_ended(base, event, &realtime, server).await {
             return true;
         }
         if event.event_type == SekaiEventType::WorldBloom {
-            Self::handle_world_bloom(base, event).await;
+            Self::handle_world_bloom(base, event, &realtime, server).await;
         }
         false
     }
 
-    async fn handle_event_ended(base: &mut EventTrackerBase, event: &EventStatus) -> bool {
+    async fn handle_event_ended(
+        base: &mut EventTrackerBase,
+        event: &EventStatus,
+        realtime: &RealtimeHub,
+        server: SekaiServerRegion,
+    ) -> bool {
         if event.event_status != SekaiEventStatus::Ended || base.is_event_ended() {
             return false;
         }
         tracing::info!(event_id = event.event_id, "event ended, finalizing");
-        if let Err(err) = base.record_ranking_data(false).await {
-            tracing::error!(%err, event_id = event.event_id, "final record_ranking_data failed");
+        match base.record_ranking_data(false).await {
+            Ok(true) => notify_realtime_update(realtime, server, event.event_id),
+            Ok(false) => {}
+            Err(err) => {
+                tracing::error!(%err, event_id = event.event_id, "final record_ranking_data failed")
+            }
         }
         base.set_event_ended(true).await;
         true
     }
 
-    async fn handle_world_bloom(base: &mut EventTrackerBase, event: &EventStatus) {
+    async fn handle_world_bloom(
+        base: &mut EventTrackerBase,
+        event: &EventStatus,
+        realtime: &RealtimeHub,
+        server: SekaiServerRegion,
+    ) {
         if !world_bloom_statuses_equal(base.world_bloom_statuses(), &event.chapter_statuses) {
             base.set_world_bloom_statuses(event.chapter_statuses.clone());
         }
 
         // Iterate every chapter — overlap periods are intentional in Go.
         for (&character_id, detail) in &event.chapter_statuses {
-            Self::handle_world_bloom_chapter(base, event, character_id, detail).await;
+            Self::handle_world_bloom_chapter(base, event, character_id, detail, realtime, server)
+                .await;
         }
     }
 
@@ -204,6 +231,8 @@ impl HarukiEventTracker {
         event: &EventStatus,
         character_id: i64,
         detail: &WorldBloomChapterStatus,
+        realtime: &RealtimeHub,
+        server: SekaiServerRegion,
     ) -> bool {
         match detail.chapter_status {
             SekaiEventStatus::NotStarted => false,
@@ -224,13 +253,17 @@ impl HarukiEventTracker {
                     character_id,
                     "WB chapter ended, finalizing"
                 );
-                if let Err(err) = base.record_ranking_data(true).await {
-                    tracing::error!(
-                        %err,
-                        event_id = event.event_id,
-                        character_id,
-                        "WB final record_ranking_data failed"
-                    );
+                match base.record_ranking_data(true).await {
+                    Ok(true) => notify_realtime_update(realtime, server, event.event_id),
+                    Ok(false) => {}
+                    Err(err) => {
+                        tracing::error!(
+                            %err,
+                            event_id = event.event_id,
+                            character_id,
+                            "WB final record_ranking_data failed"
+                        );
+                    }
                 }
                 base.set_world_bloom_chapter_ended(character_id, true);
                 true
@@ -238,6 +271,14 @@ impl HarukiEventTracker {
             _ => false,
         }
     }
+
+    fn notify_update(&self, event_id: i64) {
+        notify_realtime_update(&self.realtime, self.server, event_id);
+    }
+}
+
+fn notify_realtime_update(realtime: &RealtimeHub, server: SekaiServerRegion, event_id: i64) {
+    realtime.notify_update(RealtimeTopic::new(server, event_id), Utc::now().timestamp());
 }
 
 fn world_bloom_statuses_equal(

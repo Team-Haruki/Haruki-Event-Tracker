@@ -12,9 +12,25 @@ use tower_http::compression::CompressionLayer;
 use crate::api::access_log::{self, ProxyTrust};
 use crate::api::handler::{health, lines, ranking, status, trace, user, web, world_bloom};
 use crate::api::state::AppState;
+use crate::api::ws;
 
 pub fn build_router(state: AppState, trust: Arc<ProxyTrust>) -> Router {
-    let event_routes = Router::new()
+    let event_routes = event_routes();
+    let ws_state = (state.clone(), trust.clone());
+
+    Router::new()
+        .route("/livez", get(health::livez))
+        .route("/readyz", get(health::readyz))
+        .route("/ws", get(ws::connect).with_state(ws_state))
+        .nest("/event/{server}/{event_id}", event_routes)
+        .with_state(state)
+        .layer(axum::middleware::from_fn_with_state(trust, access_log::log))
+        .layer(CompressionLayer::new().gzip(true).br(true))
+        .layer(CatchPanicLayer::new())
+}
+
+pub fn event_routes() -> Router<AppState> {
+    Router::new()
         .route(
             "/latest-ranking/user/{user_id}",
             get(ranking::latest_by_user),
@@ -68,14 +84,5 @@ pub fn build_router(state: AppState, trust: Arc<ProxyTrust>) -> Router {
             "/world-bloom-ranking-score-growth/character/{character_id}/interval/{interval}",
             get(lines::wb_score_growth),
         )
-        .route("/status", get(status::event_status));
-
-    Router::new()
-        .route("/livez", get(health::livez))
-        .route("/readyz", get(health::readyz))
-        .nest("/event/{server}/{event_id}", event_routes)
-        .with_state(state)
-        .layer(axum::middleware::from_fn_with_state(trust, access_log::log))
-        .layer(CompressionLayer::new().gzip(true).br(true))
-        .layer(CatchPanicLayer::new())
+        .route("/status", get(status::event_status))
 }

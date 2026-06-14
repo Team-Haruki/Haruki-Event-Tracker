@@ -266,10 +266,10 @@ impl EventTrackerBase {
     pub async fn record_ranking_data(
         &mut self,
         only_world_bloom: bool,
-    ) -> Result<(), TrackerError> {
+    ) -> Result<bool, TrackerError> {
         if self.is_event_ended {
             tracing::info!("event already ended, skipping");
-            return Ok(());
+            return Ok(false);
         }
 
         let now = Utc::now().timestamp();
@@ -370,7 +370,7 @@ impl EventTrackerBase {
             tracing::warn!(%err, "failed to save rank_state to Redis");
         }
         tracing::info!("finished recording ranking data");
-        Ok(())
+        Ok(batch_called)
     }
 
     async fn handle_ranking_data(&mut self) -> Result<HandledRankingData, TrackerError> {

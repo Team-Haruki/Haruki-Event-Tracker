@@ -15,6 +15,7 @@ use tokio::sync::Mutex;
 use tokio_cron_scheduler::{Job, JobScheduler, JobSchedulerError};
 
 use crate::api::cache::ApiCache;
+use crate::api::realtime::RealtimeHub;
 use crate::api::state::AppState;
 use crate::config::{Config, RedisConfig};
 use crate::db::engine::{DatabaseEngine, EngineError};
@@ -51,6 +52,7 @@ pub struct AppContext {
 
 pub async fn build(cfg: &Config) -> Result<AppContext, BootstrapError> {
     let anonymizer = build_anonymizer(cfg)?;
+    let realtime = RealtimeHub::new();
     let tracker_enabled = cfg
         .servers
         .values()
@@ -126,6 +128,7 @@ pub async fn build(cfg: &Config) -> Result<AppContext, BootstrapError> {
             redis,
             api_cache_redis.clone(),
             engine.clone(),
+            realtime.clone(),
             anonymizer.clone(),
             server_cfg.tracker.post_end_user_refresh_interval_secs,
             &server_cfg.master_data_dir,
@@ -163,7 +166,7 @@ pub async fn build(cfg: &Config) -> Result<AppContext, BootstrapError> {
         tracing::info!("scheduler started");
     }
 
-    let state = AppState::new(dbs.clone(), api_cache, anonymizer);
+    let state = AppState::new(dbs.clone(), api_cache, anonymizer, realtime);
     Ok(AppContext {
         state,
         dbs,
