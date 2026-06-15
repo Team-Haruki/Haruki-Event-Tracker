@@ -51,7 +51,7 @@ pub(crate) async fn batch_get_or_create_time_ids(
     backend: DatabaseBackend,
     table_name: &str,
     timestamps: &HashSet<i64>,
-    status: i8,
+    status: i16,
 ) -> Result<HashMap<i64, i64>, DbErr> {
     let mut out = HashMap::with_capacity(timestamps.len());
     for &ts in timestamps {
@@ -73,7 +73,7 @@ pub(crate) async fn batch_get_or_create_time_ids(
         let ins = Query::insert()
             .into_table(Alias::new(table_name))
             .columns([time_id::Column::Timestamp, time_id::Column::Status])
-            .values_panic([ts.into(), i16::from(status).into()])
+            .values_panic([ts.into(), status.into()])
             .to_owned();
         tx.execute(&ins).await?;
 

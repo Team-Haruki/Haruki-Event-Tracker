@@ -9,7 +9,7 @@ use crate::db::query::user::PublicUserIdMode;
 use crate::db::table_name::{TableKind, intern};
 use crate::model::api::{
     RecordedRankData, RecordedRankingSchema, RecordedUserNameSchema,
-    RecordedWorldBloomRankingSchema,
+    RecordedWorldBloomRankingSchema, WebRankingItemSchema,
 };
 
 #[derive(Debug, Clone)]
@@ -70,6 +70,16 @@ struct RankingPageRow {
     user_id_key: i64,
     score: i64,
     rank: i64,
+    name: String,
+    cheerful_team_id: Option<i64>,
+    card_id: Option<i64>,
+    card_level: Option<i64>,
+    card_master_rank: Option<i64>,
+    card_special_training_status: Option<String>,
+    card_default_image: Option<String>,
+    profile_word: Option<String>,
+    profile_honors_json: Option<String>,
+    player_frames_json: Option<String>,
 }
 
 #[derive(Debug, FromQueryResult)]
@@ -80,6 +90,16 @@ struct WorldBloomRankingPageRow {
     score: i64,
     rank: i64,
     character_id: Option<i64>,
+    name: String,
+    cheerful_team_id: Option<i64>,
+    card_id: Option<i64>,
+    card_level: Option<i64>,
+    card_master_rank: Option<i64>,
+    card_special_training_status: Option<String>,
+    card_default_image: Option<String>,
+    profile_word: Option<String>,
+    profile_honors_json: Option<String>,
+    player_frames_json: Option<String>,
 }
 
 impl RankingPageRow {
@@ -97,6 +117,39 @@ impl RankingPageRow {
             user_id: self.user_id,
             score: self.score,
             rank: self.rank,
+        }
+    }
+
+    fn into_web_item(self) -> WebRankingItemSchema {
+        let rank_data = RecordedRankData::Normal(self.clone_rank_schema());
+        WebRankingItemSchema {
+            rank_data,
+            user_data: Some(self.into_user_schema()),
+        }
+    }
+
+    fn clone_rank_schema(&self) -> RecordedRankingSchema {
+        RecordedRankingSchema {
+            timestamp: self.timestamp,
+            user_id: self.user_id.clone(),
+            score: self.score,
+            rank: self.rank,
+        }
+    }
+
+    fn into_user_schema(self) -> RecordedUserNameSchema {
+        RecordedUserNameSchema {
+            user_id: self.user_id,
+            name: self.name,
+            cheerful_team_id: self.cheerful_team_id,
+            card_id: self.card_id,
+            card_level: self.card_level,
+            card_master_rank: self.card_master_rank,
+            card_special_training_status: self.card_special_training_status,
+            card_default_image: self.card_default_image,
+            profile_word: self.profile_word,
+            profile_honors: parse_json_array(self.profile_honors_json.as_deref()),
+            user_player_frames: parse_json_array(self.player_frames_json.as_deref()),
         }
     }
 }
@@ -119,6 +172,86 @@ impl WorldBloomRankingPageRow {
             character_id: self.character_id,
         }
     }
+
+    fn into_web_item(self) -> WebRankingItemSchema {
+        let rank_data = RecordedRankData::WorldBloom(self.clone_rank_schema());
+        WebRankingItemSchema {
+            rank_data,
+            user_data: Some(self.into_user_schema()),
+        }
+    }
+
+    fn clone_rank_schema(&self) -> RecordedWorldBloomRankingSchema {
+        RecordedWorldBloomRankingSchema {
+            timestamp: self.timestamp,
+            user_id: self.user_id.clone(),
+            score: self.score,
+            rank: self.rank,
+            character_id: self.character_id,
+        }
+    }
+
+    fn into_user_schema(self) -> RecordedUserNameSchema {
+        RecordedUserNameSchema {
+            user_id: self.user_id,
+            name: self.name,
+            cheerful_team_id: self.cheerful_team_id,
+            card_id: self.card_id,
+            card_level: self.card_level,
+            card_master_rank: self.card_master_rank,
+            card_special_training_status: self.card_special_training_status,
+            card_default_image: self.card_default_image,
+            profile_word: self.profile_word,
+            profile_honors: parse_json_array(self.profile_honors_json.as_deref()),
+            user_player_frames: parse_json_array(self.player_frames_json.as_deref()),
+        }
+    }
+}
+
+fn select_user_profile_columns(stmt: &mut SelectStatement, users_tbl: Alias) {
+    stmt.expr_as(
+        Expr::col((users_tbl.clone(), event_users::Column::Name)),
+        Alias::new("name"),
+    )
+    .expr_as(
+        Expr::col((users_tbl.clone(), event_users::Column::CheerfulTeamId)),
+        Alias::new("cheerful_team_id"),
+    )
+    .expr_as(
+        Expr::col((users_tbl.clone(), event_users::Column::CardId)),
+        Alias::new("card_id"),
+    )
+    .expr_as(
+        Expr::col((users_tbl.clone(), event_users::Column::CardLevel)),
+        Alias::new("card_level"),
+    )
+    .expr_as(
+        Expr::col((users_tbl.clone(), event_users::Column::CardMasterRank)),
+        Alias::new("card_master_rank"),
+    )
+    .expr_as(
+        Expr::col((
+            users_tbl.clone(),
+            event_users::Column::CardSpecialTrainingStatus,
+        )),
+        Alias::new("card_special_training_status"),
+    )
+    .expr_as(
+        Expr::col((users_tbl.clone(), event_users::Column::CardDefaultImage)),
+        Alias::new("card_default_image"),
+    )
+    .expr_as(
+        Expr::col((users_tbl.clone(), event_users::Column::ProfileWord)),
+        Alias::new("profile_word"),
+    )
+    .expr_as(
+        Expr::col((users_tbl.clone(), event_users::Column::ProfileHonorsJson)),
+        Alias::new("profile_honors_json"),
+    )
+    .expr_as(
+        Expr::col((users_tbl, event_users::Column::PlayerFramesJson)),
+        Alias::new("player_frames_json"),
+    );
 }
 
 fn ranking_select(event_id: i64, mode: PublicUserIdMode) -> SelectStatement {
@@ -126,28 +259,29 @@ fn ranking_select(event_id: i64, mode: PublicUserIdMode) -> SelectStatement {
     let time_tbl = Alias::new(intern(TableKind::TimeId, event_id));
     let users_tbl = Alias::new(intern(TableKind::EventUsers, event_id));
 
-    Query::select()
-        .expr_as(
-            Expr::col((time_tbl.clone(), time_id::Column::Timestamp)),
-            Alias::new("timestamp"),
-        )
-        .expr_as(
-            Expr::col((users_tbl.clone(), mode.output_column())),
-            Alias::new("user_id"),
-        )
-        .expr_as(
-            Expr::col((users_tbl.clone(), event_users::Column::UserIdKey)),
-            Alias::new("user_id_key"),
-        )
-        .expr_as(
-            Expr::col((event_tbl.clone(), event::Column::Score)),
-            Alias::new("score"),
-        )
-        .expr_as(
-            Expr::col((event_tbl.clone(), event::Column::Rank)),
-            Alias::new("rank"),
-        )
-        .from(event_tbl.clone())
+    let mut stmt = Query::select();
+    stmt.expr_as(
+        Expr::col((time_tbl.clone(), time_id::Column::Timestamp)),
+        Alias::new("timestamp"),
+    )
+    .expr_as(
+        Expr::col((users_tbl.clone(), mode.output_column())),
+        Alias::new("user_id"),
+    )
+    .expr_as(
+        Expr::col((users_tbl.clone(), event_users::Column::UserIdKey)),
+        Alias::new("user_id_key"),
+    )
+    .expr_as(
+        Expr::col((event_tbl.clone(), event::Column::Score)),
+        Alias::new("score"),
+    )
+    .expr_as(
+        Expr::col((event_tbl.clone(), event::Column::Rank)),
+        Alias::new("rank"),
+    );
+    select_user_profile_columns(&mut stmt, users_tbl.clone());
+    stmt.from(event_tbl.clone())
         .inner_join(
             time_tbl.clone(),
             Expr::col((event_tbl.clone(), event::Column::TimeId))
@@ -166,32 +300,33 @@ fn world_bloom_select(event_id: i64, mode: PublicUserIdMode) -> SelectStatement 
     let time_tbl = Alias::new(intern(TableKind::TimeId, event_id));
     let users_tbl = Alias::new(intern(TableKind::EventUsers, event_id));
 
-    Query::select()
-        .expr_as(
-            Expr::col((time_tbl.clone(), time_id::Column::Timestamp)),
-            Alias::new("timestamp"),
-        )
-        .expr_as(
-            Expr::col((users_tbl.clone(), mode.output_column())),
-            Alias::new("user_id"),
-        )
-        .expr_as(
-            Expr::col((users_tbl.clone(), event_users::Column::UserIdKey)),
-            Alias::new("user_id_key"),
-        )
-        .expr_as(
-            Expr::col((wl_tbl.clone(), world_bloom::Column::Score)),
-            Alias::new("score"),
-        )
-        .expr_as(
-            Expr::col((wl_tbl.clone(), world_bloom::Column::Rank)),
-            Alias::new("rank"),
-        )
-        .expr_as(
-            Expr::col((wl_tbl.clone(), world_bloom::Column::CharacterId)),
-            Alias::new("character_id"),
-        )
-        .from(wl_tbl.clone())
+    let mut stmt = Query::select();
+    stmt.expr_as(
+        Expr::col((time_tbl.clone(), time_id::Column::Timestamp)),
+        Alias::new("timestamp"),
+    )
+    .expr_as(
+        Expr::col((users_tbl.clone(), mode.output_column())),
+        Alias::new("user_id"),
+    )
+    .expr_as(
+        Expr::col((users_tbl.clone(), event_users::Column::UserIdKey)),
+        Alias::new("user_id_key"),
+    )
+    .expr_as(
+        Expr::col((wl_tbl.clone(), world_bloom::Column::Score)),
+        Alias::new("score"),
+    )
+    .expr_as(
+        Expr::col((wl_tbl.clone(), world_bloom::Column::Rank)),
+        Alias::new("rank"),
+    )
+    .expr_as(
+        Expr::col((wl_tbl.clone(), world_bloom::Column::CharacterId)),
+        Alias::new("character_id"),
+    );
+    select_user_profile_columns(&mut stmt, users_tbl.clone());
+    stmt.from(wl_tbl.clone())
         .inner_join(
             time_tbl.clone(),
             Expr::col((wl_tbl.clone(), world_bloom::Column::TimeId))
@@ -386,29 +521,30 @@ fn latest_rank_window_select(
     .expr_as(
         Expr::col((event_tbl.clone(), event::Column::Rank)),
         Alias::new("rank"),
-    )
-    .from(event_tbl.clone())
-    .inner_join(
-        time_tbl.clone(),
-        Expr::col((event_tbl.clone(), event::Column::TimeId))
-            .equals((time_tbl.clone(), time_id::Column::TimeId)),
-    )
-    .join_subquery(
-        JoinType::InnerJoin,
-        latest.to_owned(),
-        latest_tbl.clone(),
-        Expr::col((event_tbl.clone(), event::Column::Rank))
-            .equals((latest_tbl.clone(), Alias::new("rank")))
-            .and(
-                Expr::col((event_tbl.clone(), event::Column::TimeId))
-                    .equals((latest_tbl, Alias::new("time_id"))),
-            ),
-    )
-    .inner_join(
-        users_tbl.clone(),
-        Expr::col((event_tbl.clone(), event::Column::UserIdKey))
-            .equals((users_tbl.clone(), event_users::Column::UserIdKey)),
     );
+    select_user_profile_columns(&mut stmt, users_tbl.clone());
+    stmt.from(event_tbl.clone())
+        .inner_join(
+            time_tbl.clone(),
+            Expr::col((event_tbl.clone(), event::Column::TimeId))
+                .equals((time_tbl.clone(), time_id::Column::TimeId)),
+        )
+        .join_subquery(
+            JoinType::InnerJoin,
+            latest.to_owned(),
+            latest_tbl.clone(),
+            Expr::col((event_tbl.clone(), event::Column::Rank))
+                .equals((latest_tbl.clone(), Alias::new("rank")))
+                .and(
+                    Expr::col((event_tbl.clone(), event::Column::TimeId))
+                        .equals((latest_tbl, Alias::new("time_id"))),
+                ),
+        )
+        .inner_join(
+            users_tbl.clone(),
+            Expr::col((event_tbl.clone(), event::Column::UserIdKey))
+                .equals((users_tbl.clone(), event_users::Column::UserIdKey)),
+        );
 
     apply_rank_window_outer_filters(
         &mut stmt,
@@ -493,30 +629,31 @@ fn latest_world_bloom_rank_window_select(
     .expr_as(
         Expr::col((wl_tbl.clone(), world_bloom::Column::CharacterId)),
         Alias::new("character_id"),
-    )
-    .from(wl_tbl.clone())
-    .inner_join(
-        time_tbl.clone(),
-        Expr::col((wl_tbl.clone(), world_bloom::Column::TimeId))
-            .equals((time_tbl.clone(), time_id::Column::TimeId)),
-    )
-    .join_subquery(
-        JoinType::InnerJoin,
-        latest.to_owned(),
-        latest_tbl.clone(),
-        Expr::col((wl_tbl.clone(), world_bloom::Column::Rank))
-            .equals((latest_tbl.clone(), Alias::new("rank")))
-            .and(
-                Expr::col((wl_tbl.clone(), world_bloom::Column::TimeId))
-                    .equals((latest_tbl, Alias::new("time_id"))),
-            ),
-    )
-    .inner_join(
-        users_tbl.clone(),
-        Expr::col((wl_tbl.clone(), world_bloom::Column::UserIdKey))
-            .equals((users_tbl.clone(), event_users::Column::UserIdKey)),
-    )
-    .and_where(Expr::col((wl_tbl.clone(), world_bloom::Column::CharacterId)).eq(character_id));
+    );
+    select_user_profile_columns(&mut stmt, users_tbl.clone());
+    stmt.from(wl_tbl.clone())
+        .inner_join(
+            time_tbl.clone(),
+            Expr::col((wl_tbl.clone(), world_bloom::Column::TimeId))
+                .equals((time_tbl.clone(), time_id::Column::TimeId)),
+        )
+        .join_subquery(
+            JoinType::InnerJoin,
+            latest.to_owned(),
+            latest_tbl.clone(),
+            Expr::col((wl_tbl.clone(), world_bloom::Column::Rank))
+                .equals((latest_tbl.clone(), Alias::new("rank")))
+                .and(
+                    Expr::col((wl_tbl.clone(), world_bloom::Column::TimeId))
+                        .equals((latest_tbl, Alias::new("time_id"))),
+                ),
+        )
+        .inner_join(
+            users_tbl.clone(),
+            Expr::col((wl_tbl.clone(), world_bloom::Column::UserIdKey))
+                .equals((users_tbl.clone(), event_users::Column::UserIdKey)),
+        )
+        .and_where(Expr::col((wl_tbl.clone(), world_bloom::Column::CharacterId)).eq(character_id));
 
     apply_rank_window_outer_filters(
         &mut stmt,
@@ -537,7 +674,7 @@ pub async fn search_rankings(
     event_id: i64,
     filter: &WebRankingFilter,
     mode: PublicUserIdMode,
-) -> Result<(Vec<RecordedRankData>, Option<WebRankingCursor>), DbErr> {
+) -> Result<(Vec<WebRankingItemSchema>, Option<WebRankingCursor>), DbErr> {
     let event_tbl = Alias::new(intern(TableKind::Event, event_id));
     let time_tbl = Alias::new(intern(TableKind::TimeId, event_id));
     let users_tbl = Alias::new(intern(TableKind::EventUsers, event_id));
@@ -571,8 +708,7 @@ pub async fn search_rankings(
     };
     Ok((
         rows.into_iter()
-            .map(RankingPageRow::into_schema)
-            .map(RecordedRankData::Normal)
+            .map(RankingPageRow::into_web_item)
             .collect(),
         next_cursor,
     ))
@@ -585,7 +721,7 @@ pub async fn search_world_bloom_rankings(
     character_id: i64,
     filter: &WebRankingFilter,
     mode: PublicUserIdMode,
-) -> Result<(Vec<RecordedRankData>, Option<WebRankingCursor>), DbErr> {
+) -> Result<(Vec<WebRankingItemSchema>, Option<WebRankingCursor>), DbErr> {
     let wl_tbl = Alias::new(intern(TableKind::WorldBloom, event_id));
     let time_tbl = Alias::new(intern(TableKind::TimeId, event_id));
     let users_tbl = Alias::new(intern(TableKind::EventUsers, event_id));
@@ -622,8 +758,7 @@ pub async fn search_world_bloom_rankings(
     };
     Ok((
         rows.into_iter()
-            .map(WorldBloomRankingPageRow::into_schema)
-            .map(RecordedRankData::WorldBloom)
+            .map(WorldBloomRankingPageRow::into_web_item)
             .collect(),
         next_cursor,
     ))
@@ -876,11 +1011,19 @@ mod tests {
 
         assert_eq!(items.len(), 1);
         assert!(cursor.is_some());
-        let RecordedRankData::Normal(row) = &items[0] else {
+        let item = &items[0];
+        let RecordedRankData::Normal(row) = &item.rank_data else {
             panic!("expected normal ranking");
         };
         assert_eq!(row.user_id, "u-public-1");
         assert_eq!(row.rank, 1);
+        let user = item.user_data.as_ref().expect("expected ranking user data");
+        assert_eq!(user.user_id, "u-public-1");
+        assert_eq!(user.name, "Alpha");
+        assert_eq!(user.card_id, Some(1404));
+        assert_eq!(user.card_level, Some(60));
+        assert_eq!(user.profile_honors[0].honor_id, Some(95));
+        assert_eq!(user.user_player_frames[0].player_frame_id, Some(10050));
     }
 
     #[tokio::test]
@@ -913,8 +1056,17 @@ mod tests {
         let rows: Vec<_> = items
             .into_iter()
             .map(|item| match item {
-                RecordedRankData::Normal(row) => row,
-                RecordedRankData::WorldBloom(_) => panic!("expected normal ranking"),
+                WebRankingItemSchema {
+                    rank_data: RecordedRankData::Normal(row),
+                    user_data,
+                } => {
+                    assert!(user_data.is_some());
+                    row
+                }
+                WebRankingItemSchema {
+                    rank_data: RecordedRankData::WorldBloom(_),
+                    ..
+                } => panic!("expected normal ranking"),
             })
             .collect();
         assert_eq!(
@@ -962,8 +1114,17 @@ mod tests {
         let rows: Vec<_> = items
             .into_iter()
             .map(|item| match item {
-                RecordedRankData::WorldBloom(row) => row,
-                RecordedRankData::Normal(_) => panic!("expected world bloom ranking"),
+                WebRankingItemSchema {
+                    rank_data: RecordedRankData::WorldBloom(row),
+                    user_data,
+                } => {
+                    assert!(user_data.is_some());
+                    row
+                }
+                WebRankingItemSchema {
+                    rank_data: RecordedRankData::Normal(_),
+                    ..
+                } => panic!("expected world bloom ranking"),
             })
             .collect();
         assert_eq!(

@@ -120,7 +120,7 @@ pub struct RankingScoreGrowthSchema {
 #[serde(rename_all = "camelCase")]
 pub struct EventStatusResponseSchema {
     pub timestamp: i64,
-    pub status: i8,
+    pub status: i16,
     pub status_desc: String,
     pub time_ago: i64,
 }
@@ -129,9 +129,17 @@ pub struct EventStatusResponseSchema {
 #[serde(rename_all = "camelCase")]
 pub struct WebRankingPageSchema {
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub items: Vec<RecordedRankData>,
+    pub items: Vec<WebRankingItemSchema>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WebRankingItemSchema {
+    pub rank_data: RecordedRankData,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_data: Option<RecordedUserNameSchema>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
