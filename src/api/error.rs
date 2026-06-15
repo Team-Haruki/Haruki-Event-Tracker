@@ -17,6 +17,12 @@ pub enum ApiError {
     NotFound,
     #[error("invalid path parameter: {0}")]
     BadRequest(String),
+    #[error("login required")]
+    Unauthorized,
+    #[error("permission denied")]
+    Forbidden,
+    #[error("service unavailable: {0}")]
+    ServiceUnavailable(String),
     #[error("database: {0}")]
     Db(#[from] DbErr),
 }
@@ -33,7 +39,10 @@ impl IntoResponse for ApiError {
         }
         let status = match &self {
             ApiError::InvalidServer(_) | ApiError::BadRequest(_) => StatusCode::BAD_REQUEST,
+            ApiError::Unauthorized => StatusCode::UNAUTHORIZED,
+            ApiError::Forbidden => StatusCode::FORBIDDEN,
             ApiError::NotFound => StatusCode::NOT_FOUND,
+            ApiError::ServiceUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
             ApiError::Db(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };
         let body = Json(ErrorBody {

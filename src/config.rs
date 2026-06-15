@@ -90,6 +90,15 @@ pub struct PrivacyConfig {
 
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
+pub struct ToolboxConfig {
+    pub base_url: String,
+    pub auth_proxy_secret: String,
+    pub authorization: String,
+    pub user_agent: String,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
 pub struct BackendConfig {
     pub host: String,
     pub port: u16,
@@ -123,6 +132,7 @@ pub struct Config {
     pub redis: RedisConfig,
     pub api_cache: ApiCacheConfig,
     pub privacy: PrivacyConfig,
+    pub toolbox: ToolboxConfig,
     pub backend: BackendConfig,
     pub servers: HashMap<SekaiServerRegion, ServerConfig>,
     #[serde(rename = "sekai_api")]

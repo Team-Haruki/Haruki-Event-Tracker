@@ -40,6 +40,18 @@ api_cache:
   max_value_bytes: 1048576
 
 # ============================================================================
+# Toolbox 私有查询校验配置
+# ============================================================================
+# 用途：/event/.../private/... raw UID 查询会先调用 Toolbox 当前用户接口，
+#      校验 Oathkeeper/Kratos 登录身份是否绑定了目标区服 UID。
+# 注意：留空时 private UID 查询会返回 503，避免退回到“登录即可查任意 UID”。
+toolbox:
+  base_url: ""               # 例如 http://toolbox-backend:16666
+  auth_proxy_secret: ""      # Toolbox 后端 AUTH_PROXY_TRUSTED_VALUE / Oathkeeper shared secret
+  authorization: ""          # 如需兼容旧内部鉴权可填写 Authorization 完整值，通常留空
+  user_agent: "Haruki-Event-Tracker/private-lookup"
+
+# ============================================================================
 # 后端 API 服务器配置
 # ============================================================================
 # 用途：提供 HTTP/HTTPS API 接口供前端或其他服务调用

@@ -4,6 +4,7 @@ pub mod error;
 pub mod extract;
 pub mod handler;
 pub mod json;
+pub mod private_lookup;
 pub mod realtime;
 pub mod router;
 pub mod state;

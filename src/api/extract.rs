@@ -45,6 +45,16 @@ pub async fn prepare_user_id_mode(
     }
 }
 
+pub async fn prepare_private_user_id_mode(
+    state: &AppState,
+    engine: &DatabaseEngine,
+    server: SekaiServerRegion,
+    event_id: i64,
+) -> Result<PublicUserIdMode, ApiError> {
+    ensure_user_table_extensions(engine, server, event_id, state.anonymizer()).await?;
+    Ok(PublicUserIdMode::Raw)
+}
+
 pub fn parse_rank_query(raw: Option<&str>) -> Result<Vec<i64>, ApiError> {
     let Some(raw) = raw else {
         return Err(ApiError::BadRequest("rank query is required".into()));

@@ -15,6 +15,7 @@ use tokio::sync::Mutex;
 use tokio_cron_scheduler::{Job, JobScheduler, JobSchedulerError};
 
 use crate::api::cache::ApiCache;
+use crate::api::private_lookup::PrivateLookupVerifier;
 use crate::api::realtime::RealtimeHub;
 use crate::api::state::AppState;
 use crate::api::ws_ticket::WsTicketStore;
@@ -53,6 +54,7 @@ pub struct AppContext {
 
 pub async fn build(cfg: &Config) -> Result<AppContext, BootstrapError> {
     let anonymizer = build_anonymizer(cfg)?;
+    let private_lookup = PrivateLookupVerifier::from_config(&cfg.toolbox);
     let realtime = RealtimeHub::new();
     let tracker_enabled = cfg
         .servers
@@ -171,6 +173,7 @@ pub async fn build(cfg: &Config) -> Result<AppContext, BootstrapError> {
         dbs.clone(),
         api_cache,
         anonymizer,
+        private_lookup,
         realtime,
         WsTicketStore::default(),
     );

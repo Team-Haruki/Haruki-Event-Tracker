@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::api::cache::ApiCache;
+use crate::api::private_lookup::PrivateLookupVerifier;
 use crate::api::realtime::RealtimeHub;
 use crate::api::ws_ticket::WsTicketStore;
 use crate::db::engine::DatabaseEngine;
@@ -24,6 +25,7 @@ struct Inner {
     dbs: HashMap<SekaiServerRegion, Arc<DatabaseEngine>>,
     cache: Option<ApiCache>,
     anonymizer: UidAnonymizer,
+    private_lookup: Option<PrivateLookupVerifier>,
     realtime: RealtimeHub,
     ws_tickets: WsTicketStore,
 }
@@ -33,6 +35,7 @@ impl AppState {
         dbs: HashMap<SekaiServerRegion, Arc<DatabaseEngine>>,
         cache: Option<ApiCache>,
         anonymizer: UidAnonymizer,
+        private_lookup: Option<PrivateLookupVerifier>,
         realtime: RealtimeHub,
         ws_tickets: WsTicketStore,
     ) -> Self {
@@ -41,6 +44,7 @@ impl AppState {
                 dbs,
                 cache,
                 anonymizer,
+                private_lookup,
                 realtime,
                 ws_tickets,
             }),
@@ -64,6 +68,10 @@ impl AppState {
 
     pub fn anonymizer(&self) -> &UidAnonymizer {
         &self.inner.anonymizer
+    }
+
+    pub fn private_lookup(&self) -> Option<&PrivateLookupVerifier> {
+        self.inner.private_lookup.as_ref()
     }
 
     pub fn realtime(&self) -> &RealtimeHub {

@@ -14,8 +14,9 @@ use tokio::sync::broadcast;
 use tower::ServiceExt;
 
 use crate::api::access_log::ProxyTrust;
+use crate::api::handler::private::PrivateSubject;
 use crate::api::realtime::{RealtimeMessage, RealtimeTopic};
-use crate::api::router::event_routes;
+use crate::api::router::{event_routes, private_event_routes};
 use crate::api::state::AppState;
 use crate::api::ws_ticket::{peer_from_connect_info, resolve_trusted_subject, unauthorized};
 use crate::model::enums::SekaiServerRegion;
@@ -122,6 +123,7 @@ async fn handle_socket(
     subject: String,
 ) {
     let router = Router::new()
+        .nest("/event/{server}/{event_id}/private", private_event_routes())
         .nest("/event/{server}/{event_id}", event_routes())
         .with_state(state.clone())
         .layer(axum::middleware::from_fn_with_state(
@@ -167,7 +169,7 @@ async fn handle_socket(
                         break;
                     }
                 };
-                if handle_client_message(&mut socket, &router, &hub, &mut topics, message).await.is_err() {
+                if handle_client_message(&mut socket, &router, &hub, &mut topics, &subject, message).await.is_err() {
                     break;
                 }
             }
@@ -196,12 +198,15 @@ async fn handle_client_message(
     router: &Router,
     hub: &crate::api::realtime::RealtimeHub,
     topics: &mut HashSet<RealtimeTopic>,
+    subject: &str,
     message: Message,
 ) -> Result<(), ()> {
     let response = match message {
-        Message::Text(text) => handle_text_request(router, hub, topics, text.as_str()).await,
+        Message::Text(text) => {
+            handle_text_request(router, hub, topics, subject, text.as_str()).await
+        }
         Message::Binary(bytes) => match std::str::from_utf8(&bytes) {
-            Ok(text) => handle_text_request(router, hub, topics, text).await,
+            Ok(text) => handle_text_request(router, hub, topics, subject, text).await,
             Err(_) => WsResponse::error("", StatusCode::BAD_REQUEST, "invalid utf-8"),
         },
         Message::Ping(payload) => return socket.send(Message::Pong(payload)).await.map_err(|_| ()),
@@ -268,6 +273,7 @@ async fn handle_text_request(
     router: &Router,
     hub: &crate::api::realtime::RealtimeHub,
     topics: &mut HashSet<RealtimeTopic>,
+    subject: &str,
     text: &str,
 ) -> WsResponse {
     let request = match sonic_rs::from_str::<WsRequest>(text) {
@@ -285,7 +291,7 @@ async fn handle_text_request(
             error: None,
             status: StatusCode::OK.as_u16(),
         },
-        _ => handle_proxy_request(router, request).await,
+        _ => handle_proxy_request(router, request, subject).await,
     }
 }
 
@@ -349,7 +355,7 @@ async fn subscribe_topic(
     }
 }
 
-async fn handle_proxy_request(router: &Router, request: WsRequest) -> WsResponse {
+async fn handle_proxy_request(router: &Router, request: WsRequest, subject: &str) -> WsResponse {
     if !is_allowed_event_path(&request.path) {
         return WsResponse::error(&request.id, StatusCode::BAD_REQUEST, "invalid path");
     }
@@ -358,11 +364,14 @@ async fn handle_proxy_request(router: &Router, request: WsRequest) -> WsResponse
         Ok(uri) => uri,
         Err(_) => return WsResponse::error(&request.id, StatusCode::BAD_REQUEST, "invalid path"),
     };
-    let http_request = Request::builder()
+    let mut http_request = Request::builder()
         .method(Method::GET)
         .uri(uri)
         .body(Body::empty())
         .expect("valid websocket proxy request");
+    http_request
+        .extensions_mut()
+        .insert(PrivateSubject(subject.to_owned()));
 
     let response = match router.clone().oneshot(http_request).await {
         Ok(response) => response,

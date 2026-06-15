@@ -1,5 +1,6 @@
 pub mod health;
 pub mod lines;
+pub mod private;
 pub mod ranking;
 pub mod status;
 pub mod trace;
