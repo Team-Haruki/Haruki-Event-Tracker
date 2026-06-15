@@ -24,7 +24,7 @@ impl EntityName for Entity {
 pub struct Model {
     pub time_id: i64,
     pub timestamp: i64,
-    pub status: i16,
+    pub status: i8,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveColumn)]
@@ -40,7 +40,7 @@ impl ColumnTrait for Column {
         match self {
             Self::TimeId => ColumnType::BigInteger.def(),
             Self::Timestamp => ColumnType::BigInteger.def().unique(),
-            Self::Status => ColumnType::SmallInteger.def().default(0),
+            Self::Status => ColumnType::TinyInteger.def().default(0),
         }
     }
 }

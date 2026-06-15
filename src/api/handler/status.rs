@@ -26,7 +26,7 @@ pub async fn event_status(
     let status_desc = if status == 0 { "OK" } else { "Error" };
     Ok(Json(EventStatusResponseSchema {
         timestamp,
-        status,
+        status: status.into(),
         status_desc: status_desc.to_owned(),
         time_ago,
     }))
