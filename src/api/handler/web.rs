@@ -7,7 +7,6 @@ use crate::api::extract::resolve_region_engine;
 use crate::api::json::Json;
 use crate::api::state::AppState;
 use crate::db::engine::DatabaseEngine;
-use crate::db::privacy::ensure_user_table_extensions;
 use crate::db::query::user::PublicUserIdMode;
 use crate::db::query::web::{
     WebRankingCursor, WebRankingFilter, WebTraceFilter, WebUserSearchFilter, search_rankings,
@@ -194,7 +193,9 @@ async fn prepare_web_user_id_mode(
             "web API requires privacy.uid_anonymization.enabled".into(),
         ));
     }
-    ensure_user_table_extensions(engine, server, event_id, state.anonymizer()).await?;
+    state
+        .ensure_user_table_extensions(engine, server, event_id)
+        .await?;
     Ok(PublicUserIdMode::Unique)
 }
 
