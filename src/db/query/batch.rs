@@ -73,7 +73,7 @@ pub(crate) async fn batch_get_or_create_time_ids(
         let ins = Query::insert()
             .into_table(Alias::new(table_name))
             .columns([time_id::Column::Timestamp, time_id::Column::Status])
-            .values_panic([ts.into(), status.into()])
+            .values_panic([ts.into(), i16::from(status).into()])
             .to_owned();
         tx.execute(&ins).await?;
 
