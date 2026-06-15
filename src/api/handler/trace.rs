@@ -6,6 +6,7 @@
 use std::collections::HashMap;
 
 use axum::extract::{Path, RawQuery, State};
+use futures::stream::{self, StreamExt};
 
 use crate::api::cache::{
     CacheTtl, batch_rank_suffix, rank_suffix, user_suffix, wb_batch_rank_suffix, wb_rank_suffix,
@@ -27,6 +28,68 @@ use crate::model::api::{
     UserAllRankingDataQueryResponseSchema,
 };
 
+async fn fetch_rank_trace_response(
+    engine: &crate::db::engine::DatabaseEngine,
+    event_id: i64,
+    rank: i64,
+    mode: crate::db::query::user::PublicUserIdMode,
+) -> Result<UserAllRankingDataQueryResponseSchema, ApiError> {
+    let rankings = fetch_all_rankings_by_rank(engine, event_id, rank, mode).await?;
+    if rankings.is_empty() {
+        return Err(ApiError::NotFound);
+    }
+    Ok(UserAllRankingDataQueryResponseSchema {
+        rank_data: rankings.into_iter().map(RecordedRankData::Normal).collect(),
+        user_data: None,
+    })
+}
+
+async fn fetch_wb_rank_trace_response(
+    engine: &crate::db::engine::DatabaseEngine,
+    event_id: i64,
+    rank: i64,
+    character_id: i64,
+    mode: crate::db::query::user::PublicUserIdMode,
+) -> Result<UserAllRankingDataQueryResponseSchema, ApiError> {
+    let rankings =
+        fetch_all_world_bloom_rankings_by_rank(engine, event_id, rank, character_id, mode).await?;
+    if rankings.is_empty() {
+        return Err(ApiError::NotFound);
+    }
+    Ok(UserAllRankingDataQueryResponseSchema {
+        rank_data: rankings
+            .into_iter()
+            .map(RecordedRankData::WorldBloom)
+            .collect(),
+        user_data: None,
+    })
+}
+
+fn batch_item_from_trace(
+    rank: i64,
+    response: UserAllRankingDataQueryResponseSchema,
+) -> BatchAllRankingDataItemSchema {
+    BatchAllRankingDataItemSchema {
+        rank,
+        rank_data: response.rank_data,
+    }
+}
+
+fn batch_response_from_results(
+    results: Vec<Result<Option<BatchAllRankingDataItemSchema>, ApiError>>,
+) -> Result<BatchAllRankingDataQueryResponseSchema, ApiError> {
+    let mut items = Vec::new();
+    for result in results {
+        if let Some(item) = result? {
+            items.push(item);
+        }
+    }
+    if items.is_empty() {
+        return Err(ApiError::NotFound);
+    }
+    Ok(BatchAllRankingDataQueryResponseSchema { items })
+}
+
 #[tracing::instrument(skip(state), fields(server, event_id, user_id))]
 pub async fn all_by_user(
     State(state): State<AppState>,
@@ -34,7 +97,10 @@ pub async fn all_by_user(
 ) -> Result<Json<UserAllRankingDataQueryResponseSchema>, ApiError> {
     let (region, engine) = resolve_region_engine(&state, &server)?;
     let mode = prepare_user_id_mode(&state, &engine, region, event_id).await?;
-    let fetch = async {
+    let limiter = state.query_limiter().clone();
+    let suffix = user_suffix("trace", &user_id);
+    let fetch = async move {
+        let _permit = limiter.acquire_trace(region).await?;
         let rankings = fetch_all_rankings(&engine, event_id, &user_id, mode).await?;
         let user_data = get_user_data(&engine, event_id, &user_id, mode)
             .await
@@ -53,7 +119,7 @@ pub async fn all_by_user(
             .get_or_fetch(
                 &server,
                 event_id,
-                user_suffix("trace", &user_id),
+                suffix,
                 cache.ttl(CacheTtl::TraceRank),
                 fetch,
             )
@@ -71,15 +137,10 @@ pub async fn all_by_rank(
 ) -> Result<Json<UserAllRankingDataQueryResponseSchema>, ApiError> {
     let (region, engine) = resolve_region_engine(&state, &server)?;
     let mode = prepare_user_id_mode(&state, &engine, region, event_id).await?;
-    let fetch = async {
-        let rankings = fetch_all_rankings_by_rank(&engine, event_id, rank, mode).await?;
-        if rankings.is_empty() {
-            return Err(ApiError::NotFound);
-        }
-        Ok(UserAllRankingDataQueryResponseSchema {
-            rank_data: rankings.into_iter().map(RecordedRankData::Normal).collect(),
-            user_data: None,
-        })
+    let limiter = state.query_limiter().clone();
+    let fetch = async move {
+        let _permit = limiter.acquire_trace(region).await?;
+        fetch_rank_trace_response(&engine, event_id, rank, mode).await
     };
     let response = if let Some(cache) = state.cache() {
         cache
@@ -106,9 +167,47 @@ pub async fn all_by_ranks(
     let ranks = parse_rank_query(raw_query.as_deref())?;
     let (region, engine) = resolve_region_engine(&state, &server)?;
     let mode = prepare_user_id_mode(&state, &engine, region, event_id).await?;
-    let suffix = batch_rank_suffix("trace", &ranks);
-    let fetch_ranks = ranks.clone();
-    let fetch = async {
+    let response = if let Some(cache) = state.cache() {
+        let cache = cache.clone();
+        let limiter = state.query_limiter().clone();
+        let concurrency = limiter.batch_trace_fill_concurrency();
+        let results = stream::iter(ranks.iter().copied().map(|rank| {
+            let cache = cache.clone();
+            let engine = engine.clone();
+            let limiter = limiter.clone();
+            let server = server.clone();
+            async move {
+                let fetch = async move {
+                    let _permit = limiter.acquire_trace(region).await?;
+                    fetch_rank_trace_response(&engine, event_id, rank, mode).await
+                };
+                match cache
+                    .get_or_fetch(
+                        &server,
+                        event_id,
+                        rank_suffix("trace", rank),
+                        cache.ttl(CacheTtl::TraceRank),
+                        fetch,
+                    )
+                    .await
+                {
+                    Ok(response) => Ok(Some(batch_item_from_trace(rank, response))),
+                    Err(ApiError::NotFound) => Ok(None),
+                    Err(err) => Err(err),
+                }
+            }
+        }))
+        .buffered(concurrency)
+        .collect::<Vec<_>>()
+        .await;
+
+        batch_response_from_results(results)?
+    } else {
+        let limiter = state.query_limiter().clone();
+        let _permit = limiter.acquire_trace(region).await?;
+        let suffix = batch_rank_suffix("trace", &ranks);
+        tracing::debug!(%suffix, "api cache disabled for batch trace");
+        let fetch_ranks = ranks.clone();
         let rankings = fetch_all_rankings_by_ranks(&engine, event_id, &fetch_ranks, mode).await?;
         if rankings.is_empty() {
             return Err(ApiError::NotFound);
@@ -130,20 +229,7 @@ pub async fn all_by_ranks(
             })
             .collect();
 
-        Ok(BatchAllRankingDataQueryResponseSchema { items })
-    };
-    let response = if let Some(cache) = state.cache() {
-        cache
-            .get_or_fetch(
-                &server,
-                event_id,
-                suffix,
-                cache.ttl(CacheTtl::BatchTraceRank),
-                fetch,
-            )
-            .await?
-    } else {
-        fetch.await?
+        BatchAllRankingDataQueryResponseSchema { items }
     };
     Ok(Json(response))
 }
@@ -155,7 +241,10 @@ pub async fn wb_all_by_user(
 ) -> Result<Json<UserAllRankingDataQueryResponseSchema>, ApiError> {
     let (region, engine) = resolve_region_engine(&state, &server)?;
     let mode = prepare_user_id_mode(&state, &engine, region, event_id).await?;
-    let fetch = async {
+    let limiter = state.query_limiter().clone();
+    let suffix = format!("wb:{character_id}:{}", user_suffix("trace", &user_id));
+    let fetch = async move {
+        let _permit = limiter.acquire_trace(region).await?;
         let rankings =
             fetch_all_world_bloom_rankings(&engine, event_id, &user_id, character_id, mode).await?;
         let user_data = get_user_data(&engine, event_id, &user_id, mode)
@@ -178,7 +267,7 @@ pub async fn wb_all_by_user(
             .get_or_fetch(
                 &server,
                 event_id,
-                format!("wb:{character_id}:{}", user_suffix("trace", &user_id)),
+                suffix,
                 cache.ttl(CacheTtl::TraceRank),
                 fetch,
             )
@@ -198,9 +287,47 @@ pub async fn wb_all_by_ranks(
     let ranks = parse_rank_query(raw_query.as_deref())?;
     let (region, engine) = resolve_region_engine(&state, &server)?;
     let mode = prepare_user_id_mode(&state, &engine, region, event_id).await?;
-    let suffix = wb_batch_rank_suffix("trace", character_id, &ranks);
-    let fetch_ranks = ranks.clone();
-    let fetch = async {
+    let response = if let Some(cache) = state.cache() {
+        let cache = cache.clone();
+        let limiter = state.query_limiter().clone();
+        let concurrency = limiter.batch_trace_fill_concurrency();
+        let results = stream::iter(ranks.iter().copied().map(|rank| {
+            let cache = cache.clone();
+            let engine = engine.clone();
+            let limiter = limiter.clone();
+            let server = server.clone();
+            async move {
+                let fetch = async move {
+                    let _permit = limiter.acquire_trace(region).await?;
+                    fetch_wb_rank_trace_response(&engine, event_id, rank, character_id, mode).await
+                };
+                match cache
+                    .get_or_fetch(
+                        &server,
+                        event_id,
+                        wb_rank_suffix("trace", character_id, rank),
+                        cache.ttl(CacheTtl::TraceRank),
+                        fetch,
+                    )
+                    .await
+                {
+                    Ok(response) => Ok(Some(batch_item_from_trace(rank, response))),
+                    Err(ApiError::NotFound) => Ok(None),
+                    Err(err) => Err(err),
+                }
+            }
+        }))
+        .buffered(concurrency)
+        .collect::<Vec<_>>()
+        .await;
+
+        batch_response_from_results(results)?
+    } else {
+        let limiter = state.query_limiter().clone();
+        let _permit = limiter.acquire_trace(region).await?;
+        let suffix = wb_batch_rank_suffix("trace", character_id, &ranks);
+        tracing::debug!(%suffix, "api cache disabled for batch world bloom trace");
+        let fetch_ranks = ranks.clone();
         let rankings = fetch_all_world_bloom_rankings_by_ranks(
             &engine,
             event_id,
@@ -229,20 +356,7 @@ pub async fn wb_all_by_ranks(
             })
             .collect();
 
-        Ok(BatchAllRankingDataQueryResponseSchema { items })
-    };
-    let response = if let Some(cache) = state.cache() {
-        cache
-            .get_or_fetch(
-                &server,
-                event_id,
-                suffix,
-                cache.ttl(CacheTtl::BatchTraceRank),
-                fetch,
-            )
-            .await?
-    } else {
-        fetch.await?
+        BatchAllRankingDataQueryResponseSchema { items }
     };
     Ok(Json(response))
 }
@@ -254,20 +368,10 @@ pub async fn wb_all_by_rank(
 ) -> Result<Json<UserAllRankingDataQueryResponseSchema>, ApiError> {
     let (region, engine) = resolve_region_engine(&state, &server)?;
     let mode = prepare_user_id_mode(&state, &engine, region, event_id).await?;
-    let fetch = async {
-        let rankings =
-            fetch_all_world_bloom_rankings_by_rank(&engine, event_id, rank, character_id, mode)
-                .await?;
-        if rankings.is_empty() {
-            return Err(ApiError::NotFound);
-        }
-        Ok(UserAllRankingDataQueryResponseSchema {
-            rank_data: rankings
-                .into_iter()
-                .map(RecordedRankData::WorldBloom)
-                .collect(),
-            user_data: None,
-        })
+    let limiter = state.query_limiter().clone();
+    let fetch = async move {
+        let _permit = limiter.acquire_trace(region).await?;
+        fetch_wb_rank_trace_response(&engine, event_id, rank, character_id, mode).await
     };
     let response = if let Some(cache) = state.cache() {
         cache
@@ -283,4 +387,40 @@ pub async fn wb_all_by_rank(
         fetch.await?
     };
     Ok(Json(response))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn batch_response_keeps_rank_order_and_skips_missing() {
+        let response = batch_response_from_results(vec![
+            Ok(Some(BatchAllRankingDataItemSchema {
+                rank: 3,
+                rank_data: Vec::new(),
+            })),
+            Ok(None),
+            Ok(Some(BatchAllRankingDataItemSchema {
+                rank: 1,
+                rank_data: Vec::new(),
+            })),
+        ])
+        .unwrap();
+
+        let ranks = response
+            .items
+            .into_iter()
+            .map(|item| item.rank)
+            .collect::<Vec<_>>();
+        assert_eq!(ranks, vec![3, 1]);
+    }
+
+    #[test]
+    fn batch_response_returns_not_found_when_all_missing() {
+        match batch_response_from_results(vec![Ok(None), Ok(None)]) {
+            Err(ApiError::NotFound) => {}
+            _ => panic!("expected batch response to return not found"),
+        }
+    }
 }

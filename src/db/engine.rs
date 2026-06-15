@@ -4,9 +4,11 @@ use sea_orm::{ConnectOptions, Database, DatabaseBackend, DatabaseConnection, DbE
 
 use crate::model::db_config::DbConfig;
 
-const DEFAULT_MAX_CONN: u32 = 100;
-const DEFAULT_MIN_CONN: u32 = 10;
+const DEFAULT_MAX_CONN: u32 = 20;
+const DEFAULT_MIN_CONN: u32 = 1;
 const DEFAULT_LIFETIME: Duration = Duration::from_secs(3600);
+const DEFAULT_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(3);
+const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(600);
 
 #[derive(Debug, thiserror::Error)]
 pub enum EngineError {
@@ -43,6 +45,8 @@ impl DatabaseEngine {
         opts.max_lifetime(
             parse_simple_duration(&cfg.conn_max_lifetime).unwrap_or(DEFAULT_LIFETIME),
         );
+        opts.acquire_timeout(DEFAULT_ACQUIRE_TIMEOUT);
+        opts.idle_timeout(DEFAULT_IDLE_TIMEOUT);
         opts.sqlx_logging(false);
 
         let conn = Database::connect(opts)

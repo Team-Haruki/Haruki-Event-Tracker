@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::api::cache::ApiCache;
+use crate::api::limiter::ApiQueryLimiter;
 use crate::api::private_lookup::PrivateLookupVerifier;
 use crate::api::realtime::RealtimeHub;
 use crate::api::ws_ticket::WsTicketStore;
@@ -24,6 +25,7 @@ pub struct AppState {
 struct Inner {
     dbs: HashMap<SekaiServerRegion, Arc<DatabaseEngine>>,
     cache: Option<ApiCache>,
+    query_limiter: ApiQueryLimiter,
     anonymizer: UidAnonymizer,
     private_lookup: Option<PrivateLookupVerifier>,
     realtime: RealtimeHub,
@@ -34,6 +36,7 @@ impl AppState {
     pub fn new(
         dbs: HashMap<SekaiServerRegion, Arc<DatabaseEngine>>,
         cache: Option<ApiCache>,
+        query_limiter: ApiQueryLimiter,
         anonymizer: UidAnonymizer,
         private_lookup: Option<PrivateLookupVerifier>,
         realtime: RealtimeHub,
@@ -43,6 +46,7 @@ impl AppState {
             inner: Arc::new(Inner {
                 dbs,
                 cache,
+                query_limiter,
                 anonymizer,
                 private_lookup,
                 realtime,
@@ -64,6 +68,10 @@ impl AppState {
 
     pub fn cache(&self) -> Option<&ApiCache> {
         self.inner.cache.as_ref()
+    }
+
+    pub fn query_limiter(&self) -> &ApiQueryLimiter {
+        &self.inner.query_limiter
     }
 
     pub fn anonymizer(&self) -> &UidAnonymizer {

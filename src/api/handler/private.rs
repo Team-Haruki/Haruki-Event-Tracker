@@ -161,6 +161,7 @@ pub async fn trace_by_user(
     let (region, engine) = resolve_region_engine(&state, &server)?;
     require_bound_user(&state, &subject, &query, region, &user_id).await?;
     let mode = prepare_private_user_id_mode(&state, &engine, region, event_id).await?;
+    let _permit = state.query_limiter().acquire_trace(region).await?;
     let rankings = fetch_all_rankings(&engine, event_id, &user_id, mode).await?;
     let user_data = get_user_data(&engine, event_id, &user_id, mode)
         .await
@@ -186,6 +187,7 @@ pub async fn trace_world_bloom_by_user(
     let (region, engine) = resolve_region_engine(&state, &server)?;
     require_bound_user(&state, &subject, &query, region, &user_id).await?;
     let mode = prepare_private_user_id_mode(&state, &engine, region, event_id).await?;
+    let _permit = state.query_limiter().acquire_trace(region).await?;
     let rankings =
         fetch_all_world_bloom_rankings(&engine, event_id, &user_id, character_id, mode).await?;
     let user_data = get_user_data(&engine, event_id, &user_id, mode)

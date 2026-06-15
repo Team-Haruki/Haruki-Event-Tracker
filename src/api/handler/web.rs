@@ -119,7 +119,9 @@ pub async fn user_trace(
     let mode = prepare_web_user_id_mode(&state, &engine, region, event_id).await?;
     let filter = query.into_filter()?;
     let suffix = format!("web:trace:user:{user_id}:{}", filter.cache_key());
-    let fetch = async {
+    let limiter = state.query_limiter().clone();
+    let fetch = async move {
+        let _permit = limiter.acquire_trace(region).await?;
         let rank_data = search_user_trace(&engine, event_id, &user_id, &filter, mode).await?;
         not_found_if_empty(&rank_data)?;
         Ok(UserAllRankingDataQueryResponseSchema {
@@ -144,7 +146,9 @@ pub async fn world_bloom_user_trace(
         "web:wb:{character_id}:trace:user:{user_id}:{}",
         filter.cache_key()
     );
-    let fetch = async {
+    let limiter = state.query_limiter().clone();
+    let fetch = async move {
+        let _permit = limiter.acquire_trace(region).await?;
         let rank_data =
             search_world_bloom_user_trace(&engine, event_id, character_id, &user_id, &filter, mode)
                 .await?;

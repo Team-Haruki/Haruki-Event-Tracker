@@ -34,10 +34,21 @@ api_cache:
   redis_url: ""              # 例如 redis://:password@redis:6379/0；留空复用 redis.host/port/password
   default_ttl_secs: 2
   latest_rank_ttl_secs: 1
-  trace_rank_ttl_secs: 3
-  batch_trace_rank_ttl_secs: 3
+  trace_rank_ttl_secs: 60
+  batch_trace_rank_ttl_secs: 60 # 兼容旧配置；开启缓存时 batch trace 会拆成单 rank cache
   user_data_ttl_secs: 30
+  negative_ttl_secs: 10       # 404 rank 的短期负缓存；0 表示禁用
   max_value_bytes: 1048576
+
+# ============================================================================
+# API 查询限流配置
+# ============================================================================
+# 用途：限制重型 trace 查询的并发，避免缓存 miss 或 dirty 窗口把数据库打满。
+api_query:
+  trace_per_server_max_concurrency: 8
+  trace_global_max_concurrency: 32
+  acquire_timeout_ms: 1500
+  batch_trace_fill_concurrency: 4
 
 # ============================================================================
 # Toolbox 私有查询校验配置
@@ -132,8 +143,8 @@ servers:
       dsn: "postgres://haruki_user:YOUR_PASSWORD_HERE@localhost:5432/haruki_tracker_jp?sslmode=disable"
 
       # 连接池配置
-      max_open_conns: 100    # 最大打开连接数（建议 10-100）
-      max_idle_conns: 10     # 最大空闲连接数（建议为 max_open_conns 的 10%）
+      max_open_conns: 20     # 最大打开连接数（建议 10-50；多区服同库时保持保守）
+      max_idle_conns: 1      # 最小/空闲连接数（Rust 版本映射为 min_connections）
       conn_max_lifetime: 1h  # 连接最大生命周期（支持：1h, 30m, 3600s）
 
       # 性能优化配置
@@ -173,8 +184,8 @@ servers:
       enabled: true
       dialect: mysql         # 使用 MySQL 数据库
       dsn: "mysql://username:password@localhost:3306/haruki_tracker_en?charset=utf8mb4"
-      max_open_conns: 100
-      max_idle_conns: 10
+      max_open_conns: 20
+      max_idle_conns: 1
       conn_max_lifetime: 1h
       prepare_stmt: true
       disable_fk_migrate: true
@@ -208,8 +219,8 @@ servers:
       enabled: true
       dialect: mysql
       dsn: "mysql://username:password@localhost:3306/haruki_tracker_tw?charset=utf8mb4"
-      max_open_conns: 100
-      max_idle_conns: 10
+      max_open_conns: 20
+      max_idle_conns: 1
       conn_max_lifetime: 1h
       prepare_stmt: true
       disable_fk_migrate: true
@@ -243,8 +254,8 @@ servers:
       enabled: true
       dialect: mysql
       dsn: "mysql://username:password@localhost:3306/haruki_tracker_kr?charset=utf8mb4"
-      max_open_conns: 100
-      max_idle_conns: 10
+      max_open_conns: 20
+      max_idle_conns: 1
       conn_max_lifetime: 1h
       prepare_stmt: true
       disable_fk_migrate: true
@@ -278,8 +289,8 @@ servers:
       enabled: true
       dialect: postgres      # 使用 PostgreSQL 数据库
       dsn: "postgres://haruki_user:YOUR_PASSWORD_HERE@localhost:5432/haruki_tracker_cn?sslmode=disable"
-      max_open_conns: 100
-      max_idle_conns: 10
+      max_open_conns: 20
+      max_idle_conns: 1
       conn_max_lifetime: 1h
       prepare_stmt: true
       disable_fk_migrate: true
@@ -317,9 +328,9 @@ servers:
 #    - 当前镜像默认编译 OpenDAL fs / file / http(s) / s3 service。
 #
 # 4. 性能调优建议：
-#    - 高并发场景：增加 max_open_conns 到 200-500
-#    - 低负载场景：减少 max_open_conns 到 10-50
-#    - max_idle_conns 建议设置为 max_open_conns 的 10-20%
+#    - 高并发场景：优先启用 api_cache/api_query，再按 MySQL max_connections 调整 max_open_conns
+#    - 单实例多区服生产建议先保持 max_open_conns 12-20，避免连接数吃满
+#    - MySQL 热 trace 查询较多时，innodb_buffer_pool_size 建议至少覆盖活跃事件索引
 #
 # 5. 日志级别选择：
 #    - 开发环境：使用 info 或 warn

@@ -50,6 +50,7 @@ pub struct ApiCacheConfig {
     pub trace_rank_ttl_secs: u64,
     pub batch_trace_rank_ttl_secs: u64,
     pub user_data_ttl_secs: u64,
+    pub negative_ttl_secs: u64,
     pub max_value_bytes: usize,
 }
 
@@ -60,10 +61,31 @@ impl Default for ApiCacheConfig {
             redis_url: String::new(),
             default_ttl_secs: 2,
             latest_rank_ttl_secs: 1,
-            trace_rank_ttl_secs: 3,
-            batch_trace_rank_ttl_secs: 3,
+            trace_rank_ttl_secs: 60,
+            batch_trace_rank_ttl_secs: 60,
             user_data_ttl_secs: 30,
+            negative_ttl_secs: 10,
             max_value_bytes: 1024 * 1024,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct ApiQueryConfig {
+    pub trace_per_server_max_concurrency: usize,
+    pub trace_global_max_concurrency: usize,
+    pub acquire_timeout_ms: u64,
+    pub batch_trace_fill_concurrency: usize,
+}
+
+impl Default for ApiQueryConfig {
+    fn default() -> Self {
+        Self {
+            trace_per_server_max_concurrency: 8,
+            trace_global_max_concurrency: 32,
+            acquire_timeout_ms: 1500,
+            batch_trace_fill_concurrency: 4,
         }
     }
 }
@@ -131,6 +153,7 @@ pub struct ServerConfig {
 pub struct Config {
     pub redis: RedisConfig,
     pub api_cache: ApiCacheConfig,
+    pub api_query: ApiQueryConfig,
     pub privacy: PrivacyConfig,
     pub toolbox: ToolboxConfig,
     pub backend: BackendConfig,

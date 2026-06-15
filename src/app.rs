@@ -15,6 +15,7 @@ use tokio::sync::Mutex;
 use tokio_cron_scheduler::{Job, JobScheduler, JobSchedulerError};
 
 use crate::api::cache::ApiCache;
+use crate::api::limiter::ApiQueryLimiter;
 use crate::api::private_lookup::PrivateLookupVerifier;
 use crate::api::realtime::RealtimeHub;
 use crate::api::state::AppState;
@@ -169,9 +170,11 @@ pub async fn build(cfg: &Config) -> Result<AppContext, BootstrapError> {
         tracing::info!("scheduler started");
     }
 
+    let query_limiter = ApiQueryLimiter::new(cfg.api_query.clone(), dbs.keys().copied());
     let state = AppState::new(
         dbs.clone(),
         api_cache,
+        query_limiter,
         anonymizer,
         private_lookup,
         realtime,
