@@ -56,15 +56,15 @@ impl PrivateLookupVerifier {
         let auth_proxy_secret = normalize_optional_header_value(&config.auth_proxy_secret);
         let mut headers = HeaderMap::new();
         headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
-        if let Ok(value) = HeaderValue::from_str(config.authorization.trim()) {
-            if !value.as_bytes().is_empty() {
-                headers.insert(AUTHORIZATION, value);
-            }
+        if let Ok(value) = HeaderValue::from_str(config.authorization.trim())
+            && !value.as_bytes().is_empty()
+        {
+            headers.insert(AUTHORIZATION, value);
         }
-        if let Ok(value) = HeaderValue::from_str(config.user_agent.trim()) {
-            if !value.as_bytes().is_empty() {
-                headers.insert(USER_AGENT, value);
-            }
+        if let Ok(value) = HeaderValue::from_str(config.user_agent.trim())
+            && !value.as_bytes().is_empty()
+        {
+            headers.insert(USER_AGENT, value);
         }
 
         let client = reqwest::Client::builder()
@@ -90,10 +90,10 @@ impl PrivateLookupVerifier {
             return Err(PrivateLookupError::Unauthorized);
         }
         let owner = owner.map(str::trim).filter(|value| !value.is_empty());
-        if let Some(owner) = owner {
-            if owner != subject {
-                return Err(PrivateLookupError::Forbidden);
-            }
+        if let Some(owner) = owner
+            && owner != subject
+        {
+            return Err(PrivateLookupError::Forbidden);
         }
 
         let url = format!("{}/api/user/me", self.base_url);
