@@ -24,6 +24,7 @@ const OATHKEEPER_SUBJECT_HEADERS: &[&str] = &[
     "x-authenticated-user-id",
     "x-oathkeeper-subject",
     "x-ory-subject",
+    "x-kratos-identity-id",
     "x-user",
 ];
 
