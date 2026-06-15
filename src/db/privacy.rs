@@ -42,7 +42,10 @@ pub async fn ensure_user_table_extensions(
     Ok(())
 }
 
-async fn ensure_profile_columns(engine: &DatabaseEngine, table: &'static str) -> Result<(), DbErr> {
+pub async fn ensure_profile_columns(
+    engine: &DatabaseEngine,
+    table: &'static str,
+) -> Result<(), DbErr> {
     for (column, ty) in [
         ("card_id", "BIGINT"),
         ("card_level", "BIGINT"),

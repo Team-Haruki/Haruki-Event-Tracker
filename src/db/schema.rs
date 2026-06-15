@@ -3,6 +3,7 @@ use sea_orm::{ConnectionTrait, DatabaseBackend, DbErr, Schema};
 
 use crate::db::engine::DatabaseEngine;
 use crate::db::entity::{event, event_users, time_id, world_bloom};
+use crate::db::privacy::ensure_profile_columns;
 use crate::db::table_name::{TableKind, intern};
 use crate::model::enums::SekaiServerRegion;
 
@@ -47,6 +48,7 @@ pub async fn create_event_tables(
         stmt.if_not_exists();
         conn.execute(&stmt).await?;
     }
+    ensure_profile_columns(engine, intern(TableKind::EventUsers, event_id)).await?;
     create_query_indexes(engine, event_id, is_world_bloom).await?;
     Ok(())
 }
