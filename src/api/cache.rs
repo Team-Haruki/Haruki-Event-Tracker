@@ -1,10 +1,13 @@
 use std::collections::HashMap;
 use std::future::Future;
+use std::io::Write;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
+use flate2::Compression;
+use flate2::write::GzEncoder;
 use redis::AsyncCommands;
 use redis::aio::ConnectionManager;
 use serde::Serialize;
@@ -67,6 +70,34 @@ pub enum CacheTtl {
     TraceRank,
     BatchTraceRank,
     UserData,
+}
+
+#[derive(Clone)]
+pub struct CachedJson {
+    pub bytes: Bytes,
+    pub encoding: CachedJsonEncoding,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CachedJsonEncoding {
+    Identity,
+    Gzip,
+}
+
+impl CachedJson {
+    fn identity(bytes: Bytes) -> Self {
+        Self {
+            bytes,
+            encoding: CachedJsonEncoding::Identity,
+        }
+    }
+
+    fn gzip(bytes: Bytes) -> Self {
+        Self {
+            bytes,
+            encoding: CachedJsonEncoding::Gzip,
+        }
+    }
 }
 
 impl ApiCache {
@@ -133,6 +164,34 @@ impl ApiCache {
             encode_json_bytes(&value)
         };
         self.get_or_fetch_bytes(server, event_id, suffix, ttl_secs, fetch_bytes)
+            .await
+    }
+
+    #[tracing::instrument(skip(self, fetch), fields(server, event_id, suffix, prefer_gzip))]
+    pub async fn get_or_fetch_encoded_json<T, Fut>(
+        &self,
+        server: &str,
+        event_id: i64,
+        suffix: String,
+        ttl_secs: u64,
+        prefer_gzip: bool,
+        fetch: Fut,
+    ) -> Result<CachedJson, ApiError>
+    where
+        T: Serialize,
+        Fut: Future<Output = Result<T, ApiError>>,
+    {
+        let fetch_bytes = async move {
+            let value = fetch.await?;
+            encode_json_bytes(&value)
+        };
+        if !prefer_gzip || !self.cfg.precompress_gzip_enabled {
+            return self
+                .get_or_fetch_bytes(server, event_id, suffix, ttl_secs, fetch_bytes)
+                .await
+                .map(CachedJson::identity);
+        }
+        self.get_or_fetch_precompressed_bytes(server, event_id, suffix, ttl_secs, fetch_bytes)
             .await
     }
 
@@ -275,6 +334,207 @@ impl ApiCache {
         .await
     }
 
+    async fn get_or_fetch_precompressed_bytes<Fut>(
+        &self,
+        server: &str,
+        event_id: i64,
+        suffix: String,
+        ttl_secs: u64,
+        fetch: Fut,
+    ) -> Result<CachedJson, ApiError>
+    where
+        Fut: Future<Output = Result<Bytes, ApiError>>,
+    {
+        let control_key = control_cache_key(server, event_id);
+        if ttl_secs == 0 {
+            return self.encode_response(fetch.await?, None).await;
+        }
+
+        if let Some(control) = self.l1.get_control(&control_key).await {
+            incr(&CACHE_STATS.l1_control_hit);
+            if control.dirty {
+                incr(&CACHE_STATS.dirty_bypass);
+                tracing::debug!(cache_status = "dirty_bypass", "api cache dirty bypass");
+                return self
+                    .fetch_encoded_with_singleflight(
+                        gzip_flight_key(server, event_id, control.epoch, &suffix),
+                        fetch,
+                        None,
+                    )
+                    .await;
+            }
+
+            let key = value_key(server, event_id, control.epoch, &suffix);
+            let gzip = gzip_key(&key);
+            if let Some(bytes) = self.l1.get_value(&gzip).await {
+                incr(&CACHE_STATS.l1_hit);
+                tracing::debug!(cache_status = "l1_gzip_hit", "api cache L1 gzip hit");
+                return Ok(CachedJson::gzip(bytes));
+            }
+            if let Some(bytes) = self.l1.get_value(&key).await {
+                incr(&CACHE_STATS.l1_hit);
+                tracing::debug!(cache_status = "l1_hit", "api cache L1 hit, building gzip");
+                return self
+                    .encode_response(
+                        bytes,
+                        Some(CacheWriteContext {
+                            server: server.to_owned(),
+                            event_id,
+                            epoch: control.epoch,
+                            value_key: key,
+                            negative_key: negative_key(server, event_id, control.epoch, &suffix),
+                            ttl_secs,
+                        }),
+                    )
+                    .await;
+            }
+
+            return self
+                .lookup_encoded_with_singleflight(
+                    gzip_lookup_flight_key(server, event_id, control.epoch, &suffix),
+                    async {
+                        match self.read_l2_encoded(&key, &gzip).await {
+                            Ok(L2EncodedRead::Gzip(bytes)) => {
+                                incr(&CACHE_STATS.l2_hit);
+                                tracing::debug!(
+                                    cache_status = "l2_gzip_hit",
+                                    "api cache L2 gzip hit"
+                                );
+                                self.store_l1_value(gzip, bytes.clone()).await;
+                                Ok(CachedJson::gzip(bytes))
+                            }
+                            Ok(L2EncodedRead::Identity(bytes)) => {
+                                incr(&CACHE_STATS.l2_hit);
+                                tracing::debug!(
+                                    cache_status = "l2_hit",
+                                    "api cache L2 hit, building gzip"
+                                );
+                                self.store_l1_value(key.clone(), bytes.clone()).await;
+                                self.encode_response(
+                                    bytes,
+                                    Some(CacheWriteContext {
+                                        server: server.to_owned(),
+                                        event_id,
+                                        epoch: control.epoch,
+                                        value_key: key,
+                                        negative_key: negative_key(
+                                            server,
+                                            event_id,
+                                            control.epoch,
+                                            &suffix,
+                                        ),
+                                        ttl_secs,
+                                    }),
+                                )
+                                .await
+                            }
+                            Ok(L2EncodedRead::NotFound) => {
+                                incr(&CACHE_STATS.l2_not_found);
+                                tracing::debug!(
+                                    cache_status = "l2_not_found",
+                                    "api cache negative hit"
+                                );
+                                Err(ApiError::NotFound)
+                            }
+                            Ok(L2EncodedRead::Miss) => {
+                                incr(&CACHE_STATS.l2_miss);
+                                tracing::debug!(cache_status = "l2_miss", "api cache miss");
+                                self.fetch_and_maybe_cache_encoded(
+                                    fetch,
+                                    Some(CacheWriteContext {
+                                        server: server.to_owned(),
+                                        event_id,
+                                        epoch: control.epoch,
+                                        value_key: key,
+                                        negative_key: negative_key(
+                                            server,
+                                            event_id,
+                                            control.epoch,
+                                            &suffix,
+                                        ),
+                                        ttl_secs,
+                                    }),
+                                )
+                                .await
+                            }
+                            Err(err) => {
+                                incr(&CACHE_STATS.l2_timeout);
+                                tracing::warn!(%err, "api cache encoded read failed");
+                                self.encode_response(fetch.await?, None).await
+                            }
+                        }
+                    },
+                )
+                .await;
+        }
+
+        self.lookup_encoded_with_singleflight(
+            gzip_lookup_flight_key(server, event_id, -1, &suffix),
+            async {
+                match self.read_l2_combined(server, event_id, &suffix).await {
+                    Ok(L2CombinedRead::Dirty { epoch }) => {
+                        self.store_l1_control(control_key, epoch, true).await;
+                        incr(&CACHE_STATS.dirty_bypass);
+                        tracing::debug!(cache_status = "dirty_bypass", "api cache dirty bypass");
+                        self.fetch_encoded_with_singleflight(
+                            gzip_flight_key(server, event_id, epoch, &suffix),
+                            fetch,
+                            None,
+                        )
+                        .await
+                    }
+                    Ok(L2CombinedRead::Hit { epoch, key, bytes }) => {
+                        self.store_l1_control(control_key, epoch, false).await;
+                        self.store_l1_value(key.clone(), bytes.clone()).await;
+                        incr(&CACHE_STATS.l2_hit);
+                        tracing::debug!(cache_status = "l2_hit", "api cache L2 hit");
+                        self.encode_response(
+                            bytes,
+                            Some(CacheWriteContext {
+                                server: server.to_owned(),
+                                event_id,
+                                epoch,
+                                value_key: key,
+                                negative_key: negative_key(server, event_id, epoch, &suffix),
+                                ttl_secs,
+                            }),
+                        )
+                        .await
+                    }
+                    Ok(L2CombinedRead::NotFound { epoch }) => {
+                        self.store_l1_control(control_key, epoch, false).await;
+                        incr(&CACHE_STATS.l2_not_found);
+                        tracing::debug!(cache_status = "l2_not_found", "api cache negative hit");
+                        Err(ApiError::NotFound)
+                    }
+                    Ok(L2CombinedRead::Miss { epoch, key }) => {
+                        self.store_l1_control(control_key, epoch, false).await;
+                        incr(&CACHE_STATS.l2_miss);
+                        tracing::debug!(cache_status = "l2_miss", "api cache miss");
+                        self.fetch_and_maybe_cache_encoded(
+                            fetch,
+                            Some(CacheWriteContext {
+                                server: server.to_owned(),
+                                event_id,
+                                epoch,
+                                value_key: key,
+                                negative_key: negative_key(server, event_id, epoch, &suffix),
+                                ttl_secs,
+                            }),
+                        )
+                        .await
+                    }
+                    Err(err) => {
+                        incr(&CACHE_STATS.l2_timeout);
+                        tracing::warn!(%err, "api cache combined read failed");
+                        self.encode_response(fetch.await?, None).await
+                    }
+                }
+            },
+        )
+        .await
+    }
+
     async fn lookup_with_singleflight<Fut>(
         &self,
         flight_key: String,
@@ -342,6 +602,75 @@ impl ApiCache {
         }
     }
 
+    async fn lookup_encoded_with_singleflight<Fut>(
+        &self,
+        flight_key: String,
+        lookup: Fut,
+    ) -> Result<CachedJson, ApiError>
+    where
+        Fut: Future<Output = Result<CachedJson, ApiError>>,
+    {
+        match self.singleflight.begin(flight_key.clone()).await {
+            Flight::Waiter(entry) => {
+                incr(&CACHE_STATS.lookup_singleflight_wait);
+                tracing::debug!(
+                    cache_status = "lookup_singleflight_wait",
+                    "api cache waiting for in-flight encoded lookup"
+                );
+                if let Some(value) = SingleFlight::wait_cached_json(entry).await {
+                    return value;
+                }
+                tracing::debug!(
+                    cache_status = "lookup_singleflight_retry",
+                    "api cache in-flight encoded lookup was not shareable"
+                );
+                lookup.await
+            }
+            Flight::Owner(entry) => {
+                let result = lookup.await;
+                let shared = shared_cached_json_result(&result);
+                self.singleflight.finish(&flight_key, entry, shared).await;
+                result
+            }
+        }
+    }
+
+    async fn fetch_encoded_with_singleflight<Fut>(
+        &self,
+        flight_key: String,
+        fetch: Fut,
+        write_context: Option<CacheWriteContext>,
+    ) -> Result<CachedJson, ApiError>
+    where
+        Fut: Future<Output = Result<Bytes, ApiError>>,
+    {
+        match self.singleflight.begin(flight_key.clone()).await {
+            Flight::Waiter(entry) => {
+                incr(&CACHE_STATS.singleflight_wait);
+                tracing::debug!(
+                    cache_status = "singleflight_wait",
+                    "api cache waiting for in-flight encoded fetch"
+                );
+                if let Some(value) = SingleFlight::wait_cached_json(entry).await {
+                    return value;
+                }
+                tracing::debug!(
+                    cache_status = "singleflight_retry",
+                    "api cache in-flight encoded fetch was not shareable"
+                );
+                self.encode_response(fetch.await?, None).await
+            }
+            Flight::Owner(entry) => {
+                let result = self
+                    .fetch_and_maybe_cache_encoded(fetch, write_context)
+                    .await;
+                let shared = shared_cached_json_result(&result);
+                self.singleflight.finish(&flight_key, entry, shared).await;
+                result
+            }
+        }
+    }
+
     async fn fetch_and_maybe_cache_bytes<Fut>(
         &self,
         fetch: Fut,
@@ -400,6 +729,95 @@ impl ApiCache {
         Ok(bytes)
     }
 
+    async fn fetch_and_maybe_cache_encoded<Fut>(
+        &self,
+        fetch: Fut,
+        write_context: Option<CacheWriteContext>,
+    ) -> Result<CachedJson, ApiError>
+    where
+        Fut: Future<Output = Result<Bytes, ApiError>>,
+    {
+        let result = fetch.await;
+        if matches!(result, Err(ApiError::NotFound)) {
+            if let Some(ctx) = write_context
+                && self.cfg.negative_ttl_secs > 0
+            {
+                match self
+                    .write_l2_if_clean(
+                        &ctx,
+                        &ctx.negative_key,
+                        Bytes::from_static(b"1"),
+                        self.cfg.negative_ttl_secs,
+                    )
+                    .await
+                {
+                    Ok(true) => {}
+                    Ok(false) => {}
+                    Err(err) => tracing::warn!(%err, "api cache negative write failed"),
+                }
+            }
+            return result.map(CachedJson::identity);
+        }
+
+        let bytes = result?;
+        if bytes.len() > self.cfg.max_value_bytes {
+            tracing::debug!(
+                cache_status = "too_large",
+                bytes = bytes.len(),
+                max = self.cfg.max_value_bytes,
+                "api cache value too large"
+            );
+            return self.encode_response(bytes, None).await;
+        }
+
+        let Some(ctx) = write_context else {
+            return self.encode_response(bytes, None).await;
+        };
+        let encoded = self
+            .encode_response(bytes.clone(), Some(ctx.clone()))
+            .await?;
+        match self
+            .write_l2_if_clean(&ctx, &ctx.value_key, bytes.clone(), ctx.ttl_secs)
+            .await
+        {
+            Ok(true) => {
+                self.store_l1_value(ctx.value_key.clone(), bytes).await;
+                if encoded.encoding == CachedJsonEncoding::Gzip {
+                    self.store_l1_value(gzip_key(&ctx.value_key), encoded.bytes.clone())
+                        .await;
+                }
+            }
+            Ok(false) => {}
+            Err(err) => tracing::warn!(%err, "api cache write failed"),
+        }
+        Ok(encoded)
+    }
+
+    async fn encode_response(
+        &self,
+        bytes: Bytes,
+        write_context: Option<CacheWriteContext>,
+    ) -> Result<CachedJson, ApiError> {
+        if bytes.len() < self.cfg.precompress_min_bytes {
+            return Ok(CachedJson::identity(bytes));
+        }
+        let gzip = gzip_bytes(&bytes, self.cfg.gzip_level)?;
+        if let Some(ctx) = write_context {
+            match self
+                .write_l2_if_clean(&ctx, &gzip_key(&ctx.value_key), gzip.clone(), ctx.ttl_secs)
+                .await
+            {
+                Ok(true) => {
+                    self.store_l1_value(gzip_key(&ctx.value_key), gzip.clone())
+                        .await
+                }
+                Ok(false) => {}
+                Err(err) => tracing::warn!(%err, "api cache gzip write failed"),
+            }
+        }
+        Ok(CachedJson::gzip(gzip))
+    }
+
     async fn read_l2_combined(
         &self,
         server: &str,
@@ -446,6 +864,27 @@ impl ApiCache {
             Ok(L2ValueRead::NotFound)
         } else {
             Ok(L2ValueRead::Miss)
+        }
+    }
+
+    async fn read_l2_encoded(
+        &self,
+        key: &str,
+        gzip: &str,
+    ) -> Result<L2EncodedRead, redis::RedisError> {
+        let mut conn = self.conns.connection();
+        let mut pipe = redis::pipe();
+        pipe.get(gzip).get(key).exists(format!("{key}:not_found"));
+        let fut = pipe.query_async::<(Option<Vec<u8>>, Option<Vec<u8>>, bool)>(&mut conn);
+        let (gzip, value, negative) = self.with_timeout(fut).await?;
+        if let Some(bytes) = gzip {
+            Ok(L2EncodedRead::Gzip(Bytes::from(bytes)))
+        } else if let Some(bytes) = value {
+            Ok(L2EncodedRead::Identity(Bytes::from(bytes)))
+        } else if negative {
+            Ok(L2EncodedRead::NotFound)
+        } else {
+            Ok(L2EncodedRead::Miss)
         }
     }
 
@@ -649,6 +1088,13 @@ enum L2ValueRead {
     Miss,
 }
 
+enum L2EncodedRead {
+    Gzip(Bytes),
+    Identity(Bytes),
+    NotFound,
+    Miss,
+}
+
 #[derive(Clone)]
 struct CacheWriteContext {
     server: String,
@@ -661,7 +1107,17 @@ struct CacheWriteContext {
 
 fn shared_fetch_bytes_result(result: &Result<Bytes, ApiError>) -> Option<SharedFetchResult> {
     match result {
-        Ok(bytes) => Some(SharedFetchResult::Value(bytes.clone())),
+        Ok(bytes) => Some(SharedFetchResult::Value(CachedJson::identity(
+            bytes.clone(),
+        ))),
+        Err(ApiError::NotFound) => Some(SharedFetchResult::NotFound),
+        Err(_) => None,
+    }
+}
+
+fn shared_cached_json_result(result: &Result<CachedJson, ApiError>) -> Option<SharedFetchResult> {
+    match result {
+        Ok(value) => Some(SharedFetchResult::Value(value.clone())),
         Err(ApiError::NotFound) => Some(SharedFetchResult::NotFound),
         Err(_) => None,
     }
@@ -671,6 +1127,18 @@ fn encode_json_bytes<T: Serialize>(value: &T) -> Result<Bytes, ApiError> {
     sonic_rs::to_vec(value).map(Bytes::from).map_err(|err| {
         tracing::error!(?err, "json encode error");
         ApiError::ServiceUnavailable("json encode error".into())
+    })
+}
+
+fn gzip_bytes(bytes: &[u8], level: u32) -> Result<Bytes, ApiError> {
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::new(level.min(9)));
+    encoder.write_all(bytes).map_err(|err| {
+        tracing::warn!(%err, "gzip encode error");
+        ApiError::ServiceUnavailable("gzip encode error".into())
+    })?;
+    encoder.finish().map(Bytes::from).map_err(|err| {
+        tracing::warn!(%err, "gzip finish error");
+        ApiError::ServiceUnavailable("gzip encode error".into())
     })
 }
 
@@ -696,7 +1164,7 @@ enum Flight {
 }
 
 enum SharedFetchResult {
-    Value(Bytes),
+    Value(CachedJson),
     NotFound,
 }
 
@@ -743,7 +1211,24 @@ impl SingleFlight {
                 let state = entry.state.lock().await;
                 if state.done {
                     return match &state.result {
-                        Some(SharedFetchResult::Value(bytes)) => Some(Ok(bytes.clone())),
+                        Some(SharedFetchResult::Value(value)) => Some(Ok(value.bytes.clone())),
+                        Some(SharedFetchResult::NotFound) => Some(Err(ApiError::NotFound)),
+                        None => None,
+                    };
+                }
+            }
+            notified.await;
+        }
+    }
+
+    async fn wait_cached_json(entry: Arc<InFlightEntry>) -> Option<Result<CachedJson, ApiError>> {
+        loop {
+            let notified = entry.notify.notified();
+            {
+                let state = entry.state.lock().await;
+                if state.done {
+                    return match &state.result {
+                        Some(SharedFetchResult::Value(value)) => Some(Ok(value.clone())),
                         Some(SharedFetchResult::NotFound) => Some(Err(ApiError::NotFound)),
                         None => None,
                     };
@@ -801,6 +1286,10 @@ fn negative_key(server: &str, event_id: i64, epoch: i64, suffix: &str) -> String
     format!("{}:not_found", value_key(server, event_id, epoch, suffix))
 }
 
+fn gzip_key(value_key: &str) -> String {
+    format!("{value_key}:gz")
+}
+
 fn dirty_flight_key(server: &str, event_id: i64, epoch: i64, suffix: &str) -> String {
     format!(
         "{base}:dirty:v{epoch}:{suffix}",
@@ -811,6 +1300,20 @@ fn dirty_flight_key(server: &str, event_id: i64, epoch: i64, suffix: &str) -> St
 fn lookup_flight_key(server: &str, event_id: i64, epoch: i64, suffix: &str) -> String {
     format!(
         "{base}:lookup:v{epoch}:{suffix}",
+        base = base_key(server, event_id)
+    )
+}
+
+fn gzip_flight_key(server: &str, event_id: i64, epoch: i64, suffix: &str) -> String {
+    format!(
+        "{base}:gzip:v{epoch}:{suffix}",
+        base = base_key(server, event_id)
+    )
+}
+
+fn gzip_lookup_flight_key(server: &str, event_id: i64, epoch: i64, suffix: &str) -> String {
+    format!(
+        "{base}:gzip_lookup:v{epoch}:{suffix}",
         base = base_key(server, event_id)
     )
 }
@@ -980,8 +1483,8 @@ mod tests {
             .finish(
                 &key,
                 owner,
-                Some(SharedFetchResult::Value(Bytes::from_static(
-                    b"{\"ok\":true}",
+                Some(SharedFetchResult::Value(CachedJson::identity(
+                    Bytes::from_static(b"{\"ok\":true}"),
                 ))),
             )
             .await;
@@ -1008,5 +1511,51 @@ mod tests {
             .await;
 
         assert!(matches!(task.await.unwrap(), Err(ApiError::NotFound)));
+    }
+
+    #[test]
+    fn gzip_bytes_roundtrips_json() {
+        let source = Bytes::from_static(br#"{"ok":true,"items":[1,2,3]}"#);
+        let encoded = gzip_bytes(&source, 1).unwrap();
+        assert!(encoded.len() > 10);
+
+        let mut decoder = flate2::read::GzDecoder::new(encoded.as_ref());
+        let mut decoded = Vec::new();
+        std::io::Read::read_to_end(&mut decoder, &mut decoded).unwrap();
+        assert_eq!(decoded, source.as_ref());
+    }
+
+    #[tokio::test]
+    async fn singleflight_shares_gzip_cached_json() {
+        let singleflight = SingleFlight::default();
+        let key = "trace:rank:1:gzip".to_owned();
+        let owner = match singleflight.begin(key.clone()).await {
+            Flight::Owner(entry) => entry,
+            Flight::Waiter(_) => panic!("first caller should own the flight"),
+        };
+        let waiter = match singleflight.begin(key.clone()).await {
+            Flight::Waiter(entry) => entry,
+            Flight::Owner(_) => panic!("second caller should wait on the flight"),
+        };
+
+        let task = tokio::spawn(async move {
+            SingleFlight::wait_cached_json(waiter)
+                .await
+                .unwrap()
+                .unwrap()
+        });
+        singleflight
+            .finish(
+                &key,
+                owner,
+                Some(SharedFetchResult::Value(CachedJson::gzip(
+                    Bytes::from_static(b"gzipped"),
+                ))),
+            )
+            .await;
+
+        let shared = task.await.unwrap();
+        assert_eq!(shared.encoding, CachedJsonEncoding::Gzip);
+        assert_eq!(shared.bytes, Bytes::from_static(b"gzipped"));
     }
 }

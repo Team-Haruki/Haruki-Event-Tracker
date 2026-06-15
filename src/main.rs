@@ -38,6 +38,7 @@ async fn main() -> ExitCode {
         env!("CARGO_PKG_VERSION")
     );
     tracing::info!("Powered by Haruki Dev Team");
+    log_open_file_limit();
     haruki_event_tracker::api::stats::spawn_aggregation_logger();
 
     let ctx = match app::build(&cfg).await {
@@ -143,3 +144,21 @@ async fn resolve_addr(target: &str) -> Result<SocketAddr, ()> {
         }
     }
 }
+
+#[cfg(target_os = "linux")]
+fn log_open_file_limit() {
+    match std::fs::read_to_string("/proc/self/limits") {
+        Ok(limits) => {
+            if let Some(line) = limits
+                .lines()
+                .find(|line| line.starts_with("Max open files"))
+            {
+                tracing::info!(limit = %line, "process open file limit");
+            }
+        }
+        Err(err) => tracing::warn!(%err, "failed to read process open file limit"),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn log_open_file_limit() {}

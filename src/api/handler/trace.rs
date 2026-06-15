@@ -6,15 +6,18 @@
 use std::collections::HashMap;
 
 use axum::extract::{Path, RawQuery, State};
+use axum::http::HeaderMap;
+use axum::http::header::ACCEPT_ENCODING;
 use bytes::Bytes;
 use futures::stream::{self, StreamExt};
 
 use crate::api::cache::{
-    CacheTtl, batch_rank_suffix, rank_suffix, user_suffix, wb_batch_rank_suffix, wb_rank_suffix,
+    CacheTtl, CachedJsonEncoding, batch_rank_suffix, rank_suffix, user_suffix,
+    wb_batch_rank_suffix, wb_rank_suffix,
 };
 use crate::api::error::ApiError;
 use crate::api::extract::{parse_rank_query, prepare_user_id_mode, resolve_region_engine};
-use crate::api::json::{Json, RawJson};
+use crate::api::json::{EncodedJson, Json, RawJson};
 use crate::api::state::AppState;
 use crate::db::query::ranking::{
     fetch_all_rankings, fetch_all_rankings_by_rank, fetch_all_rankings_by_ranks,
@@ -100,11 +103,31 @@ fn raw_json<T: serde::Serialize>(value: &T) -> Result<RawJson, ApiError> {
         })
 }
 
+fn accepts_gzip(headers: &HeaderMap) -> bool {
+    headers
+        .get(ACCEPT_ENCODING)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| {
+            value
+                .split(',')
+                .filter_map(|part| part.split(';').next())
+                .any(|encoding| encoding.trim().eq_ignore_ascii_case("gzip"))
+        })
+}
+
+fn encoded_json(bytes: crate::api::cache::CachedJson) -> EncodedJson {
+    match bytes.encoding {
+        CachedJsonEncoding::Identity => EncodedJson::identity(bytes.bytes),
+        CachedJsonEncoding::Gzip => EncodedJson::gzip(bytes.bytes),
+    }
+}
+
 #[tracing::instrument(skip(state), fields(server, event_id, user_id))]
 pub async fn all_by_user(
     State(state): State<AppState>,
     Path((server, event_id, user_id)): Path<(String, i64, String)>,
-) -> Result<RawJson, ApiError> {
+    headers: HeaderMap,
+) -> Result<EncodedJson, ApiError> {
     let (region, engine) = resolve_region_engine(&state, &server)?;
     let mode = prepare_user_id_mode(&state, &engine, region, event_id).await?;
     let limiter = state.query_limiter().clone();
@@ -126,17 +149,18 @@ pub async fn all_by_user(
     };
     if let Some(cache) = state.cache() {
         let bytes = cache
-            .get_or_fetch_json_bytes(
+            .get_or_fetch_encoded_json(
                 &server,
                 event_id,
                 suffix,
                 cache.ttl(CacheTtl::TraceRank),
+                accepts_gzip(&headers),
                 fetch,
             )
             .await?;
-        Ok(RawJson(bytes))
+        Ok(encoded_json(bytes))
     } else {
-        raw_json(&fetch.await?)
+        raw_json(&fetch.await?).map(|json| EncodedJson::identity(json.0))
     }
 }
 
@@ -144,7 +168,8 @@ pub async fn all_by_user(
 pub async fn all_by_rank(
     State(state): State<AppState>,
     Path((server, event_id, rank)): Path<(String, i64, i64)>,
-) -> Result<RawJson, ApiError> {
+    headers: HeaderMap,
+) -> Result<EncodedJson, ApiError> {
     let (region, engine) = resolve_region_engine(&state, &server)?;
     let mode = prepare_user_id_mode(&state, &engine, region, event_id).await?;
     let limiter = state.query_limiter().clone();
@@ -154,17 +179,18 @@ pub async fn all_by_rank(
     };
     if let Some(cache) = state.cache() {
         let bytes = cache
-            .get_or_fetch_json_bytes(
+            .get_or_fetch_encoded_json(
                 &server,
                 event_id,
                 rank_suffix("trace", rank),
                 cache.ttl(CacheTtl::TraceRank),
+                accepts_gzip(&headers),
                 fetch,
             )
             .await?;
-        Ok(RawJson(bytes))
+        Ok(encoded_json(bytes))
     } else {
-        raw_json(&fetch.await?)
+        raw_json(&fetch.await?).map(|json| EncodedJson::identity(json.0))
     }
 }
 
@@ -248,7 +274,8 @@ pub async fn all_by_ranks(
 pub async fn wb_all_by_user(
     State(state): State<AppState>,
     Path((server, event_id, character_id, user_id)): Path<(String, i64, i64, String)>,
-) -> Result<RawJson, ApiError> {
+    headers: HeaderMap,
+) -> Result<EncodedJson, ApiError> {
     let (region, engine) = resolve_region_engine(&state, &server)?;
     let mode = prepare_user_id_mode(&state, &engine, region, event_id).await?;
     let limiter = state.query_limiter().clone();
@@ -274,17 +301,18 @@ pub async fn wb_all_by_user(
     };
     if let Some(cache) = state.cache() {
         let bytes = cache
-            .get_or_fetch_json_bytes(
+            .get_or_fetch_encoded_json(
                 &server,
                 event_id,
                 suffix,
                 cache.ttl(CacheTtl::TraceRank),
+                accepts_gzip(&headers),
                 fetch,
             )
             .await?;
-        Ok(RawJson(bytes))
+        Ok(encoded_json(bytes))
     } else {
-        raw_json(&fetch.await?)
+        raw_json(&fetch.await?).map(|json| EncodedJson::identity(json.0))
     }
 }
 
@@ -375,7 +403,8 @@ pub async fn wb_all_by_ranks(
 pub async fn wb_all_by_rank(
     State(state): State<AppState>,
     Path((server, event_id, character_id, rank)): Path<(String, i64, i64, i64)>,
-) -> Result<RawJson, ApiError> {
+    headers: HeaderMap,
+) -> Result<EncodedJson, ApiError> {
     let (region, engine) = resolve_region_engine(&state, &server)?;
     let mode = prepare_user_id_mode(&state, &engine, region, event_id).await?;
     let limiter = state.query_limiter().clone();
@@ -385,23 +414,25 @@ pub async fn wb_all_by_rank(
     };
     if let Some(cache) = state.cache() {
         let bytes = cache
-            .get_or_fetch_json_bytes(
+            .get_or_fetch_encoded_json(
                 &server,
                 event_id,
                 wb_rank_suffix("trace", character_id, rank),
                 cache.ttl(CacheTtl::TraceRank),
+                accepts_gzip(&headers),
                 fetch,
             )
             .await?;
-        Ok(RawJson(bytes))
+        Ok(encoded_json(bytes))
     } else {
-        raw_json(&fetch.await?)
+        raw_json(&fetch.await?).map(|json| EncodedJson::identity(json.0))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::http::HeaderValue;
 
     #[test]
     fn batch_response_keeps_rank_order_and_skips_missing() {
@@ -432,5 +463,17 @@ mod tests {
             Err(ApiError::NotFound) => {}
             _ => panic!("expected batch response to return not found"),
         }
+    }
+
+    #[test]
+    fn accepts_gzip_matches_header_tokens() {
+        let mut headers = HeaderMap::new();
+        assert!(!accepts_gzip(&headers));
+
+        headers.insert(ACCEPT_ENCODING, HeaderValue::from_static("br, gzip;q=1"));
+        assert!(accepts_gzip(&headers));
+
+        headers.insert(ACCEPT_ENCODING, HeaderValue::from_static("br"));
+        assert!(!accepts_gzip(&headers));
     }
 }

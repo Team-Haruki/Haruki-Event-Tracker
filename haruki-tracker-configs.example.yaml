@@ -32,6 +32,14 @@ redis:
 api_cache:
   enabled: false
   redis_url: ""              # 例如 redis://:password@redis:6379/0；留空复用 redis.host/port/password
+  pool_size: 2               # API cache Redis 连接池大小；生产热点可从 4 起观察
+  command_timeout_ms: 100    # Redis cache 命令超时；超时后降级查库/回填
+  local_control_ttl_ms: 100  # event epoch/dirty 本地短缓存
+  local_value_ttl_ms: 250    # API value 本地短缓存；0 表示禁用 L1 value
+  local_max_entries: 4096
+  precompress_gzip_enabled: true # 热点 trace JSON 是否缓存 gzip 预压缩响应
+  precompress_min_bytes: 4096    # 原始 JSON 小于该值时不预压缩
+  gzip_level: 1                  # 预压缩 gzip 等级；1 优先降低 CPU
   default_ttl_secs: 2
   latest_rank_ttl_secs: 1
   trace_rank_ttl_secs: 60

@@ -26,6 +26,19 @@ Do not scale tracker-enabled pods above one replica until leader election or a
 distributed scrape lock exists; otherwise multiple pods can fetch and persist the
 same ranking data.
 
+For high-concurrency API traffic, run the tracker process with a high open-file
+limit. Docker Compose deployments should set this on the tracker service:
+
+```yaml
+ulimits:
+  nofile:
+    soft: 65535
+    hard: 65535
+```
+
+The process logs its Linux `Max open files` limit on startup. Keep it at 65535
+or higher before running 1024+ concurrent trace benchmarks.
+
 For local OrbStack verification, run:
 
 ```sh
