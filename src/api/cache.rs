@@ -342,12 +342,13 @@ impl ApiCache {
         let mut conn = self.conns.connection();
         let base = base_key(server, event_id);
         let script = redis::Script::new(READ_SCRIPT);
-        script
+        let mut invocation = script.prepare_invoke();
+        invocation
             .key(epoch_key(server, event_id))
             .key(dirty_key(server, event_id))
             .arg(base)
             .arg(suffix);
-        let fut = script.invoke_async::<_, (i64, i64, Vec<u8>, i64, i64)>(&mut conn);
+        let fut = invocation.invoke_async::<(i64, i64, Vec<u8>, i64, i64)>(&mut conn);
         let (epoch, dirty, value, negative, has_value) = self.with_timeout(fut).await?;
         if dirty != 0 {
             return Ok(L2CombinedRead::Dirty { epoch });
@@ -390,14 +391,15 @@ impl ApiCache {
     ) -> Result<bool, redis::RedisError> {
         let mut conn = self.conns.connection();
         let script = redis::Script::new(WRITE_SCRIPT);
-        script
+        let mut invocation = script.prepare_invoke();
+        invocation
             .key(epoch_key(&ctx.server, ctx.event_id))
             .key(dirty_key(&ctx.server, ctx.event_id))
             .key(key)
             .arg(ctx.epoch)
             .arg(bytes)
             .arg(ttl_secs);
-        let fut = script.invoke_async::<_, i64>(&mut conn);
+        let fut = invocation.invoke_async::<i64>(&mut conn);
         self.with_timeout(fut).await.map(|written| written != 0)
     }
 
