@@ -12,7 +12,7 @@ use tower_http::compression::CompressionLayer;
 use crate::api::access_log::{self, ProxyTrust};
 use crate::api::handler::{health, lines, ranking, status, trace, user, web, world_bloom};
 use crate::api::state::AppState;
-use crate::api::ws;
+use crate::api::{ws, ws_ticket};
 
 pub fn build_router(state: AppState, trust: Arc<ProxyTrust>) -> Router {
     let event_routes = event_routes();
@@ -21,6 +21,10 @@ pub fn build_router(state: AppState, trust: Arc<ProxyTrust>) -> Router {
     Router::new()
         .route("/livez", get(health::livez))
         .route("/readyz", get(health::readyz))
+        .route(
+            "/ws-ticket",
+            get(ws_ticket::issue_ticket).with_state(ws_state.clone()),
+        )
         .route("/ws", get(ws::connect).with_state(ws_state))
         .nest("/event/{server}/{event_id}", event_routes)
         .with_state(state)

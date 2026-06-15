@@ -3,8 +3,9 @@ use std::sync::Arc;
 
 use axum::Router;
 use axum::body::Body;
+use axum::extract::ConnectInfo;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{Request, State};
+use axum::extract::{Query, Request, State};
 use axum::http::{HeaderMap, Method, StatusCode, Uri};
 use axum::response::IntoResponse;
 use serde::{Deserialize, Serialize};
@@ -16,6 +17,7 @@ use crate::api::access_log::ProxyTrust;
 use crate::api::realtime::{RealtimeMessage, RealtimeTopic};
 use crate::api::router::event_routes;
 use crate::api::state::AppState;
+use crate::api::ws_ticket::{peer_from_connect_info, resolve_trusted_subject, unauthorized};
 use crate::model::enums::SekaiServerRegion;
 
 const OATHKEEPER_SUBJECT_HEADERS: &[&str] = &[
@@ -40,6 +42,13 @@ struct WsRequest {
     server: Option<SekaiServerRegion>,
     #[serde(default)]
     event_id: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WsQuery {
+    #[serde(default)]
+    ticket: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -80,18 +89,37 @@ struct OnlinePayload {
 
 pub async fn connect(
     State((state, trust)): State<(AppState, Arc<ProxyTrust>)>,
+    connect_info: ConnectInfo<std::net::SocketAddr>,
     headers: HeaderMap,
+    Query(query): Query<WsQuery>,
     ws: WebSocketUpgrade,
 ) -> impl IntoResponse {
-    let subject = resolve_oathkeeper_subject(&headers);
+    let subject = if query.ticket.trim().is_empty() {
+        if cfg!(debug_assertions) {
+            resolve_trusted_subject(&headers, &trust, peer_from_connect_info(connect_info))
+        } else {
+            None
+        }
+    } else {
+        state
+            .ws_tickets()
+            .consume(&query.ticket)
+            .await
+            .map(|ticket| ticket.subject)
+    };
+    let Some(subject) = subject else {
+        return unauthorized().into_response();
+    };
+
     ws.on_upgrade(move |socket| handle_socket(socket, state, trust, subject))
+        .into_response()
 }
 
 async fn handle_socket(
     mut socket: WebSocket,
     state: AppState,
     trust: Arc<ProxyTrust>,
-    subject: Option<String>,
+    subject: String,
 ) {
     let router = Router::new()
         .nest("/event/{server}/{event_id}", event_routes())
@@ -109,7 +137,7 @@ async fn handle_socket(
         &mut socket,
         &WsEvent {
             kind: "ready",
-            subject: subject.as_deref(),
+            subject: Some(subject.as_str()),
             server: None,
             event_id: None,
             timestamp: None,
@@ -381,7 +409,7 @@ async fn handle_proxy_request(router: &Router, request: WsRequest) -> WsResponse
     }
 }
 
-fn resolve_oathkeeper_subject(headers: &HeaderMap) -> Option<String> {
+pub fn resolve_oathkeeper_subject(headers: &HeaderMap) -> Option<String> {
     for name in OATHKEEPER_SUBJECT_HEADERS {
         if let Some(value) = headers
             .get(*name)

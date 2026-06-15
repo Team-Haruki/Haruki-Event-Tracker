@@ -17,6 +17,7 @@ use tokio_cron_scheduler::{Job, JobScheduler, JobSchedulerError};
 use crate::api::cache::ApiCache;
 use crate::api::realtime::RealtimeHub;
 use crate::api::state::AppState;
+use crate::api::ws_ticket::WsTicketStore;
 use crate::config::{Config, RedisConfig};
 use crate::db::engine::{DatabaseEngine, EngineError};
 use crate::model::enums::SekaiServerRegion;
@@ -166,7 +167,13 @@ pub async fn build(cfg: &Config) -> Result<AppContext, BootstrapError> {
         tracing::info!("scheduler started");
     }
 
-    let state = AppState::new(dbs.clone(), api_cache, anonymizer, realtime);
+    let state = AppState::new(
+        dbs.clone(),
+        api_cache,
+        anonymizer,
+        realtime,
+        WsTicketStore::default(),
+    );
     Ok(AppContext {
         state,
         dbs,

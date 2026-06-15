@@ -67,7 +67,7 @@ impl ProxyTrust {
         )
     }
 
-    fn peer_is_trusted(&self, peer: &IpAddr) -> bool {
+    pub fn peer_is_trusted(&self, peer: &IpAddr) -> bool {
         self.trusted.iter().any(|net| net.contains(peer))
     }
 }

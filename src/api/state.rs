@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 use crate::api::cache::ApiCache;
 use crate::api::realtime::RealtimeHub;
+use crate::api::ws_ticket::WsTicketStore;
 use crate::db::engine::DatabaseEngine;
 use crate::model::enums::SekaiServerRegion;
 use crate::privacy::UidAnonymizer;
@@ -24,6 +25,7 @@ struct Inner {
     cache: Option<ApiCache>,
     anonymizer: UidAnonymizer,
     realtime: RealtimeHub,
+    ws_tickets: WsTicketStore,
 }
 
 impl AppState {
@@ -32,6 +34,7 @@ impl AppState {
         cache: Option<ApiCache>,
         anonymizer: UidAnonymizer,
         realtime: RealtimeHub,
+        ws_tickets: WsTicketStore,
     ) -> Self {
         Self {
             inner: Arc::new(Inner {
@@ -39,6 +42,7 @@ impl AppState {
                 cache,
                 anonymizer,
                 realtime,
+                ws_tickets,
             }),
         }
     }
@@ -64,5 +68,9 @@ impl AppState {
 
     pub fn realtime(&self) -> &RealtimeHub {
         &self.inner.realtime
+    }
+
+    pub fn ws_tickets(&self) -> &WsTicketStore {
+        &self.inner.ws_tickets
     }
 }
