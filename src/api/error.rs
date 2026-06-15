@@ -8,6 +8,7 @@ use sea_orm::DbErr;
 use serde::Serialize;
 
 use crate::api::json::Json;
+use crate::api::stats::{API_STATS, incr};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ApiError {
@@ -36,6 +37,9 @@ impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         if let ApiError::Db(err) = &self {
             tracing::error!(%err, "db error in handler");
+        }
+        if matches!(self, ApiError::ServiceUnavailable(_)) {
+            incr(&API_STATS.service_unavailable);
         }
         let status = match &self {
             ApiError::InvalidServer(_) | ApiError::BadRequest(_) => StatusCode::BAD_REQUEST,

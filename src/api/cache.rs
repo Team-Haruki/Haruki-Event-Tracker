@@ -1,22 +1,62 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
 use redis::AsyncCommands;
 use redis::aio::ConnectionManager;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tokio::sync::{Mutex, Notify};
+use tokio::time;
 
 use crate::api::error::ApiError;
+use crate::api::stats::{CACHE_STATS, incr};
 use crate::config::ApiCacheConfig;
 
 const DIRTY_TTL_SECS: u64 = 300;
+const READ_SCRIPT: &str = r#"
+local epoch = redis.call('GET', KEYS[1])
+if not epoch then
+  epoch = 0
+else
+  epoch = tonumber(epoch)
+end
+local dirty = redis.call('EXISTS', KEYS[2])
+if dirty == 1 then
+  return {epoch, 1, '', 0, 0}
+end
+local value_key = ARGV[1] .. ':v' .. epoch .. ':' .. ARGV[2]
+local value = redis.call('GET', value_key)
+if value then
+  return {epoch, 0, value, 0, 1}
+end
+local negative = redis.call('EXISTS', value_key .. ':not_found')
+return {epoch, 0, '', negative, 0}
+"#;
+const WRITE_SCRIPT: &str = r#"
+local current = redis.call('GET', KEYS[1])
+if not current then
+  current = 0
+else
+  current = tonumber(current)
+end
+if current ~= tonumber(ARGV[1]) then
+  return 0
+end
+if redis.call('EXISTS', KEYS[2]) == 1 then
+  return 0
+end
+redis.call('SETEX', KEYS[3], tonumber(ARGV[3]), ARGV[2])
+return 1
+"#;
 
 #[derive(Clone)]
 pub struct ApiCache {
-    conn: ConnectionManager,
+    conns: Arc<CacheConnections>,
     cfg: ApiCacheConfig,
+    l1: L1Cache,
     singleflight: SingleFlight,
 }
 
@@ -29,9 +69,10 @@ pub enum CacheTtl {
 }
 
 impl ApiCache {
-    pub fn new(conn: ConnectionManager, cfg: ApiCacheConfig) -> Self {
+    pub fn new(conns: Vec<ConnectionManager>, cfg: ApiCacheConfig) -> Self {
         Self {
-            conn,
+            conns: Arc::new(CacheConnections::new(conns)),
+            l1: L1Cache::new(cfg.local_max_entries),
             cfg,
             singleflight: SingleFlight::default(),
         }
@@ -68,16 +109,76 @@ impl ApiCache {
             return fetch.await;
         }
 
-        let mut conn = self.conn.clone();
-        let epoch = match read_epoch(&mut conn, server, event_id).await {
-            Ok(epoch) => epoch,
-            Err(err) => {
-                tracing::warn!(%err, "api cache epoch read failed");
-                return fetch.await;
+        let control_key = control_cache_key(server, event_id);
+        if let Some(control) = self.l1.get_control(&control_key).await {
+            incr(&CACHE_STATS.l1_control_hit);
+            if control.dirty {
+                incr(&CACHE_STATS.dirty_bypass);
+                tracing::debug!(cache_status = "dirty_bypass", "api cache dirty bypass");
+                return self
+                    .fetch_with_singleflight(
+                        dirty_flight_key(server, event_id, control.epoch, &suffix),
+                        fetch,
+                        None,
+                    )
+                    .await;
             }
-        };
-        match is_dirty(&mut conn, server, event_id).await {
-            Ok(true) => {
+            let key = value_key(server, event_id, control.epoch, &suffix);
+            if let Some(bytes) = self.l1.get_value(&key).await {
+                match sonic_rs::from_slice::<T>(&bytes) {
+                    Ok(value) => {
+                        incr(&CACHE_STATS.l1_hit);
+                        tracing::debug!(cache_status = "l1_hit", "api cache L1 hit");
+                        return Ok(value);
+                    }
+                    Err(err) => tracing::warn!(%err, "api cache L1 decode failed"),
+                }
+            }
+            match self.read_l2_value(&key).await {
+                Ok(L2ValueRead::Hit(bytes)) => match sonic_rs::from_slice::<T>(&bytes) {
+                    Ok(value) => {
+                        incr(&CACHE_STATS.l2_hit);
+                        tracing::debug!(cache_status = "l2_hit", "api cache L2 hit");
+                        self.store_l1_value(key, bytes).await;
+                        return Ok(value);
+                    }
+                    Err(err) => tracing::warn!(%err, "api cache decode failed"),
+                },
+                Ok(L2ValueRead::NotFound) => {
+                    incr(&CACHE_STATS.l2_not_found);
+                    tracing::debug!(cache_status = "l2_not_found", "api cache negative hit");
+                    return Err(ApiError::NotFound);
+                }
+                Ok(L2ValueRead::Miss) => {
+                    incr(&CACHE_STATS.l2_miss);
+                }
+                Err(err) => {
+                    incr(&CACHE_STATS.l2_timeout);
+                    tracing::warn!(%err, "api cache value read failed");
+                    return fetch.await;
+                }
+            }
+            tracing::debug!(cache_status = "l2_miss", "api cache miss");
+            return self
+                .fetch_with_singleflight(
+                    key.clone(),
+                    fetch,
+                    Some(CacheWriteContext {
+                        server: server.to_owned(),
+                        event_id,
+                        epoch: control.epoch,
+                        value_key: key,
+                        negative_key: negative_key(server, event_id, control.epoch, &suffix),
+                        ttl_secs,
+                    }),
+                )
+                .await;
+        }
+
+        match self.read_l2_combined(server, event_id, &suffix).await {
+            Ok(L2CombinedRead::Dirty { epoch }) => {
+                self.store_l1_control(control_key, epoch, true).await;
+                incr(&CACHE_STATS.dirty_bypass);
                 tracing::debug!(cache_status = "dirty_bypass", "api cache dirty bypass");
                 return self
                     .fetch_with_singleflight(
@@ -87,49 +188,51 @@ impl ApiCache {
                     )
                     .await;
             }
-            Ok(false) => {}
-            Err(err) => {
-                tracing::warn!(%err, "api cache dirty read failed");
-                return fetch.await;
-            }
-        }
-
-        let key = value_key(server, event_id, epoch, &suffix);
-        match conn.get::<_, Option<Vec<u8>>>(&key).await {
-            Ok(Some(bytes)) => match sonic_rs::from_slice::<T>(&bytes) {
-                Ok(value) => {
-                    tracing::debug!(cache_status = "hit", "api cache hit");
-                    return Ok(value);
+            Ok(L2CombinedRead::Hit { epoch, key, bytes }) => {
+                match sonic_rs::from_slice::<T>(&bytes) {
+                    Ok(value) => {
+                        self.store_l1_control(control_key, epoch, false).await;
+                        self.store_l1_value(key, bytes).await;
+                        incr(&CACHE_STATS.l2_hit);
+                        tracing::debug!(cache_status = "l2_hit", "api cache L2 hit");
+                        return Ok(value);
+                    }
+                    Err(err) => tracing::warn!(%err, "api cache decode failed"),
                 }
-                Err(err) => tracing::warn!(%err, "api cache decode failed"),
-            },
-            Ok(None) => {}
-            Err(err) => tracing::warn!(%err, "api cache read failed"),
-        }
-        let negative_key = negative_key(server, event_id, epoch, &suffix);
-        match conn.exists::<_, bool>(&negative_key).await {
-            Ok(true) => {
-                tracing::debug!(cache_status = "not_found_cached", "api cache negative hit");
+            }
+            Ok(L2CombinedRead::NotFound { epoch }) => {
+                self.store_l1_control(control_key, epoch, false).await;
+                incr(&CACHE_STATS.l2_not_found);
+                tracing::debug!(cache_status = "l2_not_found", "api cache negative hit");
                 return Err(ApiError::NotFound);
             }
-            Ok(false) => {}
-            Err(err) => tracing::warn!(%err, "api cache negative read failed"),
+            Ok(L2CombinedRead::Miss { epoch, key }) => {
+                self.store_l1_control(control_key, epoch, false).await;
+                incr(&CACHE_STATS.l2_miss);
+                tracing::debug!(cache_status = "l2_miss", "api cache miss");
+                return self
+                    .fetch_with_singleflight(
+                        key.clone(),
+                        fetch,
+                        Some(CacheWriteContext {
+                            server: server.to_owned(),
+                            event_id,
+                            epoch,
+                            value_key: key,
+                            negative_key: negative_key(server, event_id, epoch, &suffix),
+                            ttl_secs,
+                        }),
+                    )
+                    .await;
+            }
+            Err(err) => {
+                incr(&CACHE_STATS.l2_timeout);
+                tracing::warn!(%err, "api cache combined read failed");
+            }
         }
 
-        tracing::debug!(cache_status = "miss", "api cache miss");
-        self.fetch_with_singleflight(
-            key.clone(),
-            fetch,
-            Some(CacheWriteContext {
-                server: server.to_owned(),
-                event_id,
-                epoch,
-                value_key: key,
-                negative_key,
-                ttl_secs,
-            }),
-        )
-        .await
+        self.fetch_with_singleflight(fallback_flight_key(server, event_id, &suffix), fetch, None)
+            .await
     }
 
     async fn fetch_with_singleflight<T, Fut>(
@@ -144,6 +247,7 @@ impl ApiCache {
     {
         match self.singleflight.begin(flight_key.clone()).await {
             Flight::Waiter(entry) => {
+                incr(&CACHE_STATS.singleflight_wait);
                 tracing::debug!(
                     cache_status = "singleflight_wait",
                     "api cache waiting for in-flight fetch"
@@ -180,22 +284,18 @@ impl ApiCache {
             if let Some(ctx) = write_context
                 && self.cfg.negative_ttl_secs > 0
             {
-                let mut conn = self.conn.clone();
-                let still_clean = matches!(
-                    is_dirty(&mut conn, &ctx.server, ctx.event_id).await,
-                    Ok(false)
-                );
-                let same_epoch = matches!(
-                    read_epoch(&mut conn, &ctx.server, ctx.event_id).await,
-                    Ok(next) if next == ctx.epoch
-                );
-                if still_clean
-                    && same_epoch
-                    && let Err(err) = conn
-                        .set_ex::<_, _, ()>(&ctx.negative_key, "1", self.cfg.negative_ttl_secs)
-                        .await
+                match self
+                    .write_l2_if_clean(
+                        &ctx,
+                        &ctx.negative_key,
+                        b"1".to_vec(),
+                        self.cfg.negative_ttl_secs,
+                    )
+                    .await
                 {
-                    tracing::warn!(%err, "api cache negative write failed");
+                    Ok(true) => {}
+                    Ok(false) => {}
+                    Err(err) => tracing::warn!(%err, "api cache negative write failed"),
                 }
             }
             return result;
@@ -222,22 +322,262 @@ impl ApiCache {
         let Some(ctx) = write_context else {
             return Ok(value);
         };
-        let mut conn = self.conn.clone();
-        let still_clean = matches!(
-            is_dirty(&mut conn, &ctx.server, ctx.event_id).await,
-            Ok(false)
-        );
-        let same_epoch = matches!(read_epoch(&mut conn, &ctx.server, ctx.event_id).await, Ok(next) if next == ctx.epoch);
-        if still_clean
-            && same_epoch
-            && let Err(err) = conn
-                .set_ex::<_, _, ()>(&ctx.value_key, bytes, ctx.ttl_secs)
-                .await
+        match self
+            .write_l2_if_clean(&ctx, &ctx.value_key, bytes.clone(), ctx.ttl_secs)
+            .await
         {
-            tracing::warn!(%err, "api cache write failed");
+            Ok(true) => self.store_l1_value(ctx.value_key.clone(), bytes).await,
+            Ok(false) => {}
+            Err(err) => tracing::warn!(%err, "api cache write failed"),
         }
         Ok(value)
     }
+
+    async fn read_l2_combined(
+        &self,
+        server: &str,
+        event_id: i64,
+        suffix: &str,
+    ) -> Result<L2CombinedRead, redis::RedisError> {
+        let mut conn = self.conns.connection();
+        let base = base_key(server, event_id);
+        let script = redis::Script::new(READ_SCRIPT);
+        script
+            .key(epoch_key(server, event_id))
+            .key(dirty_key(server, event_id))
+            .arg(base)
+            .arg(suffix);
+        let fut = script.invoke_async::<_, (i64, i64, Vec<u8>, i64, i64)>(&mut conn);
+        let (epoch, dirty, value, negative, has_value) = self.with_timeout(fut).await?;
+        if dirty != 0 {
+            return Ok(L2CombinedRead::Dirty { epoch });
+        }
+        let key = value_key(server, event_id, epoch, suffix);
+        if has_value != 0 {
+            return Ok(L2CombinedRead::Hit {
+                epoch,
+                key,
+                bytes: value,
+            });
+        }
+        if negative != 0 {
+            return Ok(L2CombinedRead::NotFound { epoch });
+        }
+        Ok(L2CombinedRead::Miss { epoch, key })
+    }
+
+    async fn read_l2_value(&self, key: &str) -> Result<L2ValueRead, redis::RedisError> {
+        let mut conn = self.conns.connection();
+        let mut pipe = redis::pipe();
+        pipe.get(key).exists(format!("{key}:not_found"));
+        let fut = pipe.query_async::<(Option<Vec<u8>>, bool)>(&mut conn);
+        let (value, negative) = self.with_timeout(fut).await?;
+        if let Some(bytes) = value {
+            Ok(L2ValueRead::Hit(bytes))
+        } else if negative {
+            Ok(L2ValueRead::NotFound)
+        } else {
+            Ok(L2ValueRead::Miss)
+        }
+    }
+
+    async fn write_l2_if_clean(
+        &self,
+        ctx: &CacheWriteContext,
+        key: &str,
+        bytes: Vec<u8>,
+        ttl_secs: u64,
+    ) -> Result<bool, redis::RedisError> {
+        let mut conn = self.conns.connection();
+        let script = redis::Script::new(WRITE_SCRIPT);
+        script
+            .key(epoch_key(&ctx.server, ctx.event_id))
+            .key(dirty_key(&ctx.server, ctx.event_id))
+            .key(key)
+            .arg(ctx.epoch)
+            .arg(bytes)
+            .arg(ttl_secs);
+        let fut = script.invoke_async::<_, i64>(&mut conn);
+        self.with_timeout(fut).await.map(|written| written != 0)
+    }
+
+    async fn with_timeout<F, T>(&self, fut: F) -> Result<T, redis::RedisError>
+    where
+        F: Future<Output = Result<T, redis::RedisError>>,
+    {
+        if self.cfg.command_timeout_ms == 0 {
+            return fut.await;
+        }
+        time::timeout(Duration::from_millis(self.cfg.command_timeout_ms), fut)
+            .await
+            .map_err(|_| {
+                redis::RedisError::from((redis::ErrorKind::Io, "api cache command timed out"))
+            })?
+    }
+
+    async fn store_l1_control(&self, key: String, epoch: i64, dirty: bool) {
+        if self.cfg.local_control_ttl_ms == 0 {
+            return;
+        }
+        self.l1
+            .insert_control(
+                key,
+                L1Control {
+                    epoch,
+                    dirty,
+                    expires_at: Instant::now()
+                        + Duration::from_millis(self.cfg.local_control_ttl_ms),
+                },
+            )
+            .await;
+    }
+
+    async fn store_l1_value(&self, key: String, bytes: Vec<u8>) {
+        if self.cfg.local_value_ttl_ms == 0 {
+            return;
+        }
+        self.l1
+            .insert_value(
+                key,
+                L1Value {
+                    bytes,
+                    expires_at: Instant::now() + Duration::from_millis(self.cfg.local_value_ttl_ms),
+                },
+            )
+            .await;
+    }
+}
+
+struct CacheConnections {
+    conns: Vec<ConnectionManager>,
+    next: AtomicUsize,
+}
+
+impl CacheConnections {
+    fn new(conns: Vec<ConnectionManager>) -> Self {
+        assert!(
+            !conns.is_empty(),
+            "api cache requires at least one Redis connection"
+        );
+        Self {
+            conns,
+            next: AtomicUsize::new(0),
+        }
+    }
+
+    fn connection(&self) -> ConnectionManager {
+        let idx = self.next.fetch_add(1, Ordering::Relaxed) % self.conns.len();
+        self.conns[idx].clone()
+    }
+}
+
+#[derive(Clone, Default)]
+struct L1Cache {
+    max_entries: usize,
+    inner: Arc<Mutex<L1Inner>>,
+}
+
+#[derive(Default)]
+struct L1Inner {
+    controls: HashMap<String, L1Control>,
+    values: HashMap<String, L1Value>,
+}
+
+#[derive(Clone, Copy)]
+struct L1Control {
+    epoch: i64,
+    dirty: bool,
+    expires_at: Instant,
+}
+
+#[derive(Clone)]
+struct L1Value {
+    bytes: Vec<u8>,
+    expires_at: Instant,
+}
+
+impl L1Cache {
+    fn new(max_entries: usize) -> Self {
+        Self {
+            max_entries,
+            inner: Arc::new(Mutex::new(L1Inner::default())),
+        }
+    }
+
+    async fn get_control(&self, key: &str) -> Option<L1Control> {
+        let now = Instant::now();
+        let mut inner = self.inner.lock().await;
+        match inner.controls.get(key).copied() {
+            Some(control) if control.expires_at > now => Some(control),
+            Some(_) => {
+                inner.controls.remove(key);
+                None
+            }
+            None => None,
+        }
+    }
+
+    async fn insert_control(&self, key: String, value: L1Control) {
+        if self.max_entries == 0 {
+            return;
+        }
+        let mut inner = self.inner.lock().await;
+        prune_if_full(self.max_entries, &mut inner.controls);
+        inner.controls.insert(key, value);
+    }
+
+    async fn get_value(&self, key: &str) -> Option<Vec<u8>> {
+        let now = Instant::now();
+        let mut inner = self.inner.lock().await;
+        match inner.values.get(key) {
+            Some(value) if value.expires_at > now => Some(value.bytes.clone()),
+            Some(_) => {
+                inner.values.remove(key);
+                None
+            }
+            None => None,
+        }
+    }
+
+    async fn insert_value(&self, key: String, value: L1Value) {
+        if self.max_entries == 0 {
+            return;
+        }
+        let mut inner = self.inner.lock().await;
+        prune_if_full(self.max_entries, &mut inner.values);
+        inner.values.insert(key, value);
+    }
+}
+
+fn prune_if_full<T>(max_entries: usize, values: &mut HashMap<String, T>) {
+    if values.len() < max_entries {
+        return;
+    }
+    values.clear();
+}
+
+enum L2CombinedRead {
+    Dirty {
+        epoch: i64,
+    },
+    Hit {
+        epoch: i64,
+        key: String,
+        bytes: Vec<u8>,
+    },
+    NotFound {
+        epoch: i64,
+    },
+    Miss {
+        epoch: i64,
+        key: String,
+    },
+}
+
+enum L2ValueRead {
+    Hit(Vec<u8>),
+    NotFound,
+    Miss,
 }
 
 #[derive(Clone)]
@@ -412,6 +752,17 @@ fn dirty_flight_key(server: &str, event_id: i64, epoch: i64, suffix: &str) -> St
     )
 }
 
+fn fallback_flight_key(server: &str, event_id: i64, suffix: &str) -> String {
+    format!(
+        "{base}:fallback:{suffix}",
+        base = base_key(server, event_id)
+    )
+}
+
+fn control_cache_key(server: &str, event_id: i64) -> String {
+    format!("{base}:control", base = base_key(server, event_id))
+}
+
 fn epoch_key(server: &str, event_id: i64) -> String {
     format!("{base}:epoch", base = base_key(server, event_id))
 }
@@ -423,23 +774,6 @@ fn dirty_key(server: &str, event_id: i64) -> String {
 fn base_key(server: &str, event_id: i64) -> String {
     let server = server.to_ascii_lowercase();
     format!("haruki:tracker:{server}:{event_id}:api_cache")
-}
-
-async fn read_epoch(
-    conn: &mut ConnectionManager,
-    server: &str,
-    event_id: i64,
-) -> Result<i64, redis::RedisError> {
-    let epoch: Option<i64> = conn.get(epoch_key(server, event_id)).await?;
-    Ok(epoch.unwrap_or(0))
-}
-
-async fn is_dirty(
-    conn: &mut ConnectionManager,
-    server: &str,
-    event_id: i64,
-) -> Result<bool, redis::RedisError> {
-    conn.exists(dirty_key(server, event_id)).await
 }
 
 pub fn rank_suffix(kind: &str, rank: i64) -> String {
@@ -491,9 +825,81 @@ mod tests {
             "haruki:tracker:jp:137:api_cache:dirty:v3:trace:rank:100"
         );
         assert_eq!(
+            fallback_flight_key("JP", 137, "trace:rank:100"),
+            "haruki:tracker:jp:137:api_cache:fallback:trace:rank:100"
+        );
+        assert_eq!(
+            control_cache_key("JP", 137),
+            "haruki:tracker:jp:137:api_cache:control"
+        );
+        assert_eq!(
             dirty_key("en", 200),
             "haruki:tracker:en:200:api_cache:dirty"
         );
+    }
+
+    #[tokio::test]
+    async fn l1_value_hit_returns_cached_bytes() {
+        let l1 = L1Cache::new(16);
+        l1.insert_value(
+            "value".to_owned(),
+            L1Value {
+                bytes: b"cached".to_vec(),
+                expires_at: Instant::now() + Duration::from_secs(1),
+            },
+        )
+        .await;
+
+        assert_eq!(l1.get_value("value").await, Some(b"cached".to_vec()));
+    }
+
+    #[tokio::test]
+    async fn l1_value_expiry_removes_cached_bytes() {
+        let l1 = L1Cache::new(16);
+        l1.insert_value(
+            "value".to_owned(),
+            L1Value {
+                bytes: b"stale".to_vec(),
+                expires_at: Instant::now() - Duration::from_secs(1),
+            },
+        )
+        .await;
+
+        assert_eq!(l1.get_value("value").await, None);
+        assert_eq!(l1.get_value("value").await, None);
+    }
+
+    #[tokio::test]
+    async fn l1_control_tracks_epoch_and_dirty_state() {
+        let l1 = L1Cache::new(16);
+        l1.insert_control(
+            "control".to_owned(),
+            L1Control {
+                epoch: 7,
+                dirty: true,
+                expires_at: Instant::now() + Duration::from_secs(1),
+            },
+        )
+        .await;
+
+        let control = l1.get_control("control").await.unwrap();
+        assert_eq!(control.epoch, 7);
+        assert!(control.dirty);
+    }
+
+    #[tokio::test]
+    async fn l1_zero_max_entries_disables_storage() {
+        let l1 = L1Cache::new(0);
+        l1.insert_value(
+            "value".to_owned(),
+            L1Value {
+                bytes: b"cached".to_vec(),
+                expires_at: Instant::now() + Duration::from_secs(1),
+            },
+        )
+        .await;
+
+        assert_eq!(l1.get_value("value").await, None);
     }
 
     #[tokio::test]

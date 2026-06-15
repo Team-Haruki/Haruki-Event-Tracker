@@ -85,13 +85,18 @@ pub async fn build(cfg: &Config) -> Result<AppContext, BootstrapError> {
         } else {
             cfg.api_cache.redis_url.clone()
         };
-        tracing::info!("connecting API cache Redis");
+        let pool_size = cfg.api_cache.pool_size.max(1);
+        tracing::info!(pool_size, "connecting API cache Redis");
         let client = redis::Client::open(redis_url)?;
-        let conn = redis::aio::ConnectionManager::new(client).await?;
-        tracing::info!("API cache Redis ready");
+        let mut conns = Vec::with_capacity(pool_size);
+        for _ in 0..pool_size {
+            conns.push(redis::aio::ConnectionManager::new(client.clone()).await?);
+        }
+        let invalidation_conn = redis::aio::ConnectionManager::new(client).await?;
+        tracing::info!(pool_size, "API cache Redis ready");
         (
-            Some(ApiCache::new(conn.clone(), cfg.api_cache.clone())),
-            Some(conn),
+            Some(ApiCache::new(conns, cfg.api_cache.clone())),
+            Some(invalidation_conn),
         )
     } else {
         (None, None)

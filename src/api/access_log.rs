@@ -12,7 +12,7 @@
 
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use axum::extract::ConnectInfo;
 use axum::extract::Request;
@@ -23,12 +23,16 @@ use axum::response::Response;
 use chrono::Local;
 use ipnet::IpNet;
 
+use crate::api::stats::{ACCESS_STATS, incr};
+
 #[derive(Debug, Clone)]
 pub struct ProxyTrust {
     pub enabled: bool,
     pub trusted: Vec<IpNet>,
     /// Lower-cased header name to honour first when the peer is trusted.
     pub primary_header: String,
+    pub sample_rate: f64,
+    pub slow_threshold: Duration,
 }
 
 impl ProxyTrust {
@@ -36,6 +40,8 @@ impl ProxyTrust {
         enabled: bool,
         trusted_cidrs: &[String],
         proxy_header: &str,
+        sample_rate: f64,
+        slow_threshold_ms: u64,
     ) -> (Self, Vec<String>) {
         let mut parsed = Vec::with_capacity(trusted_cidrs.len());
         let mut bad = Vec::new();
@@ -62,6 +68,8 @@ impl ProxyTrust {
                 enabled,
                 trusted: parsed,
                 primary_header: header,
+                sample_rate: sample_rate.clamp(0.0, 1.0),
+                slow_threshold: Duration::from_millis(slow_threshold_ms),
             },
             bad,
         )
@@ -87,6 +95,14 @@ pub async fn log(State(trust): State<Arc<ProxyTrust>>, req: Request, next: Next)
 
     let status = response.status().as_u16();
     let latency = started.elapsed();
+    if !should_log(status, latency, trust.sample_rate, trust.slow_threshold) {
+        incr(&ACCESS_STATS.dropped);
+        return response;
+    }
+    if status < 400 && latency < trust.slow_threshold && trust.sample_rate < 1.0 {
+        incr(&ACCESS_STATS.sampled);
+    }
+    incr(&ACCESS_STATS.logged);
     let now = Local::now().format("%Y/%m/%d %H:%M:%S");
     tracing::info!(
         target: "access",
@@ -132,6 +148,19 @@ fn client_ip(req: &Request, trust: &ProxyTrust) -> String {
         .unwrap_or_else(|| "-".to_owned())
 }
 
+fn should_log(status: u16, latency: Duration, sample_rate: f64, slow_threshold: Duration) -> bool {
+    if status >= 400 || latency >= slow_threshold {
+        return true;
+    }
+    if sample_rate >= 1.0 {
+        return true;
+    }
+    if sample_rate <= 0.0 {
+        return false;
+    }
+    rand::random::<f64>() < sample_rate
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -153,7 +182,7 @@ mod tests {
 
     fn trust(enabled: bool, cidrs: &[&str], header: &str) -> ProxyTrust {
         let owned: Vec<String> = cidrs.iter().map(|s| (*s).to_owned()).collect();
-        let (t, bad) = ProxyTrust::from_config(enabled, &owned, header);
+        let (t, bad) = ProxyTrust::from_config(enabled, &owned, header, 1.0, 1000);
         assert!(bad.is_empty(), "unparseable cidrs in test: {bad:?}");
         t
     }
@@ -193,7 +222,7 @@ mod tests {
             "not-a-cidr".to_owned(),
             "::1".to_owned(),
         ];
-        let (t, bad) = ProxyTrust::from_config(true, &cidrs, "");
+        let (t, bad) = ProxyTrust::from_config(true, &cidrs, "", 1.0, 1000);
         assert_eq!(t.trusted.len(), 2);
         assert_eq!(bad, vec!["not-a-cidr"]);
         assert_eq!(t.primary_header, "x-forwarded-for"); // empty -> default
@@ -204,5 +233,33 @@ mod tests {
         let t = trust(true, &["::1/128"], "X-Forwarded-For");
         let req = make_req("::1", &[("x-forwarded-for", "1.2.3.4")]);
         assert_eq!(client_ip(&req, &t), "1.2.3.4");
+    }
+
+    #[test]
+    fn sampling_keeps_errors_and_slow_requests() {
+        assert!(should_log(
+            500,
+            Duration::from_millis(1),
+            0.0,
+            Duration::from_secs(1)
+        ));
+        assert!(should_log(
+            200,
+            Duration::from_secs(2),
+            0.0,
+            Duration::from_secs(1)
+        ));
+        assert!(!should_log(
+            200,
+            Duration::from_millis(1),
+            0.0,
+            Duration::from_secs(1)
+        ));
+        assert!(should_log(
+            200,
+            Duration::from_millis(1),
+            1.0,
+            Duration::from_secs(1)
+        ));
     }
 }

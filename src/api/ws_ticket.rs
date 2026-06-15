@@ -129,7 +129,7 @@ mod tests {
 
     fn trust(enabled: bool, cidrs: &[&str]) -> ProxyTrust {
         let owned: Vec<String> = cidrs.iter().map(|value| (*value).to_owned()).collect();
-        let (trust, bad) = ProxyTrust::from_config(enabled, &owned, "X-Forwarded-For");
+        let (trust, bad) = ProxyTrust::from_config(enabled, &owned, "X-Forwarded-For", 1.0, 1000);
         assert!(bad.is_empty(), "unparseable cidrs in test: {bad:?}");
         trust
     }

@@ -9,5 +9,6 @@ pub mod private_lookup;
 pub mod realtime;
 pub mod router;
 pub mod state;
+pub mod stats;
 pub mod ws;
 pub mod ws_ticket;

@@ -45,6 +45,11 @@ pub struct RedisConfig {
 pub struct ApiCacheConfig {
     pub enabled: bool,
     pub redis_url: String,
+    pub pool_size: usize,
+    pub command_timeout_ms: u64,
+    pub local_control_ttl_ms: u64,
+    pub local_value_ttl_ms: u64,
+    pub local_max_entries: usize,
     pub default_ttl_secs: u64,
     pub latest_rank_ttl_secs: u64,
     pub trace_rank_ttl_secs: u64,
@@ -59,6 +64,11 @@ impl Default for ApiCacheConfig {
         Self {
             enabled: false,
             redis_url: String::new(),
+            pool_size: 2,
+            command_timeout_ms: 100,
+            local_control_ttl_ms: 100,
+            local_value_ttl_ms: 250,
+            local_max_entries: 4096,
             default_ttl_secs: 2,
             latest_rank_ttl_secs: 1,
             trace_rank_ttl_secs: 60,
@@ -119,7 +129,7 @@ pub struct ToolboxConfig {
     pub user_agent: String,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct BackendConfig {
     pub host: String,
@@ -134,6 +144,29 @@ pub struct BackendConfig {
     pub enable_trust_proxy: bool,
     pub trusted_proxies: Vec<String>,
     pub proxy_header: String,
+    pub access_log_sample_rate: f64,
+    pub access_log_slow_threshold_ms: u64,
+}
+
+impl Default for BackendConfig {
+    fn default() -> Self {
+        Self {
+            host: String::new(),
+            port: 0,
+            ssl: false,
+            ssl_cert: String::new(),
+            ssl_key: String::new(),
+            log_level: String::new(),
+            main_log_file: String::new(),
+            access_log: String::new(),
+            access_log_path: String::new(),
+            enable_trust_proxy: false,
+            trusted_proxies: Vec::new(),
+            proxy_header: String::new(),
+            access_log_sample_rate: 1.0,
+            access_log_slow_threshold_ms: 1000,
+        }
+    }
 }
 
 /// Per-server configuration. The `gorm_config` YAML key is preserved verbatim

@@ -38,6 +38,7 @@ async fn main() -> ExitCode {
         env!("CARGO_PKG_VERSION")
     );
     tracing::info!("Powered by Haruki Dev Team");
+    haruki_event_tracker::api::stats::spawn_aggregation_logger();
 
     let ctx = match app::build(&cfg).await {
         Ok(ctx) => ctx,
@@ -51,6 +52,8 @@ async fn main() -> ExitCode {
         cfg.backend.enable_trust_proxy,
         &cfg.backend.trusted_proxies,
         &cfg.backend.proxy_header,
+        cfg.backend.access_log_sample_rate,
+        cfg.backend.access_log_slow_threshold_ms,
     );
     for raw in &bad_cidrs {
         tracing::warn!(cidr = %raw, "ignored unparseable trusted_proxies entry");
