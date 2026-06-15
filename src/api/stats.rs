@@ -17,6 +17,7 @@ pub struct CacheStats {
     pub l2_not_found: AtomicU64,
     pub l2_timeout: AtomicU64,
     pub dirty_bypass: AtomicU64,
+    pub lookup_singleflight_wait: AtomicU64,
     pub singleflight_wait: AtomicU64,
 }
 
@@ -30,6 +31,7 @@ impl CacheStats {
             l2_not_found: AtomicU64::new(0),
             l2_timeout: AtomicU64::new(0),
             dirty_bypass: AtomicU64::new(0),
+            lookup_singleflight_wait: AtomicU64::new(0),
             singleflight_wait: AtomicU64::new(0),
         }
     }
@@ -111,6 +113,7 @@ fn log_snapshot() {
         l2_not_found = take(&CACHE_STATS.l2_not_found),
         l2_timeout = take(&CACHE_STATS.l2_timeout),
         dirty_bypass = take(&CACHE_STATS.dirty_bypass),
+        lookup_singleflight_wait = take(&CACHE_STATS.lookup_singleflight_wait),
         singleflight_wait = take(&CACHE_STATS.singleflight_wait),
         access_logged = take(&ACCESS_STATS.logged),
         access_sampled = take(&ACCESS_STATS.sampled),

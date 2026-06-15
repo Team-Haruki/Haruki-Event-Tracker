@@ -6,6 +6,7 @@
 use std::collections::HashMap;
 
 use axum::extract::{Path, RawQuery, State};
+use bytes::Bytes;
 use futures::stream::{self, StreamExt};
 
 use crate::api::cache::{
@@ -13,7 +14,7 @@ use crate::api::cache::{
 };
 use crate::api::error::ApiError;
 use crate::api::extract::{parse_rank_query, prepare_user_id_mode, resolve_region_engine};
-use crate::api::json::Json;
+use crate::api::json::{Json, RawJson};
 use crate::api::state::AppState;
 use crate::db::query::ranking::{
     fetch_all_rankings, fetch_all_rankings_by_rank, fetch_all_rankings_by_ranks,
@@ -90,11 +91,20 @@ fn batch_response_from_results(
     Ok(BatchAllRankingDataQueryResponseSchema { items })
 }
 
+fn raw_json<T: serde::Serialize>(value: &T) -> Result<RawJson, ApiError> {
+    sonic_rs::to_vec(value)
+        .map(|bytes| RawJson(Bytes::from(bytes)))
+        .map_err(|err| {
+            tracing::error!(?err, "json encode error");
+            ApiError::ServiceUnavailable("json encode error".into())
+        })
+}
+
 #[tracing::instrument(skip(state), fields(server, event_id, user_id))]
 pub async fn all_by_user(
     State(state): State<AppState>,
     Path((server, event_id, user_id)): Path<(String, i64, String)>,
-) -> Result<Json<UserAllRankingDataQueryResponseSchema>, ApiError> {
+) -> Result<RawJson, ApiError> {
     let (region, engine) = resolve_region_engine(&state, &server)?;
     let mode = prepare_user_id_mode(&state, &engine, region, event_id).await?;
     let limiter = state.query_limiter().clone();
@@ -114,27 +124,27 @@ pub async fn all_by_user(
             user_data,
         })
     };
-    let response = if let Some(cache) = state.cache() {
-        cache
-            .get_or_fetch(
+    if let Some(cache) = state.cache() {
+        let bytes = cache
+            .get_or_fetch_json_bytes(
                 &server,
                 event_id,
                 suffix,
                 cache.ttl(CacheTtl::TraceRank),
                 fetch,
             )
-            .await?
+            .await?;
+        Ok(RawJson(bytes))
     } else {
-        fetch.await?
-    };
-    Ok(Json(response))
+        raw_json(&fetch.await?)
+    }
 }
 
 #[tracing::instrument(skip(state), fields(server, event_id, rank))]
 pub async fn all_by_rank(
     State(state): State<AppState>,
     Path((server, event_id, rank)): Path<(String, i64, i64)>,
-) -> Result<Json<UserAllRankingDataQueryResponseSchema>, ApiError> {
+) -> Result<RawJson, ApiError> {
     let (region, engine) = resolve_region_engine(&state, &server)?;
     let mode = prepare_user_id_mode(&state, &engine, region, event_id).await?;
     let limiter = state.query_limiter().clone();
@@ -142,20 +152,20 @@ pub async fn all_by_rank(
         let _permit = limiter.acquire_trace(region).await?;
         fetch_rank_trace_response(&engine, event_id, rank, mode).await
     };
-    let response = if let Some(cache) = state.cache() {
-        cache
-            .get_or_fetch(
+    if let Some(cache) = state.cache() {
+        let bytes = cache
+            .get_or_fetch_json_bytes(
                 &server,
                 event_id,
                 rank_suffix("trace", rank),
                 cache.ttl(CacheTtl::TraceRank),
                 fetch,
             )
-            .await?
+            .await?;
+        Ok(RawJson(bytes))
     } else {
-        fetch.await?
-    };
-    Ok(Json(response))
+        raw_json(&fetch.await?)
+    }
 }
 
 #[tracing::instrument(skip(state, raw_query), fields(server, event_id))]
@@ -238,7 +248,7 @@ pub async fn all_by_ranks(
 pub async fn wb_all_by_user(
     State(state): State<AppState>,
     Path((server, event_id, character_id, user_id)): Path<(String, i64, i64, String)>,
-) -> Result<Json<UserAllRankingDataQueryResponseSchema>, ApiError> {
+) -> Result<RawJson, ApiError> {
     let (region, engine) = resolve_region_engine(&state, &server)?;
     let mode = prepare_user_id_mode(&state, &engine, region, event_id).await?;
     let limiter = state.query_limiter().clone();
@@ -262,20 +272,20 @@ pub async fn wb_all_by_user(
             user_data,
         })
     };
-    let response = if let Some(cache) = state.cache() {
-        cache
-            .get_or_fetch(
+    if let Some(cache) = state.cache() {
+        let bytes = cache
+            .get_or_fetch_json_bytes(
                 &server,
                 event_id,
                 suffix,
                 cache.ttl(CacheTtl::TraceRank),
                 fetch,
             )
-            .await?
+            .await?;
+        Ok(RawJson(bytes))
     } else {
-        fetch.await?
-    };
-    Ok(Json(response))
+        raw_json(&fetch.await?)
+    }
 }
 
 #[tracing::instrument(skip(state, raw_query), fields(server, event_id, character_id))]
@@ -365,7 +375,7 @@ pub async fn wb_all_by_ranks(
 pub async fn wb_all_by_rank(
     State(state): State<AppState>,
     Path((server, event_id, character_id, rank)): Path<(String, i64, i64, i64)>,
-) -> Result<Json<UserAllRankingDataQueryResponseSchema>, ApiError> {
+) -> Result<RawJson, ApiError> {
     let (region, engine) = resolve_region_engine(&state, &server)?;
     let mode = prepare_user_id_mode(&state, &engine, region, event_id).await?;
     let limiter = state.query_limiter().clone();
@@ -373,20 +383,20 @@ pub async fn wb_all_by_rank(
         let _permit = limiter.acquire_trace(region).await?;
         fetch_wb_rank_trace_response(&engine, event_id, rank, character_id, mode).await
     };
-    let response = if let Some(cache) = state.cache() {
-        cache
-            .get_or_fetch(
+    if let Some(cache) = state.cache() {
+        let bytes = cache
+            .get_or_fetch_json_bytes(
                 &server,
                 event_id,
                 wb_rank_suffix("trace", character_id, rank),
                 cache.ttl(CacheTtl::TraceRank),
                 fetch,
             )
-            .await?
+            .await?;
+        Ok(RawJson(bytes))
     } else {
-        fetch.await?
-    };
-    Ok(Json(response))
+        raw_json(&fetch.await?)
+    }
 }
 
 #[cfg(test)]
