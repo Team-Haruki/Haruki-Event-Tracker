@@ -1,4 +1,6 @@
-use sea_orm::sea_query::{Alias, Expr, IntoCondition, Order, Query, SelectStatement, SimpleExpr};
+use sea_orm::sea_query::{
+    Alias, Expr, IntoCondition, JoinType, Order, Query, SelectStatement, SimpleExpr,
+};
 use sea_orm::{DbErr, ExprTrait, FromQueryResult};
 
 use crate::db::engine::DatabaseEngine;
@@ -23,6 +25,12 @@ pub struct WebRankingFilter {
     pub timestamp: Option<i64>,
     pub cursor: Option<WebRankingCursor>,
     pub limit: u64,
+}
+
+impl WebRankingFilter {
+    fn is_rank_window(&self) -> bool {
+        self.rank_min.is_some() || self.rank_max.is_some()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -249,6 +257,280 @@ fn apply_common_filters(
     }
 }
 
+fn apply_rank_window_time_filters(
+    stmt: &mut SelectStatement,
+    timestamp_col: SimpleExpr,
+    filter: &WebRankingFilter,
+) {
+    if let Some(start_time) = filter.start_time {
+        stmt.and_where(timestamp_col.clone().gte(start_time));
+    }
+    if let Some(end_time) = filter.end_time {
+        stmt.and_where(timestamp_col.clone().lte(end_time));
+    }
+    if let Some(before) = filter.before {
+        stmt.and_where(timestamp_col.clone().lte(before));
+    }
+    if let Some(after) = filter.after {
+        stmt.and_where(timestamp_col.clone().gte(after));
+    }
+    if let Some(timestamp) = filter.timestamp {
+        stmt.and_where(timestamp_col.eq(timestamp));
+    }
+}
+
+fn apply_rank_window_score_filters(
+    stmt: &mut SelectStatement,
+    score_col: SimpleExpr,
+    filter: &WebRankingFilter,
+) {
+    if let Some(score_min) = filter.score_min {
+        stmt.and_where(score_col.clone().gte(score_min));
+    }
+    if let Some(score_max) = filter.score_max {
+        stmt.and_where(score_col.lte(score_max));
+    }
+}
+
+fn apply_rank_window_outer_filters(
+    stmt: &mut SelectStatement,
+    score_col: SimpleExpr,
+    rank_col: SimpleExpr,
+    user_key_col: SimpleExpr,
+    filter: &WebRankingFilter,
+) {
+    if let Some(score_min) = filter.score_min {
+        stmt.and_where(score_col.clone().gte(score_min));
+    }
+    if let Some(score_max) = filter.score_max {
+        stmt.and_where(score_col.lte(score_max));
+    }
+    if let Some(cursor) = filter.cursor {
+        stmt.and_where(
+            Expr::expr(rank_col.clone())
+                .gt(cursor.rank)
+                .or(Expr::expr(rank_col)
+                    .eq(cursor.rank)
+                    .and(Expr::expr(user_key_col).gt(cursor.user_id_key)))
+                .into_condition()
+                .into(),
+        );
+    }
+}
+
+fn limit_rank_window(filter: &WebRankingFilter) -> u64 {
+    filter.limit + 1
+}
+
+fn latest_rank_window_select(
+    event_id: i64,
+    filter: &WebRankingFilter,
+    mode: PublicUserIdMode,
+) -> SelectStatement {
+    let event_tbl = Alias::new(intern(TableKind::Event, event_id));
+    let time_tbl = Alias::new(intern(TableKind::TimeId, event_id));
+    let users_tbl = Alias::new(intern(TableKind::EventUsers, event_id));
+    let latest_tbl = Alias::new("latest_rank");
+
+    let mut latest = Query::select();
+    latest
+        .expr_as(
+            Expr::col((event_tbl.clone(), event::Column::Rank)),
+            Alias::new("rank"),
+        )
+        .expr_as(
+            Expr::col((event_tbl.clone(), event::Column::TimeId)).max(),
+            Alias::new("time_id"),
+        )
+        .from(event_tbl.clone())
+        .inner_join(
+            time_tbl.clone(),
+            Expr::col((event_tbl.clone(), event::Column::TimeId))
+                .equals((time_tbl.clone(), time_id::Column::TimeId)),
+        );
+    if let Some(rank_min) = filter.rank_min {
+        latest.and_where(Expr::col((event_tbl.clone(), event::Column::Rank)).gte(rank_min));
+    }
+    if let Some(rank_max) = filter.rank_max {
+        latest.and_where(Expr::col((event_tbl.clone(), event::Column::Rank)).lte(rank_max));
+    }
+    apply_rank_window_time_filters(
+        &mut latest,
+        Expr::col((time_tbl.clone(), time_id::Column::Timestamp)),
+        filter,
+    );
+    apply_rank_window_score_filters(
+        &mut latest,
+        Expr::col((event_tbl.clone(), event::Column::Score)),
+        filter,
+    );
+    latest.group_by_col((event_tbl.clone(), event::Column::Rank));
+
+    let mut stmt = Query::select();
+    stmt.expr_as(
+        Expr::col((time_tbl.clone(), time_id::Column::Timestamp)),
+        Alias::new("timestamp"),
+    )
+    .expr_as(
+        Expr::col((users_tbl.clone(), mode.output_column())),
+        Alias::new("user_id"),
+    )
+    .expr_as(
+        Expr::col((users_tbl.clone(), event_users::Column::UserIdKey)),
+        Alias::new("user_id_key"),
+    )
+    .expr_as(
+        Expr::col((event_tbl.clone(), event::Column::Score)),
+        Alias::new("score"),
+    )
+    .expr_as(
+        Expr::col((event_tbl.clone(), event::Column::Rank)),
+        Alias::new("rank"),
+    )
+    .from(event_tbl.clone())
+    .inner_join(
+        time_tbl.clone(),
+        Expr::col((event_tbl.clone(), event::Column::TimeId))
+            .equals((time_tbl.clone(), time_id::Column::TimeId)),
+    )
+    .join_subquery(
+        JoinType::InnerJoin,
+        latest.to_owned(),
+        latest_tbl.clone(),
+        Expr::col((event_tbl.clone(), event::Column::Rank))
+            .equals((latest_tbl.clone(), Alias::new("rank")))
+            .and(
+                Expr::col((event_tbl.clone(), event::Column::TimeId))
+                    .equals((latest_tbl, Alias::new("time_id"))),
+            ),
+    )
+    .inner_join(
+        users_tbl.clone(),
+        Expr::col((event_tbl.clone(), event::Column::UserIdKey))
+            .equals((users_tbl.clone(), event_users::Column::UserIdKey)),
+    );
+
+    apply_rank_window_outer_filters(
+        &mut stmt,
+        Expr::col((event_tbl.clone(), event::Column::Score)),
+        Expr::col((event_tbl.clone(), event::Column::Rank)),
+        Expr::col((event_tbl.clone(), event::Column::UserIdKey)),
+        filter,
+    );
+    stmt.order_by((event_tbl.clone(), event::Column::Rank), Order::Asc)
+        .order_by((event_tbl, event::Column::UserIdKey), Order::Asc)
+        .limit(limit_rank_window(filter))
+        .to_owned()
+}
+
+fn latest_world_bloom_rank_window_select(
+    event_id: i64,
+    character_id: i64,
+    filter: &WebRankingFilter,
+    mode: PublicUserIdMode,
+) -> SelectStatement {
+    let wl_tbl = Alias::new(intern(TableKind::WorldBloom, event_id));
+    let time_tbl = Alias::new(intern(TableKind::TimeId, event_id));
+    let users_tbl = Alias::new(intern(TableKind::EventUsers, event_id));
+    let latest_tbl = Alias::new("latest_rank");
+
+    let mut latest = Query::select();
+    latest
+        .expr_as(
+            Expr::col((wl_tbl.clone(), world_bloom::Column::Rank)),
+            Alias::new("rank"),
+        )
+        .expr_as(
+            Expr::col((wl_tbl.clone(), world_bloom::Column::TimeId)).max(),
+            Alias::new("time_id"),
+        )
+        .from(wl_tbl.clone())
+        .inner_join(
+            time_tbl.clone(),
+            Expr::col((wl_tbl.clone(), world_bloom::Column::TimeId))
+                .equals((time_tbl.clone(), time_id::Column::TimeId)),
+        )
+        .and_where(Expr::col((wl_tbl.clone(), world_bloom::Column::CharacterId)).eq(character_id));
+    if let Some(rank_min) = filter.rank_min {
+        latest.and_where(Expr::col((wl_tbl.clone(), world_bloom::Column::Rank)).gte(rank_min));
+    }
+    if let Some(rank_max) = filter.rank_max {
+        latest.and_where(Expr::col((wl_tbl.clone(), world_bloom::Column::Rank)).lte(rank_max));
+    }
+    apply_rank_window_time_filters(
+        &mut latest,
+        Expr::col((time_tbl.clone(), time_id::Column::Timestamp)),
+        filter,
+    );
+    apply_rank_window_score_filters(
+        &mut latest,
+        Expr::col((wl_tbl.clone(), world_bloom::Column::Score)),
+        filter,
+    );
+    latest.group_by_col((wl_tbl.clone(), world_bloom::Column::Rank));
+
+    let mut stmt = Query::select();
+    stmt.expr_as(
+        Expr::col((time_tbl.clone(), time_id::Column::Timestamp)),
+        Alias::new("timestamp"),
+    )
+    .expr_as(
+        Expr::col((users_tbl.clone(), mode.output_column())),
+        Alias::new("user_id"),
+    )
+    .expr_as(
+        Expr::col((users_tbl.clone(), event_users::Column::UserIdKey)),
+        Alias::new("user_id_key"),
+    )
+    .expr_as(
+        Expr::col((wl_tbl.clone(), world_bloom::Column::Score)),
+        Alias::new("score"),
+    )
+    .expr_as(
+        Expr::col((wl_tbl.clone(), world_bloom::Column::Rank)),
+        Alias::new("rank"),
+    )
+    .expr_as(
+        Expr::col((wl_tbl.clone(), world_bloom::Column::CharacterId)),
+        Alias::new("character_id"),
+    )
+    .from(wl_tbl.clone())
+    .inner_join(
+        time_tbl.clone(),
+        Expr::col((wl_tbl.clone(), world_bloom::Column::TimeId))
+            .equals((time_tbl.clone(), time_id::Column::TimeId)),
+    )
+    .join_subquery(
+        JoinType::InnerJoin,
+        latest.to_owned(),
+        latest_tbl.clone(),
+        Expr::col((wl_tbl.clone(), world_bloom::Column::Rank))
+            .equals((latest_tbl.clone(), Alias::new("rank")))
+            .and(
+                Expr::col((wl_tbl.clone(), world_bloom::Column::TimeId))
+                    .equals((latest_tbl, Alias::new("time_id"))),
+            ),
+    )
+    .inner_join(
+        users_tbl.clone(),
+        Expr::col((wl_tbl.clone(), world_bloom::Column::UserIdKey))
+            .equals((users_tbl.clone(), event_users::Column::UserIdKey)),
+    )
+    .and_where(Expr::col((wl_tbl.clone(), world_bloom::Column::CharacterId)).eq(character_id));
+
+    apply_rank_window_outer_filters(
+        &mut stmt,
+        Expr::col((wl_tbl.clone(), world_bloom::Column::Score)),
+        Expr::col((wl_tbl.clone(), world_bloom::Column::Rank)),
+        Expr::col((wl_tbl.clone(), world_bloom::Column::UserIdKey)),
+        filter,
+    );
+    stmt.order_by((wl_tbl.clone(), world_bloom::Column::Rank), Order::Asc)
+        .order_by((wl_tbl, world_bloom::Column::UserIdKey), Order::Asc)
+        .limit(limit_rank_window(filter))
+        .to_owned()
+}
+
 #[tracing::instrument(skip(engine, filter), fields(event_id))]
 pub async fn search_rankings(
     engine: &DatabaseEngine,
@@ -259,19 +541,24 @@ pub async fn search_rankings(
     let event_tbl = Alias::new(intern(TableKind::Event, event_id));
     let time_tbl = Alias::new(intern(TableKind::TimeId, event_id));
     let users_tbl = Alias::new(intern(TableKind::EventUsers, event_id));
-    let mut stmt = ranking_select(event_id, mode);
-    apply_common_filters(
-        &mut stmt,
-        Expr::col((event_tbl.clone(), event::Column::Score)),
-        Expr::col((event_tbl.clone(), event::Column::Rank)),
-        Expr::col((time_tbl.clone(), time_id::Column::Timestamp)),
-        Expr::col((users_tbl, event_users::Column::UserIdKey)),
-        filter,
-    );
-    stmt.order_by((time_tbl, time_id::Column::Timestamp), Order::Desc)
-        .order_by((event_tbl.clone(), event::Column::Rank), Order::Asc)
-        .order_by((event_tbl, event::Column::UserIdKey), Order::Asc)
-        .limit(filter.limit + 1);
+    let stmt = if filter.is_rank_window() {
+        latest_rank_window_select(event_id, filter, mode)
+    } else {
+        let mut stmt = ranking_select(event_id, mode);
+        apply_common_filters(
+            &mut stmt,
+            Expr::col((event_tbl.clone(), event::Column::Score)),
+            Expr::col((event_tbl.clone(), event::Column::Rank)),
+            Expr::col((time_tbl.clone(), time_id::Column::Timestamp)),
+            Expr::col((users_tbl, event_users::Column::UserIdKey)),
+            filter,
+        );
+        stmt.order_by((time_tbl, time_id::Column::Timestamp), Order::Desc)
+            .order_by((event_tbl.clone(), event::Column::Rank), Order::Asc)
+            .order_by((event_tbl, event::Column::UserIdKey), Order::Asc)
+            .limit(filter.limit + 1)
+            .to_owned()
+    };
 
     let backend = engine.backend();
     let mut rows = RankingPageRow::find_by_statement(backend.build(&stmt))
@@ -302,20 +589,27 @@ pub async fn search_world_bloom_rankings(
     let wl_tbl = Alias::new(intern(TableKind::WorldBloom, event_id));
     let time_tbl = Alias::new(intern(TableKind::TimeId, event_id));
     let users_tbl = Alias::new(intern(TableKind::EventUsers, event_id));
-    let mut stmt = world_bloom_select(event_id, mode);
-    stmt.and_where(Expr::col((wl_tbl.clone(), world_bloom::Column::CharacterId)).eq(character_id));
-    apply_common_filters(
-        &mut stmt,
-        Expr::col((wl_tbl.clone(), world_bloom::Column::Score)),
-        Expr::col((wl_tbl.clone(), world_bloom::Column::Rank)),
-        Expr::col((time_tbl.clone(), time_id::Column::Timestamp)),
-        Expr::col((users_tbl, event_users::Column::UserIdKey)),
-        filter,
-    );
-    stmt.order_by((time_tbl, time_id::Column::Timestamp), Order::Desc)
-        .order_by((wl_tbl.clone(), world_bloom::Column::Rank), Order::Asc)
-        .order_by((wl_tbl, world_bloom::Column::UserIdKey), Order::Asc)
-        .limit(filter.limit + 1);
+    let stmt = if filter.is_rank_window() {
+        latest_world_bloom_rank_window_select(event_id, character_id, filter, mode)
+    } else {
+        let mut stmt = world_bloom_select(event_id, mode);
+        stmt.and_where(
+            Expr::col((wl_tbl.clone(), world_bloom::Column::CharacterId)).eq(character_id),
+        );
+        apply_common_filters(
+            &mut stmt,
+            Expr::col((wl_tbl.clone(), world_bloom::Column::Score)),
+            Expr::col((wl_tbl.clone(), world_bloom::Column::Rank)),
+            Expr::col((time_tbl.clone(), time_id::Column::Timestamp)),
+            Expr::col((users_tbl, event_users::Column::UserIdKey)),
+            filter,
+        );
+        stmt.order_by((time_tbl, time_id::Column::Timestamp), Order::Desc)
+            .order_by((wl_tbl.clone(), world_bloom::Column::Rank), Order::Asc)
+            .order_by((wl_tbl, world_bloom::Column::UserIdKey), Order::Asc)
+            .limit(filter.limit + 1)
+            .to_owned()
+    };
 
     let backend = engine.backend();
     let mut rows = WorldBloomRankingPageRow::find_by_statement(backend.build(&stmt))
@@ -590,6 +884,103 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn web_ranking_window_returns_latest_row_per_rank() {
+        let engine = sqlite_engine().await;
+        let event_id = 553;
+        create_event_tables(&engine, SekaiServerRegion::Jp, event_id, false)
+            .await
+            .unwrap();
+        seed_normal_event_with_history(&engine, event_id).await;
+
+        let filter = WebRankingFilter {
+            rank_min: Some(1),
+            rank_max: Some(3),
+            score_min: None,
+            score_max: None,
+            start_time: None,
+            end_time: None,
+            before: None,
+            after: None,
+            timestamp: None,
+            cursor: None,
+            limit: 10,
+        };
+        let (items, cursor) = search_rankings(&engine, event_id, &filter, PublicUserIdMode::Unique)
+            .await
+            .unwrap();
+
+        assert!(cursor.is_none());
+        let rows: Vec<_> = items
+            .into_iter()
+            .map(|item| match item {
+                RecordedRankData::Normal(row) => row,
+                RecordedRankData::WorldBloom(_) => panic!("expected normal ranking"),
+            })
+            .collect();
+        assert_eq!(
+            rows.iter().map(|row| row.rank).collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+        assert_eq!(
+            rows.iter().map(|row| row.timestamp).collect::<Vec<_>>(),
+            vec![1_710_000_060, 1_710_000_060, 1_710_000_060]
+        );
+        assert_eq!(
+            rows.iter().map(|row| row.score).collect::<Vec<_>>(),
+            vec![1300, 1200, 1100]
+        );
+    }
+
+    #[tokio::test]
+    async fn web_world_bloom_window_returns_latest_row_per_rank() {
+        let engine = sqlite_engine().await;
+        let event_id = 554;
+        create_event_tables(&engine, SekaiServerRegion::Jp, event_id, true)
+            .await
+            .unwrap();
+        seed_world_bloom_event_with_history(&engine, event_id).await;
+
+        let filter = WebRankingFilter {
+            rank_min: Some(1),
+            rank_max: Some(3),
+            score_min: None,
+            score_max: None,
+            start_time: None,
+            end_time: None,
+            before: None,
+            after: None,
+            timestamp: None,
+            cursor: None,
+            limit: 10,
+        };
+        let (items, cursor) =
+            search_world_bloom_rankings(&engine, event_id, 17, &filter, PublicUserIdMode::Unique)
+                .await
+                .unwrap();
+
+        assert!(cursor.is_none());
+        let rows: Vec<_> = items
+            .into_iter()
+            .map(|item| match item {
+                RecordedRankData::WorldBloom(row) => row,
+                RecordedRankData::Normal(_) => panic!("expected world bloom ranking"),
+            })
+            .collect();
+        assert_eq!(
+            rows.iter().map(|row| row.rank).collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+        assert_eq!(
+            rows.iter().map(|row| row.timestamp).collect::<Vec<_>>(),
+            vec![1_710_000_060, 1_710_000_060, 1_710_000_060]
+        );
+        assert_eq!(
+            rows.iter().map(|row| row.score).collect::<Vec<_>>(),
+            vec![2300, 2200, 2100]
+        );
+    }
+
+    #[tokio::test]
     async fn web_user_search_filters_profile_fields() {
         let engine = sqlite_engine().await;
         let event_id = 552;
@@ -647,6 +1038,77 @@ mod tests {
             format!(
                 "INSERT INTO {event_tbl} (time_id, user_id_key, score, rank) \
                 VALUES (1, 1, 1000, 1), (1, 2, 900, 2)"
+            ),
+        ] {
+            engine
+                .conn()
+                .execute_raw(Statement::from_string(DatabaseBackend::Sqlite, sql))
+                .await
+                .unwrap();
+        }
+    }
+
+    async fn seed_normal_event_with_history(engine: &DatabaseEngine, event_id: i64) {
+        let users_tbl = intern(TableKind::EventUsers, event_id);
+        let time_tbl = intern(TableKind::TimeId, event_id);
+        let event_tbl = intern(TableKind::Event, event_id);
+        for sql in [
+            format!(
+                "INSERT INTO {users_tbl} \
+                (user_id, unique_id, name, cheerful_team_id, card_id, card_level, \
+                card_master_rank, card_special_training_status, card_default_image, \
+                profile_word, profile_honors_json, player_frames_json) VALUES \
+                ('100', 'u-public-1', 'Alpha', NULL, 1404, 60, 5, 'done', 'original', \
+                'hello world', '[]', '[]'), \
+                ('200', 'u-public-2', 'Beta', NULL, 1300, 50, 0, 'none', 'original', \
+                'other word', '[]', '[]'), \
+                ('300', 'u-public-3', 'Gamma', NULL, 1200, 50, 0, 'none', 'original', \
+                'third word', '[]', '[]')"
+            ),
+            format!(
+                "INSERT INTO {time_tbl} (timestamp, status) VALUES \
+                (1710000000, 0), (1710000060, 0)"
+            ),
+            format!(
+                "INSERT INTO {event_tbl} (time_id, user_id_key, score, rank) VALUES \
+                (1, 1, 1000, 1), (1, 2, 900, 2), (1, 3, 800, 3), \
+                (2, 1, 1300, 1), (2, 2, 1200, 2), (2, 3, 1100, 3)"
+            ),
+        ] {
+            engine
+                .conn()
+                .execute_raw(Statement::from_string(DatabaseBackend::Sqlite, sql))
+                .await
+                .unwrap();
+        }
+    }
+
+    async fn seed_world_bloom_event_with_history(engine: &DatabaseEngine, event_id: i64) {
+        let users_tbl = intern(TableKind::EventUsers, event_id);
+        let time_tbl = intern(TableKind::TimeId, event_id);
+        let wl_tbl = intern(TableKind::WorldBloom, event_id);
+        for sql in [
+            format!(
+                "INSERT INTO {users_tbl} \
+                (user_id, unique_id, name, cheerful_team_id, card_id, card_level, \
+                card_master_rank, card_special_training_status, card_default_image, \
+                profile_word, profile_honors_json, player_frames_json) VALUES \
+                ('100', 'u-public-1', 'Alpha', NULL, 1404, 60, 5, 'done', 'original', \
+                'hello world', '[]', '[]'), \
+                ('200', 'u-public-2', 'Beta', NULL, 1300, 50, 0, 'none', 'original', \
+                'other word', '[]', '[]'), \
+                ('300', 'u-public-3', 'Gamma', NULL, 1200, 50, 0, 'none', 'original', \
+                'third word', '[]', '[]')"
+            ),
+            format!(
+                "INSERT INTO {time_tbl} (timestamp, status) VALUES \
+                (1710000000, 0), (1710000060, 0)"
+            ),
+            format!(
+                "INSERT INTO {wl_tbl} (time_id, user_id_key, character_id, score, rank) VALUES \
+                (1, 1, 17, 2000, 1), (1, 2, 17, 1900, 2), (1, 3, 17, 1800, 3), \
+                (2, 1, 17, 2300, 1), (2, 2, 17, 2200, 2), (2, 3, 17, 2100, 3), \
+                (2, 1, 19, 9000, 1)"
             ),
         ] {
             engine
