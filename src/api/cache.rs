@@ -729,9 +729,14 @@ impl ApiCache {
                 lookup.await
             }
             Flight::Owner(entry) => {
+                let guard = SingleFlightOwnerGuard::new(
+                    self.singleflight.clone(),
+                    flight_key.clone(),
+                    entry,
+                );
                 let result = lookup.await;
                 let shared = shared_fetch_bytes_result(&result);
-                self.singleflight.finish(&flight_key, entry, shared).await;
+                guard.finish(shared).await;
                 result
             }
         }
@@ -767,11 +772,16 @@ impl ApiCache {
                 fetch.await
             }
             Flight::Owner(entry) => {
+                let guard = SingleFlightOwnerGuard::new(
+                    self.singleflight.clone(),
+                    flight_key.clone(),
+                    entry,
+                );
                 let result = self
                     .fetch_and_maybe_cache_bytes(fetch, write_context, options)
                     .await;
                 let shared = shared_fetch_bytes_result(&result);
-                self.singleflight.finish(&flight_key, entry, shared).await;
+                guard.finish(shared).await;
                 result
             }
         }
@@ -806,9 +816,14 @@ impl ApiCache {
                 lookup.await
             }
             Flight::Owner(entry) => {
+                let guard = SingleFlightOwnerGuard::new(
+                    self.singleflight.clone(),
+                    flight_key.clone(),
+                    entry,
+                );
                 let result = lookup.await;
                 let shared = shared_cached_json_result(&result);
-                self.singleflight.finish(&flight_key, entry, shared).await;
+                guard.finish(shared).await;
                 result
             }
         }
@@ -844,11 +859,16 @@ impl ApiCache {
                 self.encode_response(fetch.await?, None, options).await
             }
             Flight::Owner(entry) => {
+                let guard = SingleFlightOwnerGuard::new(
+                    self.singleflight.clone(),
+                    flight_key.clone(),
+                    entry,
+                );
                 let result = self
                     .fetch_and_maybe_cache_encoded(fetch, write_context, options)
                     .await;
                 let shared = shared_cached_json_result(&result);
-                self.singleflight.finish(&flight_key, entry, shared).await;
+                guard.finish(shared).await;
                 result
             }
         }
@@ -1387,6 +1407,40 @@ enum SharedFetchResult {
     NotFound,
 }
 
+struct SingleFlightOwnerGuard {
+    singleflight: SingleFlight,
+    key: String,
+    entry: Option<Arc<InFlightEntry>>,
+}
+
+impl SingleFlightOwnerGuard {
+    fn new(singleflight: SingleFlight, key: String, entry: Arc<InFlightEntry>) -> Self {
+        Self {
+            singleflight,
+            key,
+            entry: Some(entry),
+        }
+    }
+
+    async fn finish(mut self, result: Option<SharedFetchResult>) {
+        if let Some(entry) = self.entry.take() {
+            self.singleflight.finish(&self.key, entry, result).await;
+        }
+    }
+}
+
+impl Drop for SingleFlightOwnerGuard {
+    fn drop(&mut self) {
+        if let Some(entry) = self.entry.take() {
+            let singleflight = self.singleflight.clone();
+            let key = self.key.clone();
+            tokio::spawn(async move {
+                singleflight.finish(&key, entry, None).await;
+            });
+        }
+    }
+}
+
 impl SingleFlight {
     async fn begin(&self, key: String) -> Flight {
         let mut inner = self.inner.lock().await;
@@ -1776,5 +1830,29 @@ mod tests {
         let shared = task.await.unwrap();
         assert_eq!(shared.encoding, CachedJsonEncoding::Gzip);
         assert_eq!(shared.bytes, Bytes::from_static(b"gzipped"));
+    }
+
+    #[tokio::test]
+    async fn singleflight_owner_drop_releases_waiters_and_key() {
+        let singleflight = SingleFlight::default();
+        let key = "trace:ranks:1,2,3".to_owned();
+        let owner = match singleflight.begin(key.clone()).await {
+            Flight::Owner(entry) => entry,
+            Flight::Waiter(_) => panic!("first caller should own the flight"),
+        };
+        let guard = SingleFlightOwnerGuard::new(singleflight.clone(), key.clone(), owner);
+        let waiter = match singleflight.begin(key.clone()).await {
+            Flight::Waiter(entry) => entry,
+            Flight::Owner(_) => panic!("second caller should wait on the flight"),
+        };
+        let task = tokio::spawn(async move { SingleFlight::wait_bytes(waiter).await });
+
+        drop(guard);
+
+        assert!(task.await.unwrap().is_none());
+        match singleflight.begin(key).await {
+            Flight::Owner(_) => {}
+            Flight::Waiter(_) => panic!("dropped owner should remove in-flight key"),
+        }
     }
 }
