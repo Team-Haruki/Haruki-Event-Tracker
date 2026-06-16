@@ -19,6 +19,11 @@ pub struct CacheStats {
     pub dirty_bypass: AtomicU64,
     pub lookup_singleflight_wait: AtomicU64,
     pub singleflight_wait: AtomicU64,
+    pub batch_l1_hit: AtomicU64,
+    pub batch_l2_hit: AtomicU64,
+    pub batch_miss: AtomicU64,
+    pub batch_too_large: AtomicU64,
+    pub batch_singleflight_wait: AtomicU64,
 }
 
 impl CacheStats {
@@ -33,6 +38,11 @@ impl CacheStats {
             dirty_bypass: AtomicU64::new(0),
             lookup_singleflight_wait: AtomicU64::new(0),
             singleflight_wait: AtomicU64::new(0),
+            batch_l1_hit: AtomicU64::new(0),
+            batch_l2_hit: AtomicU64::new(0),
+            batch_miss: AtomicU64::new(0),
+            batch_too_large: AtomicU64::new(0),
+            batch_singleflight_wait: AtomicU64::new(0),
         }
     }
 }
@@ -115,6 +125,11 @@ fn log_snapshot() {
         dirty_bypass = take(&CACHE_STATS.dirty_bypass),
         lookup_singleflight_wait = take(&CACHE_STATS.lookup_singleflight_wait),
         singleflight_wait = take(&CACHE_STATS.singleflight_wait),
+        batch_l1_hit = take(&CACHE_STATS.batch_l1_hit),
+        batch_l2_hit = take(&CACHE_STATS.batch_l2_hit),
+        batch_miss = take(&CACHE_STATS.batch_miss),
+        batch_too_large = take(&CACHE_STATS.batch_too_large),
+        batch_singleflight_wait = take(&CACHE_STATS.batch_singleflight_wait),
         access_logged = take(&ACCESS_STATS.logged),
         access_sampled = take(&ACCESS_STATS.sampled),
         access_dropped = take(&ACCESS_STATS.dropped),

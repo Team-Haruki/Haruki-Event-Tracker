@@ -195,6 +195,35 @@ impl ApiCache {
             .await
     }
 
+    #[tracing::instrument(skip(self, fetch), fields(server, event_id, suffix, prefer_gzip))]
+    pub async fn get_or_fetch_batch_encoded_json<Fut>(
+        &self,
+        server: &str,
+        event_id: i64,
+        suffix: String,
+        ttl_secs: u64,
+        prefer_gzip: bool,
+        fetch: Fut,
+    ) -> Result<CachedJson, ApiError>
+    where
+        Fut: Future<Output = Result<Bytes, ApiError>>,
+    {
+        let options = CacheOptions {
+            max_value_bytes: self.cfg.batch_max_value_bytes,
+            is_batch: true,
+        };
+        if !prefer_gzip || !self.cfg.precompress_gzip_enabled {
+            return self
+                .get_or_fetch_bytes_with_options(server, event_id, suffix, ttl_secs, fetch, options)
+                .await
+                .map(CachedJson::identity);
+        }
+        self.get_or_fetch_precompressed_bytes_with_options(
+            server, event_id, suffix, ttl_secs, fetch, options,
+        )
+        .await
+    }
+
     async fn get_or_fetch_bytes<Fut>(
         &self,
         server: &str,
@@ -202,6 +231,32 @@ impl ApiCache {
         suffix: String,
         ttl_secs: u64,
         fetch: Fut,
+    ) -> Result<Bytes, ApiError>
+    where
+        Fut: Future<Output = Result<Bytes, ApiError>>,
+    {
+        self.get_or_fetch_bytes_with_options(
+            server,
+            event_id,
+            suffix,
+            ttl_secs,
+            fetch,
+            CacheOptions {
+                max_value_bytes: self.cfg.max_value_bytes,
+                is_batch: false,
+            },
+        )
+        .await
+    }
+
+    async fn get_or_fetch_bytes_with_options<Fut>(
+        &self,
+        server: &str,
+        event_id: i64,
+        suffix: String,
+        ttl_secs: u64,
+        fetch: Fut,
+        options: CacheOptions,
     ) -> Result<Bytes, ApiError>
     where
         Fut: Future<Output = Result<Bytes, ApiError>>,
@@ -221,23 +276,37 @@ impl ApiCache {
                         dirty_flight_key(server, event_id, control.epoch, &suffix),
                         fetch,
                         None,
+                        options,
                     )
                     .await;
             }
             let key = value_key(server, event_id, control.epoch, &suffix);
             if let Some(bytes) = self.l1.get_value(&key).await {
                 incr(&CACHE_STATS.l1_hit);
-                tracing::debug!(cache_status = "l1_hit", "api cache L1 hit");
+                if options.is_batch {
+                    incr(&CACHE_STATS.batch_l1_hit);
+                }
+                tracing::debug!(
+                    cache_status = cache_status(options, "l1_hit"),
+                    "api cache L1 hit"
+                );
                 return Ok(bytes);
             }
             return self
                 .lookup_with_singleflight(
                     lookup_flight_key(server, event_id, control.epoch, &suffix),
+                    options,
                     async {
                         match self.read_l2_value(&key).await {
                             Ok(L2ValueRead::Hit(bytes)) => {
                                 incr(&CACHE_STATS.l2_hit);
-                                tracing::debug!(cache_status = "l2_hit", "api cache L2 hit");
+                                if options.is_batch {
+                                    incr(&CACHE_STATS.batch_l2_hit);
+                                }
+                                tracing::debug!(
+                                    cache_status = cache_status(options, "l2_hit"),
+                                    "api cache L2 hit"
+                                );
                                 self.store_l1_value(key, bytes.clone()).await;
                                 Ok(bytes)
                             }
@@ -251,7 +320,13 @@ impl ApiCache {
                             }
                             Ok(L2ValueRead::Miss) => {
                                 incr(&CACHE_STATS.l2_miss);
-                                tracing::debug!(cache_status = "l2_miss", "api cache miss");
+                                if options.is_batch {
+                                    incr(&CACHE_STATS.batch_miss);
+                                }
+                                tracing::debug!(
+                                    cache_status = cache_status(options, "l2_miss"),
+                                    "api cache miss"
+                                );
                                 self.fetch_and_maybe_cache_bytes(
                                     fetch,
                                     Some(CacheWriteContext {
@@ -267,6 +342,7 @@ impl ApiCache {
                                         ),
                                         ttl_secs,
                                     }),
+                                    options,
                                 )
                                 .await
                             }
@@ -281,56 +357,74 @@ impl ApiCache {
                 .await;
         }
 
-        self.lookup_with_singleflight(lookup_flight_key(server, event_id, -1, &suffix), async {
-            match self.read_l2_combined(server, event_id, &suffix).await {
-                Ok(L2CombinedRead::Dirty { epoch }) => {
-                    self.store_l1_control(control_key, epoch, true).await;
-                    incr(&CACHE_STATS.dirty_bypass);
-                    tracing::debug!(cache_status = "dirty_bypass", "api cache dirty bypass");
-                    self.fetch_bytes_with_singleflight(
-                        dirty_flight_key(server, event_id, epoch, &suffix),
-                        fetch,
-                        None,
-                    )
-                    .await
+        self.lookup_with_singleflight(
+            lookup_flight_key(server, event_id, -1, &suffix),
+            options,
+            async {
+                match self.read_l2_combined(server, event_id, &suffix).await {
+                    Ok(L2CombinedRead::Dirty { epoch }) => {
+                        self.store_l1_control(control_key, epoch, true).await;
+                        incr(&CACHE_STATS.dirty_bypass);
+                        tracing::debug!(cache_status = "dirty_bypass", "api cache dirty bypass");
+                        self.fetch_bytes_with_singleflight(
+                            dirty_flight_key(server, event_id, epoch, &suffix),
+                            fetch,
+                            None,
+                            options,
+                        )
+                        .await
+                    }
+                    Ok(L2CombinedRead::Hit { epoch, key, bytes }) => {
+                        self.store_l1_control(control_key, epoch, false).await;
+                        self.store_l1_value(key, bytes.clone()).await;
+                        incr(&CACHE_STATS.l2_hit);
+                        if options.is_batch {
+                            incr(&CACHE_STATS.batch_l2_hit);
+                        }
+                        tracing::debug!(
+                            cache_status = cache_status(options, "l2_hit"),
+                            "api cache L2 hit"
+                        );
+                        Ok(bytes)
+                    }
+                    Ok(L2CombinedRead::NotFound { epoch }) => {
+                        self.store_l1_control(control_key, epoch, false).await;
+                        incr(&CACHE_STATS.l2_not_found);
+                        tracing::debug!(cache_status = "l2_not_found", "api cache negative hit");
+                        Err(ApiError::NotFound)
+                    }
+                    Ok(L2CombinedRead::Miss { epoch, key }) => {
+                        self.store_l1_control(control_key, epoch, false).await;
+                        incr(&CACHE_STATS.l2_miss);
+                        if options.is_batch {
+                            incr(&CACHE_STATS.batch_miss);
+                        }
+                        tracing::debug!(
+                            cache_status = cache_status(options, "l2_miss"),
+                            "api cache miss"
+                        );
+                        self.fetch_and_maybe_cache_bytes(
+                            fetch,
+                            Some(CacheWriteContext {
+                                server: server.to_owned(),
+                                event_id,
+                                epoch,
+                                value_key: key,
+                                negative_key: negative_key(server, event_id, epoch, &suffix),
+                                ttl_secs,
+                            }),
+                            options,
+                        )
+                        .await
+                    }
+                    Err(err) => {
+                        incr(&CACHE_STATS.l2_timeout);
+                        tracing::warn!(%err, "api cache combined read failed");
+                        fetch.await
+                    }
                 }
-                Ok(L2CombinedRead::Hit { epoch, key, bytes }) => {
-                    self.store_l1_control(control_key, epoch, false).await;
-                    self.store_l1_value(key, bytes.clone()).await;
-                    incr(&CACHE_STATS.l2_hit);
-                    tracing::debug!(cache_status = "l2_hit", "api cache L2 hit");
-                    Ok(bytes)
-                }
-                Ok(L2CombinedRead::NotFound { epoch }) => {
-                    self.store_l1_control(control_key, epoch, false).await;
-                    incr(&CACHE_STATS.l2_not_found);
-                    tracing::debug!(cache_status = "l2_not_found", "api cache negative hit");
-                    Err(ApiError::NotFound)
-                }
-                Ok(L2CombinedRead::Miss { epoch, key }) => {
-                    self.store_l1_control(control_key, epoch, false).await;
-                    incr(&CACHE_STATS.l2_miss);
-                    tracing::debug!(cache_status = "l2_miss", "api cache miss");
-                    self.fetch_and_maybe_cache_bytes(
-                        fetch,
-                        Some(CacheWriteContext {
-                            server: server.to_owned(),
-                            event_id,
-                            epoch,
-                            value_key: key,
-                            negative_key: negative_key(server, event_id, epoch, &suffix),
-                            ttl_secs,
-                        }),
-                    )
-                    .await
-                }
-                Err(err) => {
-                    incr(&CACHE_STATS.l2_timeout);
-                    tracing::warn!(%err, "api cache combined read failed");
-                    fetch.await
-                }
-            }
-        })
+            },
+        )
         .await
     }
 
@@ -345,9 +439,35 @@ impl ApiCache {
     where
         Fut: Future<Output = Result<Bytes, ApiError>>,
     {
+        self.get_or_fetch_precompressed_bytes_with_options(
+            server,
+            event_id,
+            suffix,
+            ttl_secs,
+            fetch,
+            CacheOptions {
+                max_value_bytes: self.cfg.max_value_bytes,
+                is_batch: false,
+            },
+        )
+        .await
+    }
+
+    async fn get_or_fetch_precompressed_bytes_with_options<Fut>(
+        &self,
+        server: &str,
+        event_id: i64,
+        suffix: String,
+        ttl_secs: u64,
+        fetch: Fut,
+        options: CacheOptions,
+    ) -> Result<CachedJson, ApiError>
+    where
+        Fut: Future<Output = Result<Bytes, ApiError>>,
+    {
         let control_key = control_cache_key(server, event_id);
         if ttl_secs == 0 {
-            return self.encode_response(fetch.await?, None).await;
+            return self.encode_response(fetch.await?, None, options).await;
         }
 
         if let Some(control) = self.l1.get_control(&control_key).await {
@@ -360,6 +480,7 @@ impl ApiCache {
                         gzip_flight_key(server, event_id, control.epoch, &suffix),
                         fetch,
                         None,
+                        options,
                     )
                     .await;
             }
@@ -368,12 +489,24 @@ impl ApiCache {
             let gzip = gzip_key(&key);
             if let Some(bytes) = self.l1.get_value(&gzip).await {
                 incr(&CACHE_STATS.l1_hit);
-                tracing::debug!(cache_status = "l1_gzip_hit", "api cache L1 gzip hit");
+                if options.is_batch {
+                    incr(&CACHE_STATS.batch_l1_hit);
+                }
+                tracing::debug!(
+                    cache_status = cache_status(options, "l1_gzip_hit"),
+                    "api cache L1 gzip hit"
+                );
                 return Ok(CachedJson::gzip(bytes));
             }
             if let Some(bytes) = self.l1.get_value(&key).await {
                 incr(&CACHE_STATS.l1_hit);
-                tracing::debug!(cache_status = "l1_hit", "api cache L1 hit, building gzip");
+                if options.is_batch {
+                    incr(&CACHE_STATS.batch_l1_hit);
+                }
+                tracing::debug!(
+                    cache_status = cache_status(options, "l1_hit"),
+                    "api cache L1 hit, building gzip"
+                );
                 return self
                     .encode_response(
                         bytes,
@@ -385,6 +518,7 @@ impl ApiCache {
                             negative_key: negative_key(server, event_id, control.epoch, &suffix),
                             ttl_secs,
                         }),
+                        options,
                     )
                     .await;
             }
@@ -392,12 +526,16 @@ impl ApiCache {
             return self
                 .lookup_encoded_with_singleflight(
                     gzip_lookup_flight_key(server, event_id, control.epoch, &suffix),
+                    options,
                     async {
                         match self.read_l2_encoded(&key, &gzip).await {
                             Ok(L2EncodedRead::Gzip(bytes)) => {
                                 incr(&CACHE_STATS.l2_hit);
+                                if options.is_batch {
+                                    incr(&CACHE_STATS.batch_l2_hit);
+                                }
                                 tracing::debug!(
-                                    cache_status = "l2_gzip_hit",
+                                    cache_status = cache_status(options, "l2_gzip_hit"),
                                     "api cache L2 gzip hit"
                                 );
                                 self.store_l1_value(gzip, bytes.clone()).await;
@@ -405,8 +543,11 @@ impl ApiCache {
                             }
                             Ok(L2EncodedRead::Identity(bytes)) => {
                                 incr(&CACHE_STATS.l2_hit);
+                                if options.is_batch {
+                                    incr(&CACHE_STATS.batch_l2_hit);
+                                }
                                 tracing::debug!(
-                                    cache_status = "l2_hit",
+                                    cache_status = cache_status(options, "l2_hit"),
                                     "api cache L2 hit, building gzip"
                                 );
                                 self.store_l1_value(key.clone(), bytes.clone()).await;
@@ -425,6 +566,7 @@ impl ApiCache {
                                         ),
                                         ttl_secs,
                                     }),
+                                    options,
                                 )
                                 .await
                             }
@@ -438,7 +580,13 @@ impl ApiCache {
                             }
                             Ok(L2EncodedRead::Miss) => {
                                 incr(&CACHE_STATS.l2_miss);
-                                tracing::debug!(cache_status = "l2_miss", "api cache miss");
+                                if options.is_batch {
+                                    incr(&CACHE_STATS.batch_miss);
+                                }
+                                tracing::debug!(
+                                    cache_status = cache_status(options, "l2_miss"),
+                                    "api cache miss"
+                                );
                                 self.fetch_and_maybe_cache_encoded(
                                     fetch,
                                     Some(CacheWriteContext {
@@ -454,13 +602,14 @@ impl ApiCache {
                                         ),
                                         ttl_secs,
                                     }),
+                                    options,
                                 )
                                 .await
                             }
                             Err(err) => {
                                 incr(&CACHE_STATS.l2_timeout);
                                 tracing::warn!(%err, "api cache encoded read failed");
-                                self.encode_response(fetch.await?, None).await
+                                self.encode_response(fetch.await?, None, options).await
                             }
                         }
                     },
@@ -470,6 +619,7 @@ impl ApiCache {
 
         self.lookup_encoded_with_singleflight(
             gzip_lookup_flight_key(server, event_id, -1, &suffix),
+            options,
             async {
                 match self.read_l2_combined(server, event_id, &suffix).await {
                     Ok(L2CombinedRead::Dirty { epoch }) => {
@@ -480,6 +630,7 @@ impl ApiCache {
                             gzip_flight_key(server, event_id, epoch, &suffix),
                             fetch,
                             None,
+                            options,
                         )
                         .await
                     }
@@ -487,7 +638,13 @@ impl ApiCache {
                         self.store_l1_control(control_key, epoch, false).await;
                         self.store_l1_value(key.clone(), bytes.clone()).await;
                         incr(&CACHE_STATS.l2_hit);
-                        tracing::debug!(cache_status = "l2_hit", "api cache L2 hit");
+                        if options.is_batch {
+                            incr(&CACHE_STATS.batch_l2_hit);
+                        }
+                        tracing::debug!(
+                            cache_status = cache_status(options, "l2_hit"),
+                            "api cache L2 hit"
+                        );
                         self.encode_response(
                             bytes,
                             Some(CacheWriteContext {
@@ -498,6 +655,7 @@ impl ApiCache {
                                 negative_key: negative_key(server, event_id, epoch, &suffix),
                                 ttl_secs,
                             }),
+                            options,
                         )
                         .await
                     }
@@ -510,7 +668,13 @@ impl ApiCache {
                     Ok(L2CombinedRead::Miss { epoch, key }) => {
                         self.store_l1_control(control_key, epoch, false).await;
                         incr(&CACHE_STATS.l2_miss);
-                        tracing::debug!(cache_status = "l2_miss", "api cache miss");
+                        if options.is_batch {
+                            incr(&CACHE_STATS.batch_miss);
+                        }
+                        tracing::debug!(
+                            cache_status = cache_status(options, "l2_miss"),
+                            "api cache miss"
+                        );
                         self.fetch_and_maybe_cache_encoded(
                             fetch,
                             Some(CacheWriteContext {
@@ -521,13 +685,14 @@ impl ApiCache {
                                 negative_key: negative_key(server, event_id, epoch, &suffix),
                                 ttl_secs,
                             }),
+                            options,
                         )
                         .await
                     }
                     Err(err) => {
                         incr(&CACHE_STATS.l2_timeout);
                         tracing::warn!(%err, "api cache combined read failed");
-                        self.encode_response(fetch.await?, None).await
+                        self.encode_response(fetch.await?, None, options).await
                     }
                 }
             },
@@ -538,6 +703,7 @@ impl ApiCache {
     async fn lookup_with_singleflight<Fut>(
         &self,
         flight_key: String,
+        options: CacheOptions,
         lookup: Fut,
     ) -> Result<Bytes, ApiError>
     where
@@ -546,8 +712,11 @@ impl ApiCache {
         match self.singleflight.begin(flight_key.clone()).await {
             Flight::Waiter(entry) => {
                 incr(&CACHE_STATS.lookup_singleflight_wait);
+                if options.is_batch {
+                    incr(&CACHE_STATS.batch_singleflight_wait);
+                }
                 tracing::debug!(
-                    cache_status = "lookup_singleflight_wait",
+                    cache_status = cache_status(options, "lookup_singleflight_wait"),
                     "api cache waiting for in-flight lookup"
                 );
                 if let Some(value) = SingleFlight::wait_bytes(entry).await {
@@ -573,6 +742,7 @@ impl ApiCache {
         flight_key: String,
         fetch: Fut,
         write_context: Option<CacheWriteContext>,
+        options: CacheOptions,
     ) -> Result<Bytes, ApiError>
     where
         Fut: Future<Output = Result<Bytes, ApiError>>,
@@ -580,8 +750,11 @@ impl ApiCache {
         match self.singleflight.begin(flight_key.clone()).await {
             Flight::Waiter(entry) => {
                 incr(&CACHE_STATS.singleflight_wait);
+                if options.is_batch {
+                    incr(&CACHE_STATS.batch_singleflight_wait);
+                }
                 tracing::debug!(
-                    cache_status = "singleflight_wait",
+                    cache_status = cache_status(options, "singleflight_wait"),
                     "api cache waiting for in-flight fetch"
                 );
                 if let Some(value) = SingleFlight::wait_bytes(entry).await {
@@ -594,7 +767,9 @@ impl ApiCache {
                 fetch.await
             }
             Flight::Owner(entry) => {
-                let result = self.fetch_and_maybe_cache_bytes(fetch, write_context).await;
+                let result = self
+                    .fetch_and_maybe_cache_bytes(fetch, write_context, options)
+                    .await;
                 let shared = shared_fetch_bytes_result(&result);
                 self.singleflight.finish(&flight_key, entry, shared).await;
                 result
@@ -605,6 +780,7 @@ impl ApiCache {
     async fn lookup_encoded_with_singleflight<Fut>(
         &self,
         flight_key: String,
+        options: CacheOptions,
         lookup: Fut,
     ) -> Result<CachedJson, ApiError>
     where
@@ -613,8 +789,11 @@ impl ApiCache {
         match self.singleflight.begin(flight_key.clone()).await {
             Flight::Waiter(entry) => {
                 incr(&CACHE_STATS.lookup_singleflight_wait);
+                if options.is_batch {
+                    incr(&CACHE_STATS.batch_singleflight_wait);
+                }
                 tracing::debug!(
-                    cache_status = "lookup_singleflight_wait",
+                    cache_status = cache_status(options, "lookup_singleflight_wait"),
                     "api cache waiting for in-flight encoded lookup"
                 );
                 if let Some(value) = SingleFlight::wait_cached_json(entry).await {
@@ -640,6 +819,7 @@ impl ApiCache {
         flight_key: String,
         fetch: Fut,
         write_context: Option<CacheWriteContext>,
+        options: CacheOptions,
     ) -> Result<CachedJson, ApiError>
     where
         Fut: Future<Output = Result<Bytes, ApiError>>,
@@ -647,8 +827,11 @@ impl ApiCache {
         match self.singleflight.begin(flight_key.clone()).await {
             Flight::Waiter(entry) => {
                 incr(&CACHE_STATS.singleflight_wait);
+                if options.is_batch {
+                    incr(&CACHE_STATS.batch_singleflight_wait);
+                }
                 tracing::debug!(
-                    cache_status = "singleflight_wait",
+                    cache_status = cache_status(options, "singleflight_wait"),
                     "api cache waiting for in-flight encoded fetch"
                 );
                 if let Some(value) = SingleFlight::wait_cached_json(entry).await {
@@ -658,11 +841,11 @@ impl ApiCache {
                     cache_status = "singleflight_retry",
                     "api cache in-flight encoded fetch was not shareable"
                 );
-                self.encode_response(fetch.await?, None).await
+                self.encode_response(fetch.await?, None, options).await
             }
             Flight::Owner(entry) => {
                 let result = self
-                    .fetch_and_maybe_cache_encoded(fetch, write_context)
+                    .fetch_and_maybe_cache_encoded(fetch, write_context, options)
                     .await;
                 let shared = shared_cached_json_result(&result);
                 self.singleflight.finish(&flight_key, entry, shared).await;
@@ -675,6 +858,7 @@ impl ApiCache {
         &self,
         fetch: Fut,
         write_context: Option<CacheWriteContext>,
+        options: CacheOptions,
     ) -> Result<Bytes, ApiError>
     where
         Fut: Future<Output = Result<Bytes, ApiError>>,
@@ -702,11 +886,18 @@ impl ApiCache {
         }
 
         let bytes = result?;
-        if bytes.len() > self.cfg.max_value_bytes {
+        if bytes.len() > options.max_value_bytes {
+            if options.is_batch {
+                incr(&CACHE_STATS.batch_too_large);
+            }
             tracing::debug!(
-                cache_status = "too_large",
+                cache_status = if options.is_batch {
+                    "batch_too_large"
+                } else {
+                    "too_large"
+                },
                 bytes = bytes.len(),
-                max = self.cfg.max_value_bytes,
+                max = options.max_value_bytes,
                 "api cache value too large"
             );
             return Ok(bytes);
@@ -733,6 +924,7 @@ impl ApiCache {
         &self,
         fetch: Fut,
         write_context: Option<CacheWriteContext>,
+        options: CacheOptions,
     ) -> Result<CachedJson, ApiError>
     where
         Fut: Future<Output = Result<Bytes, ApiError>>,
@@ -760,21 +952,28 @@ impl ApiCache {
         }
 
         let bytes = result?;
-        if bytes.len() > self.cfg.max_value_bytes {
+        if bytes.len() > options.max_value_bytes {
+            if options.is_batch {
+                incr(&CACHE_STATS.batch_too_large);
+            }
             tracing::debug!(
-                cache_status = "too_large",
+                cache_status = if options.is_batch {
+                    "batch_too_large"
+                } else {
+                    "too_large"
+                },
                 bytes = bytes.len(),
-                max = self.cfg.max_value_bytes,
+                max = options.max_value_bytes,
                 "api cache value too large"
             );
-            return self.encode_response(bytes, None).await;
+            return self.encode_response(bytes, None, options).await;
         }
 
         let Some(ctx) = write_context else {
-            return self.encode_response(bytes, None).await;
+            return self.encode_response(bytes, None, options).await;
         };
         let encoded = self
-            .encode_response(bytes.clone(), Some(ctx.clone()))
+            .encode_response(bytes.clone(), Some(ctx.clone()), options)
             .await?;
         match self
             .write_l2_if_clean(&ctx, &ctx.value_key, bytes.clone(), ctx.ttl_secs)
@@ -797,6 +996,7 @@ impl ApiCache {
         &self,
         bytes: Bytes,
         write_context: Option<CacheWriteContext>,
+        _options: CacheOptions,
     ) -> Result<CachedJson, ApiError> {
         if bytes.len() < self.cfg.precompress_min_bytes {
             return Ok(CachedJson::identity(bytes));
@@ -1103,6 +1303,25 @@ struct CacheWriteContext {
     value_key: String,
     negative_key: String,
     ttl_secs: u64,
+}
+
+#[derive(Clone, Copy)]
+struct CacheOptions {
+    max_value_bytes: usize,
+    is_batch: bool,
+}
+
+fn cache_status(options: CacheOptions, status: &'static str) -> &'static str {
+    if !options.is_batch {
+        return status;
+    }
+    match status {
+        "l1_hit" | "l1_gzip_hit" => "batch_l1_hit",
+        "l2_hit" | "l2_gzip_hit" => "batch_l2_hit",
+        "l2_miss" => "batch_miss",
+        "lookup_singleflight_wait" | "singleflight_wait" => "batch_singleflight_wait",
+        _ => status,
+    }
 }
 
 fn shared_fetch_bytes_result(result: &Result<Bytes, ApiError>) -> Option<SharedFetchResult> {

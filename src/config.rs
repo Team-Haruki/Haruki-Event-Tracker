@@ -60,6 +60,7 @@ pub struct ApiCacheConfig {
     pub user_data_ttl_secs: u64,
     pub negative_ttl_secs: u64,
     pub max_value_bytes: usize,
+    pub batch_max_value_bytes: usize,
 }
 
 impl Default for ApiCacheConfig {
@@ -82,6 +83,7 @@ impl Default for ApiCacheConfig {
             user_data_ttl_secs: 30,
             negative_ttl_secs: 10,
             max_value_bytes: 1024 * 1024,
+            batch_max_value_bytes: 4 * 1024 * 1024,
         }
     }
 }
