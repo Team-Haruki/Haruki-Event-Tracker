@@ -137,8 +137,23 @@ impl ApiCache {
         T: Serialize + DeserializeOwned,
         Fut: Future<Output = Result<T, ApiError>>,
     {
+        let fetch_bytes = async move {
+            let value = fetch.await?;
+            encode_json_bytes(&value)
+        };
         let bytes = self
-            .get_or_fetch_json_bytes(server, event_id, suffix, ttl_secs, fetch)
+            .get_or_fetch_bytes_with_options(
+                server,
+                event_id,
+                suffix,
+                ttl_secs,
+                fetch_bytes,
+                CacheOptions {
+                    max_value_bytes: self.cfg.max_value_bytes,
+                    is_batch: false,
+                    validate_cached_bytes: Some(validate_json_bytes::<T>),
+                },
+            )
             .await?;
         sonic_rs::from_slice::<T>(&bytes).map_err(|err| {
             tracing::warn!(%err, "api cache decoded invalid JSON bytes");
@@ -211,6 +226,7 @@ impl ApiCache {
         let options = CacheOptions {
             max_value_bytes: self.cfg.batch_max_value_bytes,
             is_batch: true,
+            validate_cached_bytes: None,
         };
         if !prefer_gzip || !self.cfg.precompress_gzip_enabled {
             return self
@@ -244,6 +260,7 @@ impl ApiCache {
             CacheOptions {
                 max_value_bytes: self.cfg.max_value_bytes,
                 is_batch: false,
+                validate_cached_bytes: None,
             },
         )
         .await
@@ -282,15 +299,18 @@ impl ApiCache {
             }
             let key = value_key(server, event_id, control.epoch, &suffix);
             if let Some(bytes) = self.l1.get_value(&key).await {
-                incr(&CACHE_STATS.l1_hit);
-                if options.is_batch {
-                    incr(&CACHE_STATS.batch_l1_hit);
+                if cached_bytes_are_valid(options, &bytes) {
+                    incr(&CACHE_STATS.l1_hit);
+                    if options.is_batch {
+                        incr(&CACHE_STATS.batch_l1_hit);
+                    }
+                    tracing::debug!(
+                        cache_status = cache_status(options, "l1_hit"),
+                        "api cache L1 hit"
+                    );
+                    return Ok(bytes);
                 }
-                tracing::debug!(
-                    cache_status = cache_status(options, "l1_hit"),
-                    "api cache L1 hit"
-                );
-                return Ok(bytes);
+                tracing::warn!(cache_status = "l1_invalid", "api cache L1 invalid");
             }
             return self
                 .lookup_with_singleflight(
@@ -299,16 +319,41 @@ impl ApiCache {
                     async {
                         match self.read_l2_value(&key).await {
                             Ok(L2ValueRead::Hit(bytes)) => {
-                                incr(&CACHE_STATS.l2_hit);
-                                if options.is_batch {
-                                    incr(&CACHE_STATS.batch_l2_hit);
+                                if cached_bytes_are_valid(options, &bytes) {
+                                    incr(&CACHE_STATS.l2_hit);
+                                    if options.is_batch {
+                                        incr(&CACHE_STATS.batch_l2_hit);
+                                    }
+                                    tracing::debug!(
+                                        cache_status = cache_status(options, "l2_hit"),
+                                        "api cache L2 hit"
+                                    );
+                                    self.store_l1_value(key, bytes.clone()).await;
+                                    Ok(bytes)
+                                } else {
+                                    tracing::warn!(
+                                        cache_status = "l2_invalid",
+                                        "api cache L2 invalid, refetching"
+                                    );
+                                    self.fetch_and_maybe_cache_bytes(
+                                        fetch,
+                                        Some(CacheWriteContext {
+                                            server: server.to_owned(),
+                                            event_id,
+                                            epoch: control.epoch,
+                                            value_key: key,
+                                            negative_key: negative_key(
+                                                server,
+                                                event_id,
+                                                control.epoch,
+                                                &suffix,
+                                            ),
+                                            ttl_secs,
+                                        }),
+                                        options,
+                                    )
+                                    .await
                                 }
-                                tracing::debug!(
-                                    cache_status = cache_status(options, "l2_hit"),
-                                    "api cache L2 hit"
-                                );
-                                self.store_l1_value(key, bytes.clone()).await;
-                                Ok(bytes)
                             }
                             Ok(L2ValueRead::NotFound) => {
                                 incr(&CACHE_STATS.l2_not_found);
@@ -376,16 +421,36 @@ impl ApiCache {
                     }
                     Ok(L2CombinedRead::Hit { epoch, key, bytes }) => {
                         self.store_l1_control(control_key, epoch, false).await;
-                        self.store_l1_value(key, bytes.clone()).await;
-                        incr(&CACHE_STATS.l2_hit);
-                        if options.is_batch {
-                            incr(&CACHE_STATS.batch_l2_hit);
+                        if cached_bytes_are_valid(options, &bytes) {
+                            self.store_l1_value(key, bytes.clone()).await;
+                            incr(&CACHE_STATS.l2_hit);
+                            if options.is_batch {
+                                incr(&CACHE_STATS.batch_l2_hit);
+                            }
+                            tracing::debug!(
+                                cache_status = cache_status(options, "l2_hit"),
+                                "api cache L2 hit"
+                            );
+                            Ok(bytes)
+                        } else {
+                            tracing::warn!(
+                                cache_status = "l2_invalid",
+                                "api cache L2 invalid, refetching"
+                            );
+                            self.fetch_and_maybe_cache_bytes(
+                                fetch,
+                                Some(CacheWriteContext {
+                                    server: server.to_owned(),
+                                    event_id,
+                                    epoch,
+                                    value_key: key,
+                                    negative_key: negative_key(server, event_id, epoch, &suffix),
+                                    ttl_secs,
+                                }),
+                                options,
+                            )
+                            .await
                         }
-                        tracing::debug!(
-                            cache_status = cache_status(options, "l2_hit"),
-                            "api cache L2 hit"
-                        );
-                        Ok(bytes)
                     }
                     Ok(L2CombinedRead::NotFound { epoch }) => {
                         self.store_l1_control(control_key, epoch, false).await;
@@ -448,6 +513,7 @@ impl ApiCache {
             CacheOptions {
                 max_value_bytes: self.cfg.max_value_bytes,
                 is_batch: false,
+                validate_cached_bytes: None,
             },
         )
         .await
@@ -1329,6 +1395,7 @@ struct CacheWriteContext {
 struct CacheOptions {
     max_value_bytes: usize,
     is_batch: bool,
+    validate_cached_bytes: Option<fn(&Bytes) -> bool>,
 }
 
 fn cache_status(options: CacheOptions, status: &'static str) -> &'static str {
@@ -1341,6 +1408,23 @@ fn cache_status(options: CacheOptions, status: &'static str) -> &'static str {
         "l2_miss" => "batch_miss",
         "lookup_singleflight_wait" | "singleflight_wait" => "batch_singleflight_wait",
         _ => status,
+    }
+}
+
+fn cached_bytes_are_valid(options: CacheOptions, bytes: &Bytes) -> bool {
+    options
+        .validate_cached_bytes
+        .map(|validate| validate(bytes))
+        .unwrap_or(true)
+}
+
+fn validate_json_bytes<T: DeserializeOwned>(bytes: &Bytes) -> bool {
+    match sonic_rs::from_slice::<T>(bytes) {
+        Ok(_) => true,
+        Err(err) => {
+            tracing::warn!(%err, "api cache cached JSON schema mismatch");
+            false
+        }
     }
 }
 
@@ -1641,6 +1725,7 @@ pub fn wb_batch_rank_suffix(kind: &str, character_id: i64, ranks: &[i64]) -> Str
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde::Deserialize;
 
     #[test]
     fn builds_epoch_value_keys() {
@@ -1735,6 +1820,21 @@ mod tests {
         .await;
 
         assert_eq!(l1.get_value("value").await, None);
+    }
+
+    #[derive(Deserialize, Serialize, PartialEq, Debug)]
+    struct TypedCachePayload {
+        items: Vec<i64>,
+    }
+
+    #[test]
+    fn typed_cache_validation_rejects_schema_mismatch() {
+        assert!(!validate_json_bytes::<TypedCachePayload>(
+            &Bytes::from_static(br#"{"oldItems":[1]}"#)
+        ));
+        assert!(validate_json_bytes::<TypedCachePayload>(
+            &Bytes::from_static(br#"{"items":[2]}"#)
+        ));
     }
 
     #[tokio::test]
