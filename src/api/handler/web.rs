@@ -74,7 +74,7 @@ pub async fn rankings(
     let (region, engine) = resolve_region_engine(&state, &server)?;
     let mode = prepare_web_user_id_mode(&state, &engine, region, event_id).await?;
     let filter = query.into_filter()?;
-    let suffix = format!("web:rankings:{}", filter.cache_key());
+    let suffix = format!("web:v2:rankings:{}", filter.cache_key());
     let fetch = async {
         let (items, cursor) = search_rankings(&engine, event_id, &filter, mode).await?;
         Ok(WebRankingPageSchema {
@@ -95,7 +95,7 @@ pub async fn world_bloom_rankings(
     let (region, engine) = resolve_region_engine(&state, &server)?;
     let mode = prepare_web_user_id_mode(&state, &engine, region, event_id).await?;
     let filter = query.into_filter()?;
-    let suffix = format!("web:wb:{character_id}:rankings:{}", filter.cache_key());
+    let suffix = format!("web:v2:wb:{character_id}:rankings:{}", filter.cache_key());
     let fetch = async {
         let (items, cursor) =
             search_world_bloom_rankings(&engine, event_id, character_id, &filter, mode).await?;

@@ -1824,16 +1824,29 @@ mod tests {
 
     #[derive(Deserialize, Serialize, PartialEq, Debug)]
     struct TypedCachePayload {
+        #[serde(default)]
+        items: Vec<i64>,
+    }
+
+    #[test]
+    fn typed_cache_validation_allows_default_empty_collections() {
+        assert!(validate_json_bytes::<TypedCachePayload>(
+            &Bytes::from_static(br#"{}"#)
+        ));
+        assert!(validate_json_bytes::<TypedCachePayload>(
+            &Bytes::from_static(br#"{"items":[2]}"#)
+        ));
+    }
+
+    #[derive(Deserialize, Serialize, PartialEq, Debug)]
+    struct StrictTypedCachePayload {
         items: Vec<i64>,
     }
 
     #[test]
     fn typed_cache_validation_rejects_schema_mismatch() {
-        assert!(!validate_json_bytes::<TypedCachePayload>(
+        assert!(!validate_json_bytes::<StrictTypedCachePayload>(
             &Bytes::from_static(br#"{"oldItems":[1]}"#)
-        ));
-        assert!(validate_json_bytes::<TypedCachePayload>(
-            &Bytes::from_static(br#"{"items":[2]}"#)
         ));
     }
 

@@ -71,7 +71,7 @@ pub struct UserLatestRankingQueryResponseSchema {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct UserAllRankingDataQueryResponseSchema {
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub rank_data: Vec<RecordedRankData>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub user_data: Option<RecordedUserNameSchema>,
@@ -81,14 +81,14 @@ pub struct UserAllRankingDataQueryResponseSchema {
 #[serde(rename_all = "camelCase")]
 pub struct BatchAllRankingDataItemSchema {
     pub rank: i64,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub rank_data: Vec<RecordedRankData>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct BatchAllRankingDataQueryResponseSchema {
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub items: Vec<BatchAllRankingDataItemSchema>,
 }
 
@@ -128,7 +128,7 @@ pub struct EventStatusResponseSchema {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct WebRankingPageSchema {
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub items: Vec<WebRankingItemSchema>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_cursor: Option<String>,
@@ -145,7 +145,7 @@ pub struct WebRankingItemSchema {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct WebUserSearchPageSchema {
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub items: Vec<RecordedUserNameSchema>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_cursor: Option<String>,

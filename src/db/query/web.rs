@@ -410,7 +410,7 @@ fn apply_rank_window_time_filters(
         stmt.and_where(timestamp_col.clone().gte(after));
     }
     if let Some(timestamp) = filter.timestamp {
-        stmt.and_where(timestamp_col.eq(timestamp));
+        stmt.and_where(timestamp_col.lte(timestamp));
     }
 }
 
@@ -1084,6 +1084,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn web_ranking_window_timestamp_uses_latest_snapshot_before_cutoff() {
+        let engine = sqlite_engine().await;
+        let event_id = 555;
+        create_event_tables(&engine, SekaiServerRegion::Jp, event_id, false)
+            .await
+            .unwrap();
+        seed_normal_event_with_history(&engine, event_id).await;
+
+        let filter = WebRankingFilter {
+            rank_min: Some(1),
+            rank_max: Some(3),
+            score_min: None,
+            score_max: None,
+            start_time: None,
+            end_time: None,
+            before: None,
+            after: None,
+            timestamp: Some(1_710_000_030),
+            cursor: None,
+            limit: 10,
+        };
+        let (items, cursor) = search_rankings(&engine, event_id, &filter, PublicUserIdMode::Unique)
+            .await
+            .unwrap();
+
+        assert!(cursor.is_none());
+        let rows: Vec<_> = items
+            .into_iter()
+            .map(|item| match item {
+                WebRankingItemSchema {
+                    rank_data: RecordedRankData::Normal(row),
+                    ..
+                } => row,
+                WebRankingItemSchema {
+                    rank_data: RecordedRankData::WorldBloom(_),
+                    ..
+                } => panic!("expected normal ranking"),
+            })
+            .collect();
+        assert_eq!(
+            rows.iter().map(|row| row.timestamp).collect::<Vec<_>>(),
+            vec![1_710_000_000, 1_710_000_000, 1_710_000_000]
+        );
+        assert_eq!(
+            rows.iter().map(|row| row.score).collect::<Vec<_>>(),
+            vec![1000, 900, 800]
+        );
+    }
+
+    #[tokio::test]
     async fn web_world_bloom_window_returns_latest_row_per_rank() {
         let engine = sqlite_engine().await;
         let event_id = 554;
@@ -1138,6 +1188,57 @@ mod tests {
         assert_eq!(
             rows.iter().map(|row| row.score).collect::<Vec<_>>(),
             vec![2300, 2200, 2100]
+        );
+    }
+
+    #[tokio::test]
+    async fn web_world_bloom_window_timestamp_uses_latest_snapshot_before_cutoff() {
+        let engine = sqlite_engine().await;
+        let event_id = 556;
+        create_event_tables(&engine, SekaiServerRegion::Jp, event_id, true)
+            .await
+            .unwrap();
+        seed_world_bloom_event_with_history(&engine, event_id).await;
+
+        let filter = WebRankingFilter {
+            rank_min: Some(1),
+            rank_max: Some(3),
+            score_min: None,
+            score_max: None,
+            start_time: None,
+            end_time: None,
+            before: None,
+            after: None,
+            timestamp: Some(1_710_000_030),
+            cursor: None,
+            limit: 10,
+        };
+        let (items, cursor) =
+            search_world_bloom_rankings(&engine, event_id, 17, &filter, PublicUserIdMode::Unique)
+                .await
+                .unwrap();
+
+        assert!(cursor.is_none());
+        let rows: Vec<_> = items
+            .into_iter()
+            .map(|item| match item {
+                WebRankingItemSchema {
+                    rank_data: RecordedRankData::WorldBloom(row),
+                    ..
+                } => row,
+                WebRankingItemSchema {
+                    rank_data: RecordedRankData::Normal(_),
+                    ..
+                } => panic!("expected world bloom ranking"),
+            })
+            .collect();
+        assert_eq!(
+            rows.iter().map(|row| row.timestamp).collect::<Vec<_>>(),
+            vec![1_710_000_000, 1_710_000_000, 1_710_000_000]
+        );
+        assert_eq!(
+            rows.iter().map(|row| row.score).collect::<Vec<_>>(),
+            vec![2000, 1900, 1800]
         );
     }
 
