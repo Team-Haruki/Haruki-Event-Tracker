@@ -25,7 +25,8 @@ pub async fn ranking_lines(
     Path((server, event_id)): Path<(String, i64)>,
 ) -> Result<Json<Vec<RankingLineScoreSchema>>, ApiError> {
     let engine = resolve_engine(&state, &server)?;
-    let rows = fetch_ranking_lines(&engine, event_id, SEKAI_EVENT_RANKING_LINES_NORMAL).await?;
+    let rows =
+        fetch_ranking_lines(&engine, event_id, SEKAI_EVENT_RANKING_LINES_NORMAL, None).await?;
     Ok(Json(rows))
 }
 
@@ -40,6 +41,7 @@ pub async fn wb_ranking_lines(
         event_id,
         character_id,
         SEKAI_EVENT_RANKING_LINES_WORLD_BLOOM,
+        None,
     )
     .await?;
     Ok(Json(rows))
@@ -57,6 +59,7 @@ pub async fn score_growth(
         event_id,
         SEKAI_EVENT_RANKING_LINES_NORMAL,
         start_time,
+        None,
     )
     .await?;
     Ok(Json(rows))
@@ -75,6 +78,7 @@ pub async fn wb_score_growth(
         character_id,
         SEKAI_EVENT_RANKING_LINES_WORLD_BLOOM,
         start_time,
+        None,
     )
     .await?;
     Ok(Json(rows))

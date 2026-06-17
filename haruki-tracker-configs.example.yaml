@@ -45,6 +45,7 @@ api_cache:
   trace_rank_ttl_secs: 60
   batch_trace_rank_ttl_secs: 60 # 兼容旧配置；开启缓存时 batch trace 会拆成单 rank cache
   user_data_ttl_secs: 30
+  replay_overview_ttl_secs: 3600 # 带 at 的回放 overview 缓存；不受 tracker epoch/dirty 控制
   negative_ttl_secs: 10       # 404 rank 的短期负缓存；0 表示禁用
   max_value_bytes: 1048576
   batch_max_value_bytes: 4194304 # batch trace 整包缓存上限；超过则本次返回但不写缓存

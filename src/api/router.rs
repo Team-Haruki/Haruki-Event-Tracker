@@ -87,7 +87,12 @@ pub fn event_routes() -> Router<AppState> {
             get(trace::wb_all_by_ranks),
         )
         .route("/user-data/{user_id}", get(user::user_data))
+        .route("/web/overview", get(web::overview))
         .route("/web/rankings", get(web::rankings))
+        .route(
+            "/web/world-bloom-overview/character/{character_id}",
+            get(web::world_bloom_overview),
+        )
         .route(
             "/web/world-bloom-rankings/character/{character_id}",
             get(web::world_bloom_rankings),

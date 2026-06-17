@@ -19,13 +19,14 @@ pub async fn fetch_ranking_lines(
     engine: &DatabaseEngine,
     event_id: i64,
     ranks: &[i64],
+    timestamp: Option<i64>,
 ) -> Result<Vec<RankingLineScoreSchema>, DbErr> {
     let backend = engine.backend();
     let event_tbl = intern(TableKind::Event, event_id);
     let time_tbl = intern(TableKind::TimeId, event_id);
 
     let futs = ranks.iter().copied().map(|rank| {
-        let stmt = Query::select()
+        let mut stmt = Query::select()
             .expr_as(
                 Expr::col((Alias::new(time_tbl), time_id::Column::Timestamp)),
                 Alias::new("timestamp"),
@@ -45,12 +46,17 @@ pub async fn fetch_ranking_lines(
                     .equals((Alias::new(time_tbl), time_id::Column::TimeId)),
             )
             .and_where(Expr::col((Alias::new(event_tbl), event::Column::Rank)).eq(rank))
-            .order_by(
-                (Alias::new(time_tbl), time_id::Column::Timestamp),
-                Order::Desc,
-            )
-            .limit(1)
             .to_owned();
+        if let Some(timestamp) = timestamp {
+            stmt.and_where(
+                Expr::col((Alias::new(time_tbl), time_id::Column::Timestamp)).lte(timestamp),
+            );
+        }
+        stmt.order_by(
+            (Alias::new(time_tbl), time_id::Column::Timestamp),
+            Order::Desc,
+        )
+        .limit(1);
 
         async move {
             RankingLineScoreSchema::find_by_statement(backend.build(&stmt))
@@ -72,13 +78,14 @@ pub async fn fetch_world_bloom_ranking_lines(
     event_id: i64,
     character_id: i64,
     ranks: &[i64],
+    timestamp: Option<i64>,
 ) -> Result<Vec<RankingLineScoreSchema>, DbErr> {
     let backend = engine.backend();
     let wl_tbl = intern(TableKind::WorldBloom, event_id);
     let time_tbl = intern(TableKind::TimeId, event_id);
 
     let futs = ranks.iter().copied().map(|rank| {
-        let stmt = Query::select()
+        let mut stmt = Query::select()
             .expr_as(
                 Expr::col((Alias::new(time_tbl), time_id::Column::Timestamp)),
                 Alias::new("timestamp"),
@@ -101,12 +108,17 @@ pub async fn fetch_world_bloom_ranking_lines(
             .and_where(
                 Expr::col((Alias::new(wl_tbl), world_bloom::Column::CharacterId)).eq(character_id),
             )
-            .order_by(
-                (Alias::new(time_tbl), time_id::Column::Timestamp),
-                Order::Desc,
-            )
-            .limit(1)
             .to_owned();
+        if let Some(timestamp) = timestamp {
+            stmt.and_where(
+                Expr::col((Alias::new(time_tbl), time_id::Column::Timestamp)).lte(timestamp),
+            );
+        }
+        stmt.order_by(
+            (Alias::new(time_tbl), time_id::Column::Timestamp),
+            Order::Desc,
+        )
+        .limit(1);
 
         async move {
             RankingLineScoreSchema::find_by_statement(backend.build(&stmt))

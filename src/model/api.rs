@@ -118,6 +118,21 @@ pub struct RankingScoreGrowthSchema {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct TopRankingPlayerGrowthSchema {
+    pub rank: i64,
+    pub user_id: String,
+    pub score_latest: i64,
+    pub timestamp_latest: i64,
+    pub score_earlier: i64,
+    pub timestamp_earlier: i64,
+    pub time_diff: i64,
+    pub growth: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub character_id: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct EventStatusResponseSchema {
     pub timestamp: i64,
     pub status: i16,
@@ -132,6 +147,24 @@ pub struct WebRankingPageSchema {
     pub items: Vec<WebRankingItemSchema>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct WebOverviewSchema {
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub top_rankings: Vec<WebRankingItemSchema>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub top_player_growths: Vec<TopRankingPlayerGrowthSchema>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub top_rank_growths: Vec<RankingScoreGrowthSchema>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub border_lines: Vec<RankingLineScoreSchema>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub border_growths: Vec<RankingScoreGrowthSchema>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<EventStatusResponseSchema>,
+    pub interval_seconds: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

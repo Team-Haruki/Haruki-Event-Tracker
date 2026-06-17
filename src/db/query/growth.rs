@@ -41,13 +41,14 @@ pub async fn fetch_ranking_score_growths(
     event_id: i64,
     ranks: &[i64],
     start_time: i64,
+    end_time: Option<i64>,
 ) -> Result<Vec<RankingScoreGrowthSchema>, DbErr> {
     let backend = engine.backend();
     let event_tbl = intern(TableKind::Event, event_id);
     let time_tbl = intern(TableKind::TimeId, event_id);
 
     let futs = ranks.iter().copied().map(|rank| {
-        let stmt = Query::select()
+        let mut stmt = Query::select()
             .expr_as(
                 Expr::col((Alias::new(time_tbl), time_id::Column::Timestamp)),
                 Alias::new("timestamp"),
@@ -70,11 +71,16 @@ pub async fn fetch_ranking_score_growths(
             .and_where(
                 Expr::col((Alias::new(time_tbl), time_id::Column::Timestamp)).gte(start_time),
             )
-            .order_by(
-                (Alias::new(time_tbl), time_id::Column::Timestamp),
-                Order::Asc,
-            )
             .to_owned();
+        if let Some(end_time) = end_time {
+            stmt.and_where(
+                Expr::col((Alias::new(time_tbl), time_id::Column::Timestamp)).lte(end_time),
+            );
+        }
+        stmt.order_by(
+            (Alias::new(time_tbl), time_id::Column::Timestamp),
+            Order::Asc,
+        );
 
         async move {
             let rows = RankingLineScoreSchema::find_by_statement(backend.build(&stmt))
@@ -98,13 +104,14 @@ pub async fn fetch_world_bloom_ranking_score_growths(
     character_id: i64,
     ranks: &[i64],
     start_time: i64,
+    end_time: Option<i64>,
 ) -> Result<Vec<RankingScoreGrowthSchema>, DbErr> {
     let backend = engine.backend();
     let wl_tbl = intern(TableKind::WorldBloom, event_id);
     let time_tbl = intern(TableKind::TimeId, event_id);
 
     let futs = ranks.iter().copied().map(|rank| {
-        let stmt = Query::select()
+        let mut stmt = Query::select()
             .expr_as(
                 Expr::col((Alias::new(time_tbl), time_id::Column::Timestamp)),
                 Alias::new("timestamp"),
@@ -130,11 +137,16 @@ pub async fn fetch_world_bloom_ranking_score_growths(
             .and_where(
                 Expr::col((Alias::new(time_tbl), time_id::Column::Timestamp)).gte(start_time),
             )
-            .order_by(
-                (Alias::new(time_tbl), time_id::Column::Timestamp),
-                Order::Asc,
-            )
             .to_owned();
+        if let Some(end_time) = end_time {
+            stmt.and_where(
+                Expr::col((Alias::new(time_tbl), time_id::Column::Timestamp)).lte(end_time),
+            );
+        }
+        stmt.order_by(
+            (Alias::new(time_tbl), time_id::Column::Timestamp),
+            Order::Asc,
+        );
 
         async move {
             let rows = RankingLineScoreSchema::find_by_statement(backend.build(&stmt))

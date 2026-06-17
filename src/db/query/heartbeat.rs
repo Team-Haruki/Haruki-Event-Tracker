@@ -7,7 +7,7 @@
 //! ranking table.
 
 use sea_orm::sea_query::{Alias, Expr, Order, Query};
-use sea_orm::{DbErr, FromQueryResult, TransactionTrait};
+use sea_orm::{DbErr, ExprTrait, FromQueryResult, TransactionTrait};
 use std::collections::HashSet;
 
 use crate::db::engine::DatabaseEngine;
@@ -52,18 +52,30 @@ pub async fn fetch_latest_heartbeat(
     engine: &DatabaseEngine,
     event_id: i64,
 ) -> Result<Option<(i64, i8)>, DbErr> {
+    fetch_latest_heartbeat_before(engine, event_id, None).await
+}
+
+#[tracing::instrument(skip(engine), fields(event_id, timestamp))]
+pub async fn fetch_latest_heartbeat_before(
+    engine: &DatabaseEngine,
+    event_id: i64,
+    timestamp: Option<i64>,
+) -> Result<Option<(i64, i8)>, DbErr> {
     let backend = engine.backend();
     let table = intern(TableKind::TimeId, event_id);
-    let stmt = Query::select()
+    let mut stmt = Query::select()
         .expr_as(
             Expr::col(time_id::Column::Timestamp),
             Alias::new("timestamp"),
         )
         .expr_as(Expr::col(time_id::Column::Status), Alias::new("status"))
         .from(Alias::new(table))
-        .order_by(time_id::Column::Timestamp, Order::Desc)
-        .limit(1)
         .to_owned();
+    if let Some(timestamp) = timestamp {
+        stmt.and_where(Expr::col(time_id::Column::Timestamp).lte(timestamp));
+    }
+    stmt.order_by(time_id::Column::Timestamp, Order::Desc)
+        .limit(1);
 
     let row = LatestHeartbeatRow::find_by_statement(backend.build(&stmt))
         .one(engine.conn())

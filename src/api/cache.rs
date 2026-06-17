@@ -70,6 +70,7 @@ pub enum CacheTtl {
     TraceRank,
     BatchTraceRank,
     UserData,
+    ReplayOverview,
 }
 
 #[derive(Clone)]
@@ -116,6 +117,7 @@ impl ApiCache {
             CacheTtl::TraceRank => self.cfg.trace_rank_ttl_secs,
             CacheTtl::BatchTraceRank => self.cfg.batch_trace_rank_ttl_secs,
             CacheTtl::UserData => self.cfg.user_data_ttl_secs,
+            CacheTtl::ReplayOverview => self.cfg.replay_overview_ttl_secs,
         };
         if endpoint_ttl == 0 {
             self.cfg.default_ttl_secs
@@ -157,6 +159,43 @@ impl ApiCache {
             .await?;
         sonic_rs::from_slice::<T>(&bytes).map_err(|err| {
             tracing::warn!(%err, "api cache decoded invalid JSON bytes");
+            ApiError::ServiceUnavailable("api cache decode failed".into())
+        })
+    }
+
+    #[tracing::instrument(skip(self, fetch), fields(server, event_id, suffix))]
+    pub async fn get_or_fetch_static<T, Fut>(
+        &self,
+        server: &str,
+        event_id: i64,
+        suffix: String,
+        ttl_secs: u64,
+        fetch: Fut,
+    ) -> Result<T, ApiError>
+    where
+        T: Serialize + DeserializeOwned,
+        Fut: Future<Output = Result<T, ApiError>>,
+    {
+        let fetch_bytes = async move {
+            let value = fetch.await?;
+            encode_json_bytes(&value)
+        };
+        let bytes = self
+            .get_or_fetch_static_bytes(
+                server,
+                event_id,
+                suffix,
+                ttl_secs,
+                fetch_bytes,
+                CacheOptions {
+                    max_value_bytes: self.cfg.batch_max_value_bytes,
+                    is_batch: false,
+                    validate_cached_bytes: Some(validate_json_bytes::<T>),
+                },
+            )
+            .await?;
+        sonic_rs::from_slice::<T>(&bytes).map_err(|err| {
+            tracing::warn!(%err, "api cache decoded invalid static JSON bytes");
             ApiError::ServiceUnavailable("api cache decode failed".into())
         })
     }
@@ -261,6 +300,74 @@ impl ApiCache {
                 max_value_bytes: self.cfg.max_value_bytes,
                 is_batch: false,
                 validate_cached_bytes: None,
+            },
+        )
+        .await
+    }
+
+    async fn get_or_fetch_static_bytes<Fut>(
+        &self,
+        server: &str,
+        event_id: i64,
+        suffix: String,
+        ttl_secs: u64,
+        fetch: Fut,
+        options: CacheOptions,
+    ) -> Result<Bytes, ApiError>
+    where
+        Fut: Future<Output = Result<Bytes, ApiError>>,
+    {
+        if ttl_secs == 0 {
+            return fetch.await;
+        }
+        let key = static_value_key(server, event_id, &suffix);
+        if let Some(bytes) = self.l1.get_value(&key).await {
+            if cached_bytes_are_valid(options, &bytes) {
+                incr(&CACHE_STATS.l1_hit);
+                tracing::debug!(cache_status = "static_l1_hit", "api static cache L1 hit");
+                return Ok(bytes);
+            }
+            tracing::warn!(
+                cache_status = "static_l1_invalid",
+                "api static cache L1 invalid"
+            );
+        }
+
+        self.lookup_with_singleflight(
+            static_lookup_flight_key(server, event_id, &suffix),
+            options,
+            async {
+                match self.read_l2_value(&key).await {
+                    Ok(L2ValueRead::Hit(bytes)) => {
+                        if cached_bytes_are_valid(options, &bytes) {
+                            incr(&CACHE_STATS.l2_hit);
+                            tracing::debug!(
+                                cache_status = "static_l2_hit",
+                                "api static cache L2 hit"
+                            );
+                            self.store_l1_value(key, bytes.clone()).await;
+                            Ok(bytes)
+                        } else {
+                            tracing::warn!(
+                                cache_status = "static_l2_invalid",
+                                "api static cache L2 invalid"
+                            );
+                            self.fetch_and_maybe_cache_static_bytes(fetch, key, ttl_secs, options)
+                                .await
+                        }
+                    }
+                    Ok(L2ValueRead::Miss | L2ValueRead::NotFound) => {
+                        incr(&CACHE_STATS.l2_miss);
+                        tracing::debug!(cache_status = "static_l2_miss", "api static cache miss");
+                        self.fetch_and_maybe_cache_static_bytes(fetch, key, ttl_secs, options)
+                            .await
+                    }
+                    Err(err) => {
+                        incr(&CACHE_STATS.l2_timeout);
+                        tracing::warn!(%err, "api static cache read failed");
+                        fetch.await
+                    }
+                }
             },
         )
         .await
@@ -1006,6 +1113,33 @@ impl ApiCache {
         Ok(bytes)
     }
 
+    async fn fetch_and_maybe_cache_static_bytes<Fut>(
+        &self,
+        fetch: Fut,
+        key: String,
+        ttl_secs: u64,
+        options: CacheOptions,
+    ) -> Result<Bytes, ApiError>
+    where
+        Fut: Future<Output = Result<Bytes, ApiError>>,
+    {
+        let bytes = fetch.await?;
+        if bytes.len() > options.max_value_bytes {
+            tracing::debug!(
+                cache_status = "static_too_large",
+                bytes = bytes.len(),
+                max = options.max_value_bytes,
+                "api static cache value too large"
+            );
+            return Ok(bytes);
+        }
+        match self.write_l2_static(&key, bytes.clone(), ttl_secs).await {
+            Ok(()) => self.store_l1_value(key, bytes.clone()).await,
+            Err(err) => tracing::warn!(%err, "api static cache write failed"),
+        }
+        Ok(bytes)
+    }
+
     async fn fetch_and_maybe_cache_encoded<Fut>(
         &self,
         fetch: Fut,
@@ -1193,6 +1327,17 @@ impl ApiCache {
             .arg(ttl_secs);
         let fut = invocation.invoke_async::<i64>(&mut conn);
         self.with_timeout(fut).await.map(|written| written != 0)
+    }
+
+    async fn write_l2_static(
+        &self,
+        key: &str,
+        bytes: Bytes,
+        ttl_secs: u64,
+    ) -> Result<(), redis::RedisError> {
+        let mut conn = self.conns.connection();
+        let fut = conn.set_ex::<_, _, ()>(key, bytes.as_ref(), ttl_secs);
+        self.with_timeout(fut).await
     }
 
     async fn with_timeout<F, T>(&self, fut: F) -> Result<T, redis::RedisError>
@@ -1639,6 +1784,10 @@ fn value_key(server: &str, event_id: i64, epoch: i64, suffix: &str) -> String {
     )
 }
 
+fn static_value_key(server: &str, event_id: i64, suffix: &str) -> String {
+    format!("{base}:static:{suffix}", base = base_key(server, event_id))
+}
+
 fn negative_key(server: &str, event_id: i64, epoch: i64, suffix: &str) -> String {
     format!("{}:not_found", value_key(server, event_id, epoch, suffix))
 }
@@ -1657,6 +1806,13 @@ fn dirty_flight_key(server: &str, event_id: i64, epoch: i64, suffix: &str) -> St
 fn lookup_flight_key(server: &str, event_id: i64, epoch: i64, suffix: &str) -> String {
     format!(
         "{base}:lookup:v{epoch}:{suffix}",
+        base = base_key(server, event_id)
+    )
+}
+
+fn static_lookup_flight_key(server: &str, event_id: i64, suffix: &str) -> String {
+    format!(
+        "{base}:static_lookup:{suffix}",
         base = base_key(server, event_id)
     )
 }

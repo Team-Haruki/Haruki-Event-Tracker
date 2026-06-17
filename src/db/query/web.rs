@@ -9,7 +9,7 @@ use crate::db::query::user::PublicUserIdMode;
 use crate::db::table_name::{TableKind, intern};
 use crate::model::api::{
     RecordedRankData, RecordedRankingSchema, RecordedUserNameSchema,
-    RecordedWorldBloomRankingSchema, WebRankingItemSchema,
+    RecordedWorldBloomRankingSchema, TopRankingPlayerGrowthSchema, WebRankingItemSchema,
 };
 
 #[derive(Debug, Clone)]
@@ -63,8 +63,8 @@ pub struct WebUserSearchFilter {
     pub limit: u64,
 }
 
-#[derive(Debug, FromQueryResult)]
-struct RankingPageRow {
+#[derive(Debug, Clone, FromQueryResult)]
+pub struct RankingPageRow {
     timestamp: i64,
     user_id: String,
     user_id_key: i64,
@@ -82,8 +82,8 @@ struct RankingPageRow {
     player_frames_json: Option<String>,
 }
 
-#[derive(Debug, FromQueryResult)]
-struct WorldBloomRankingPageRow {
+#[derive(Debug, Clone, FromQueryResult)]
+pub struct WorldBloomRankingPageRow {
     timestamp: i64,
     user_id: String,
     user_id_key: i64,
@@ -120,12 +120,32 @@ impl RankingPageRow {
         }
     }
 
-    fn into_web_item(self) -> WebRankingItemSchema {
+    pub fn into_web_item(self) -> WebRankingItemSchema {
         let rank_data = RecordedRankData::Normal(self.clone_rank_schema());
         WebRankingItemSchema {
             rank_data,
             user_data: Some(self.into_user_schema()),
         }
+    }
+
+    pub fn user_id_key(&self) -> i64 {
+        self.user_id_key
+    }
+
+    pub fn user_id(&self) -> &str {
+        &self.user_id
+    }
+
+    pub fn rank(&self) -> i64 {
+        self.rank
+    }
+
+    pub fn score(&self) -> i64 {
+        self.score
+    }
+
+    pub fn timestamp(&self) -> i64 {
+        self.timestamp
     }
 
     fn clone_rank_schema(&self) -> RecordedRankingSchema {
@@ -173,12 +193,36 @@ impl WorldBloomRankingPageRow {
         }
     }
 
-    fn into_web_item(self) -> WebRankingItemSchema {
+    pub fn into_web_item(self) -> WebRankingItemSchema {
         let rank_data = RecordedRankData::WorldBloom(self.clone_rank_schema());
         WebRankingItemSchema {
             rank_data,
             user_data: Some(self.into_user_schema()),
         }
+    }
+
+    pub fn user_id_key(&self) -> i64 {
+        self.user_id_key
+    }
+
+    pub fn user_id(&self) -> &str {
+        &self.user_id
+    }
+
+    pub fn rank(&self) -> i64 {
+        self.rank
+    }
+
+    pub fn score(&self) -> i64 {
+        self.score
+    }
+
+    pub fn timestamp(&self) -> i64 {
+        self.timestamp
+    }
+
+    pub fn character_id(&self) -> Option<i64> {
+        self.character_id
     }
 
     fn clone_rank_schema(&self) -> RecordedWorldBloomRankingSchema {
@@ -206,6 +250,13 @@ impl WorldBloomRankingPageRow {
             user_player_frames: parse_json_array(self.player_frames_json.as_deref()),
         }
     }
+}
+
+#[derive(Debug, FromQueryResult)]
+struct PlayerGrowthRow {
+    user_id_key: i64,
+    timestamp: i64,
+    score: i64,
 }
 
 fn select_user_profile_columns(stmt: &mut SelectStatement, users_tbl: Alias) {
@@ -675,6 +726,22 @@ pub async fn search_rankings(
     filter: &WebRankingFilter,
     mode: PublicUserIdMode,
 ) -> Result<(Vec<WebRankingItemSchema>, Option<WebRankingCursor>), DbErr> {
+    let (rows, next_cursor) = search_ranking_rows(engine, event_id, filter, mode).await?;
+    Ok((
+        rows.into_iter()
+            .map(RankingPageRow::into_web_item)
+            .collect(),
+        next_cursor,
+    ))
+}
+
+#[tracing::instrument(skip(engine, filter), fields(event_id))]
+pub async fn search_ranking_rows(
+    engine: &DatabaseEngine,
+    event_id: i64,
+    filter: &WebRankingFilter,
+    mode: PublicUserIdMode,
+) -> Result<(Vec<RankingPageRow>, Option<WebRankingCursor>), DbErr> {
     let event_tbl = Alias::new(intern(TableKind::Event, event_id));
     let time_tbl = Alias::new(intern(TableKind::TimeId, event_id));
     let users_tbl = Alias::new(intern(TableKind::EventUsers, event_id));
@@ -706,12 +773,7 @@ pub async fn search_rankings(
     } else {
         None
     };
-    Ok((
-        rows.into_iter()
-            .map(RankingPageRow::into_web_item)
-            .collect(),
-        next_cursor,
-    ))
+    Ok((rows, next_cursor))
 }
 
 #[tracing::instrument(skip(engine, filter), fields(event_id, character_id))]
@@ -722,6 +784,24 @@ pub async fn search_world_bloom_rankings(
     filter: &WebRankingFilter,
     mode: PublicUserIdMode,
 ) -> Result<(Vec<WebRankingItemSchema>, Option<WebRankingCursor>), DbErr> {
+    let (rows, next_cursor) =
+        search_world_bloom_ranking_rows(engine, event_id, character_id, filter, mode).await?;
+    Ok((
+        rows.into_iter()
+            .map(WorldBloomRankingPageRow::into_web_item)
+            .collect(),
+        next_cursor,
+    ))
+}
+
+#[tracing::instrument(skip(engine, filter), fields(event_id, character_id))]
+pub async fn search_world_bloom_ranking_rows(
+    engine: &DatabaseEngine,
+    event_id: i64,
+    character_id: i64,
+    filter: &WebRankingFilter,
+    mode: PublicUserIdMode,
+) -> Result<(Vec<WorldBloomRankingPageRow>, Option<WebRankingCursor>), DbErr> {
     let wl_tbl = Alias::new(intern(TableKind::WorldBloom, event_id));
     let time_tbl = Alias::new(intern(TableKind::TimeId, event_id));
     let users_tbl = Alias::new(intern(TableKind::EventUsers, event_id));
@@ -756,11 +836,118 @@ pub async fn search_world_bloom_rankings(
     } else {
         None
     };
-    Ok((
-        rows.into_iter()
-            .map(WorldBloomRankingPageRow::into_web_item)
-            .collect(),
-        next_cursor,
+    Ok((rows, next_cursor))
+}
+
+#[tracing::instrument(skip(engine, top_rows), fields(event_id, top_len = top_rows.len(), start_time))]
+pub async fn fetch_top_player_growths(
+    engine: &DatabaseEngine,
+    event_id: i64,
+    top_rows: &[RankingPageRow],
+    start_time: i64,
+    end_time: Option<i64>,
+) -> Result<Vec<TopRankingPlayerGrowthSchema>, DbErr> {
+    if top_rows.is_empty() {
+        return Ok(Vec::new());
+    }
+    let user_keys = top_rows
+        .iter()
+        .map(RankingPageRow::user_id_key)
+        .collect::<Vec<_>>();
+    let event_tbl = Alias::new(intern(TableKind::Event, event_id));
+    let time_tbl = Alias::new(intern(TableKind::TimeId, event_id));
+    let stmt = Query::select()
+        .expr_as(
+            Expr::col((event_tbl.clone(), event::Column::UserIdKey)),
+            Alias::new("user_id_key"),
+        )
+        .expr_as(
+            Expr::col((time_tbl.clone(), time_id::Column::Timestamp)),
+            Alias::new("timestamp"),
+        )
+        .expr_as(
+            Expr::col((event_tbl.clone(), event::Column::Score)),
+            Alias::new("score"),
+        )
+        .from(event_tbl.clone())
+        .inner_join(
+            time_tbl.clone(),
+            Expr::col((event_tbl.clone(), event::Column::TimeId))
+                .equals((time_tbl.clone(), time_id::Column::TimeId)),
+        )
+        .and_where(Expr::col((event_tbl.clone(), event::Column::UserIdKey)).is_in(user_keys))
+        .and_where(Expr::col((time_tbl.clone(), time_id::Column::Timestamp)).gte(start_time))
+        .to_owned();
+    let mut stmt = stmt;
+    if let Some(end_time) = end_time {
+        stmt.and_where(Expr::col((time_tbl.clone(), time_id::Column::Timestamp)).lte(end_time));
+    }
+    stmt.order_by((event_tbl.clone(), event::Column::UserIdKey), Order::Asc)
+        .order_by((time_tbl, time_id::Column::Timestamp), Order::Asc);
+
+    let backend = engine.backend();
+    let rows = PlayerGrowthRow::find_by_statement(backend.build(&stmt))
+        .all(engine.conn())
+        .await?;
+    Ok(build_top_player_growths(top_rows, rows, None))
+}
+
+#[tracing::instrument(skip(engine, top_rows), fields(event_id, character_id, top_len = top_rows.len(), start_time))]
+pub async fn fetch_world_bloom_top_player_growths(
+    engine: &DatabaseEngine,
+    event_id: i64,
+    character_id: i64,
+    top_rows: &[WorldBloomRankingPageRow],
+    start_time: i64,
+    end_time: Option<i64>,
+) -> Result<Vec<TopRankingPlayerGrowthSchema>, DbErr> {
+    if top_rows.is_empty() {
+        return Ok(Vec::new());
+    }
+    let user_keys = top_rows
+        .iter()
+        .map(WorldBloomRankingPageRow::user_id_key)
+        .collect::<Vec<_>>();
+    let wl_tbl = Alias::new(intern(TableKind::WorldBloom, event_id));
+    let time_tbl = Alias::new(intern(TableKind::TimeId, event_id));
+    let stmt = Query::select()
+        .expr_as(
+            Expr::col((wl_tbl.clone(), world_bloom::Column::UserIdKey)),
+            Alias::new("user_id_key"),
+        )
+        .expr_as(
+            Expr::col((time_tbl.clone(), time_id::Column::Timestamp)),
+            Alias::new("timestamp"),
+        )
+        .expr_as(
+            Expr::col((wl_tbl.clone(), world_bloom::Column::Score)),
+            Alias::new("score"),
+        )
+        .from(wl_tbl.clone())
+        .inner_join(
+            time_tbl.clone(),
+            Expr::col((wl_tbl.clone(), world_bloom::Column::TimeId))
+                .equals((time_tbl.clone(), time_id::Column::TimeId)),
+        )
+        .and_where(Expr::col((wl_tbl.clone(), world_bloom::Column::CharacterId)).eq(character_id))
+        .and_where(Expr::col((wl_tbl.clone(), world_bloom::Column::UserIdKey)).is_in(user_keys))
+        .and_where(Expr::col((time_tbl.clone(), time_id::Column::Timestamp)).gte(start_time))
+        .to_owned();
+    let mut stmt = stmt;
+    if let Some(end_time) = end_time {
+        stmt.and_where(Expr::col((time_tbl.clone(), time_id::Column::Timestamp)).lte(end_time));
+    }
+    stmt.order_by((wl_tbl.clone(), world_bloom::Column::UserIdKey), Order::Asc)
+        .order_by((time_tbl, time_id::Column::Timestamp), Order::Asc);
+
+    let backend = engine.backend();
+    let rows = PlayerGrowthRow::find_by_statement(backend.build(&stmt))
+        .all(engine.conn())
+        .await?;
+    Ok(build_wb_top_player_growths(
+        top_rows,
+        rows,
+        Some(character_id),
     ))
 }
 
@@ -843,6 +1030,82 @@ fn apply_trace_filters(
     if let Some(cursor) = filter.cursor {
         stmt.and_where(timestamp_col.gt(cursor));
     }
+}
+
+fn build_top_player_growths(
+    top_rows: &[RankingPageRow],
+    rows: Vec<PlayerGrowthRow>,
+    character_id: Option<i64>,
+) -> Vec<TopRankingPlayerGrowthSchema> {
+    top_rows
+        .iter()
+        .filter_map(|top| {
+            build_top_player_growth(
+                top.user_id_key(),
+                top.user_id(),
+                top.rank(),
+                top.score(),
+                top.timestamp(),
+                character_id,
+                &rows,
+            )
+        })
+        .collect()
+}
+
+fn build_wb_top_player_growths(
+    top_rows: &[WorldBloomRankingPageRow],
+    rows: Vec<PlayerGrowthRow>,
+    character_id: Option<i64>,
+) -> Vec<TopRankingPlayerGrowthSchema> {
+    top_rows
+        .iter()
+        .filter_map(|top| {
+            build_top_player_growth(
+                top.user_id_key(),
+                top.user_id(),
+                top.rank(),
+                top.score(),
+                top.timestamp(),
+                character_id.or_else(|| top.character_id()),
+                &rows,
+            )
+        })
+        .collect()
+}
+
+fn build_top_player_growth(
+    user_id_key: i64,
+    user_id: &str,
+    latest_rank: i64,
+    latest_score: i64,
+    latest_timestamp: i64,
+    character_id: Option<i64>,
+    rows: &[PlayerGrowthRow],
+) -> Option<TopRankingPlayerGrowthSchema> {
+    let mut earlier: Option<&PlayerGrowthRow> = None;
+    let mut has_distinct_latest = false;
+    for row in rows.iter().filter(|row| row.user_id_key == user_id_key) {
+        if row.timestamp < latest_timestamp {
+            earlier.get_or_insert(row);
+            has_distinct_latest = true;
+        }
+    }
+    let earlier = earlier?;
+    if !has_distinct_latest || earlier.timestamp == latest_timestamp {
+        return None;
+    }
+    Some(TopRankingPlayerGrowthSchema {
+        rank: latest_rank,
+        user_id: user_id.to_owned(),
+        score_latest: latest_score,
+        timestamp_latest: latest_timestamp,
+        score_earlier: earlier.score,
+        timestamp_earlier: earlier.timestamp,
+        time_diff: latest_timestamp - earlier.timestamp,
+        growth: latest_score - earlier.score,
+        character_id,
+    })
 }
 
 #[tracing::instrument(skip(engine, filter), fields(event_id))]
@@ -968,6 +1231,7 @@ mod tests {
     use sea_orm::{ConnectionTrait, Database, DatabaseBackend, Statement};
 
     use crate::db::engine::DatabaseEngine;
+    use crate::db::query::growth::fetch_ranking_score_growths;
     use crate::db::schema::create_event_tables;
     use crate::model::enums::SekaiServerRegion;
 
@@ -1084,6 +1348,90 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn top_player_growth_follows_current_player_not_rank() {
+        let engine = sqlite_engine().await;
+        let event_id = 557;
+        create_event_tables(&engine, SekaiServerRegion::Jp, event_id, false)
+            .await
+            .unwrap();
+        seed_normal_event_with_history(&engine, event_id).await;
+
+        let filter = WebRankingFilter {
+            rank_min: Some(1),
+            rank_max: Some(3),
+            score_min: None,
+            score_max: None,
+            start_time: None,
+            end_time: None,
+            before: None,
+            after: None,
+            timestamp: None,
+            cursor: None,
+            limit: 10,
+        };
+        let (top_rows, _) =
+            search_ranking_rows(&engine, event_id, &filter, PublicUserIdMode::Unique)
+                .await
+                .unwrap();
+        let growths = fetch_top_player_growths(&engine, event_id, &top_rows, 1_710_000_000, None)
+            .await
+            .unwrap();
+
+        assert_eq!(growths.len(), 3);
+        assert_eq!(
+            growths
+                .iter()
+                .map(|growth| (growth.rank, growth.user_id.as_str(), growth.growth))
+                .collect::<Vec<_>>(),
+            vec![
+                (1, "u-public-1", 300),
+                (2, "u-public-2", 300),
+                (3, "u-public-3", 300)
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn ranking_score_growth_respects_replay_end_time() {
+        let engine = sqlite_engine().await;
+        let event_id = 558;
+        create_event_tables(&engine, SekaiServerRegion::Jp, event_id, false)
+            .await
+            .unwrap();
+        seed_normal_event_with_history(&engine, event_id).await;
+        let time_tbl = intern(TableKind::TimeId, event_id);
+        let event_tbl = intern(TableKind::Event, event_id);
+        for sql in [
+            format!("INSERT INTO {time_tbl} (timestamp, status) VALUES (1710000120, 0)"),
+            format!(
+                "INSERT INTO {event_tbl} (time_id, user_id_key, score, rank) VALUES \
+                (3, 1, 5000, 1), (3, 2, 4900, 2), (3, 3, 4800, 3)"
+            ),
+        ] {
+            engine
+                .conn()
+                .execute_raw(Statement::from_string(DatabaseBackend::Sqlite, sql))
+                .await
+                .unwrap();
+        }
+
+        let growths = fetch_ranking_score_growths(
+            &engine,
+            event_id,
+            &[1],
+            1_710_000_000,
+            Some(1_710_000_060),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(growths.len(), 1);
+        assert_eq!(growths[0].timestamp_latest, 1_710_000_060);
+        assert_eq!(growths[0].score_latest, 1300);
+        assert_eq!(growths[0].growth, Some(300));
+    }
+
+    #[tokio::test]
     async fn web_ranking_window_timestamp_uses_latest_snapshot_before_cutoff() {
         let engine = sqlite_engine().await;
         let event_id = 555;
@@ -1188,6 +1536,63 @@ mod tests {
         assert_eq!(
             rows.iter().map(|row| row.score).collect::<Vec<_>>(),
             vec![2300, 2200, 2100]
+        );
+    }
+
+    #[tokio::test]
+    async fn world_bloom_top_player_growth_filters_character() {
+        let engine = sqlite_engine().await;
+        let event_id = 558;
+        create_event_tables(&engine, SekaiServerRegion::Jp, event_id, true)
+            .await
+            .unwrap();
+        seed_world_bloom_event_with_history(&engine, event_id).await;
+
+        let filter = WebRankingFilter {
+            rank_min: Some(1),
+            rank_max: Some(3),
+            score_min: None,
+            score_max: None,
+            start_time: None,
+            end_time: None,
+            before: None,
+            after: None,
+            timestamp: None,
+            cursor: None,
+            limit: 10,
+        };
+        let (top_rows, _) = search_world_bloom_ranking_rows(
+            &engine,
+            event_id,
+            17,
+            &filter,
+            PublicUserIdMode::Unique,
+        )
+        .await
+        .unwrap();
+        let growths = fetch_world_bloom_top_player_growths(
+            &engine,
+            event_id,
+            17,
+            &top_rows,
+            1_710_000_000,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(growths.len(), 3);
+        assert!(growths.iter().all(|growth| growth.character_id == Some(17)));
+        assert_eq!(
+            growths
+                .iter()
+                .map(|growth| (growth.rank, growth.user_id.as_str(), growth.growth))
+                .collect::<Vec<_>>(),
+            vec![
+                (1, "u-public-1", 300),
+                (2, "u-public-2", 300),
+                (3, "u-public-3", 300)
+            ]
         );
     }
 
