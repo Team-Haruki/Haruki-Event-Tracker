@@ -1,11 +1,12 @@
 use axum::extract::{Path, Query, State};
+use bytes::Bytes;
 use chrono::Utc;
 use serde::Deserialize;
 
 use crate::api::cache::CacheTtl;
 use crate::api::error::ApiError;
 use crate::api::extract::resolve_region_engine;
-use crate::api::json::Json;
+use crate::api::json::{Json, RawJson};
 use crate::api::state::AppState;
 use crate::db::engine::DatabaseEngine;
 use crate::db::query::growth::{
@@ -119,7 +120,7 @@ pub async fn overview(
     State(state): State<AppState>,
     Path((server, event_id)): Path<(String, i64)>,
     Query(query): Query<OverviewQuery>,
-) -> Result<Json<WebOverviewSchema>, ApiError> {
+) -> Result<RawJson, ApiError> {
     let interval = query.interval_seconds();
     let at = query.playback_at();
     let suffix = format!("web:overview:v2:interval={interval}:at={at:?}");
@@ -128,8 +129,9 @@ pub async fn overview(
         let mode = prepare_web_user_id_mode(&state, &engine, region, event_id).await?;
         build_overview(&engine, event_id, mode, interval, at).await
     };
-    let response = cached_overview(&state, &server, event_id, suffix, at.is_some(), fetch).await?;
-    Ok(Json(response))
+    let response =
+        cached_overview_bytes(&state, &server, event_id, suffix, at.is_some(), fetch).await?;
+    Ok(RawJson(response))
 }
 
 #[tracing::instrument(skip(state, query), fields(server, event_id, character_id))]
@@ -159,7 +161,7 @@ pub async fn world_bloom_overview(
     State(state): State<AppState>,
     Path((server, event_id, character_id)): Path<(String, i64, i64)>,
     Query(query): Query<OverviewQuery>,
-) -> Result<Json<WebOverviewSchema>, ApiError> {
+) -> Result<RawJson, ApiError> {
     let interval = query.interval_seconds();
     let at = query.playback_at();
     let suffix = format!("web:overview:v2:wb:{character_id}:interval={interval}:at={at:?}");
@@ -168,8 +170,9 @@ pub async fn world_bloom_overview(
         let mode = prepare_web_user_id_mode(&state, &engine, region, event_id).await?;
         build_world_bloom_overview(&engine, event_id, character_id, mode, interval, at).await
     };
-    let response = cached_overview(&state, &server, event_id, suffix, at.is_some(), fetch).await?;
-    Ok(Json(response))
+    let response =
+        cached_overview_bytes(&state, &server, event_id, suffix, at.is_some(), fetch).await?;
+    Ok(RawJson(response))
 }
 
 #[tracing::instrument(skip(state, query), fields(server, event_id, user_id))]
@@ -596,22 +599,22 @@ where
     }
 }
 
-pub async fn cached_overview<T, Fut>(
+pub async fn cached_overview_bytes<T, Fut>(
     state: &AppState,
     server: &str,
     event_id: i64,
     suffix: String,
     replay: bool,
     fetch: Fut,
-) -> Result<T, ApiError>
+) -> Result<Bytes, ApiError>
 where
-    T: serde::Serialize + serde::de::DeserializeOwned,
+    T: serde::Serialize,
     Fut: std::future::Future<Output = Result<T, ApiError>>,
 {
     if let Some(cache) = state.cache() {
         if replay {
             cache
-                .get_or_fetch_static(
+                .get_or_fetch_static_json_bytes(
                     server,
                     event_id,
                     suffix,
@@ -621,7 +624,7 @@ where
                 .await
         } else {
             cache
-                .get_or_fetch(
+                .get_or_fetch_json_bytes(
                     server,
                     event_id,
                     suffix,
@@ -631,7 +634,12 @@ where
                 .await
         }
     } else {
-        fetch.await
+        fetch.await.and_then(|value| {
+            sonic_rs::to_vec(&value).map(Bytes::from).map_err(|err| {
+                tracing::error!(?err, "json encode error");
+                ApiError::ServiceUnavailable("json encode error".into())
+            })
+        })
     }
 }
 

@@ -8,9 +8,10 @@ use crate::api::cache::CacheTtl;
 use crate::api::error::ApiError;
 use crate::api::extract::{parse_rank_query, prepare_user_id_mode, resolve_region_engine};
 use crate::api::handler::web::{
-    UserSearchQuery, build_overview, build_world_bloom_overview, cached_overview, cached_trace,
+    UserSearchQuery, build_overview, build_world_bloom_overview, cached_overview_bytes,
+    cached_trace,
 };
-use crate::api::json::Json;
+use crate::api::json::{Json, RawJson};
 use crate::api::state::AppState;
 use crate::db::engine::DatabaseEngine;
 use crate::db::query::growth::{
@@ -224,7 +225,7 @@ pub async fn web_total_overview(
     State(state): State<AppState>,
     Path((server, event_id)): Path<(String, i64)>,
     Query(query): Query<OverviewQuery>,
-) -> Result<Json<LeaderboardOverviewSchema>, ApiError> {
+) -> Result<RawJson, ApiError> {
     web_overview_for_scope(state, server, event_id, None, query, "web:v2").await
 }
 
@@ -233,7 +234,7 @@ pub async fn web_world_bloom_overview(
     State(state): State<AppState>,
     Path((server, event_id, character_id)): Path<(String, i64, i64)>,
     Query(query): Query<OverviewQuery>,
-) -> Result<Json<LeaderboardOverviewSchema>, ApiError> {
+) -> Result<RawJson, ApiError> {
     web_overview_for_scope(state, server, event_id, Some(character_id), query, "web:v2").await
 }
 
@@ -242,7 +243,7 @@ pub async fn web_total_replay_overview(
     State(state): State<AppState>,
     Path((server, event_id)): Path<(String, i64)>,
     Query(query): Query<OverviewQuery>,
-) -> Result<Json<LeaderboardOverviewSchema>, ApiError> {
+) -> Result<RawJson, ApiError> {
     web_overview_for_scope(state, server, event_id, None, query, "web:v2:replay").await
 }
 
@@ -251,7 +252,7 @@ pub async fn web_world_bloom_replay_overview(
     State(state): State<AppState>,
     Path((server, event_id, character_id)): Path<(String, i64, i64)>,
     Query(query): Query<OverviewQuery>,
-) -> Result<Json<LeaderboardOverviewSchema>, ApiError> {
+) -> Result<RawJson, ApiError> {
     web_overview_for_scope(
         state,
         server,
@@ -315,7 +316,7 @@ async fn web_overview_for_scope(
     character_id: Option<i64>,
     query: OverviewQuery,
     cache_prefix: &str,
-) -> Result<Json<LeaderboardOverviewSchema>, ApiError> {
+) -> Result<RawJson, ApiError> {
     let interval = interval_seconds(query.interval);
     let at = positive_timestamp(query.at);
     let end_time = at.unwrap_or_else(|| Utc::now().timestamp());
@@ -344,8 +345,8 @@ async fn web_overview_for_scope(
         })
     };
     let response =
-        cached_overview(&state, &cache_server, event_id, suffix, at.is_some(), fetch).await?;
-    Ok(Json(response))
+        cached_overview_bytes(&state, &cache_server, event_id, suffix, at.is_some(), fetch).await?;
+    Ok(RawJson(response))
 }
 
 async fn cloud_query_for_scope(
