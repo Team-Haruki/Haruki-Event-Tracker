@@ -79,6 +79,7 @@ pub struct RankingPageRow {
     card_default_image: Option<String>,
     profile_word: Option<String>,
     profile_honors_json: Option<String>,
+    honor_missions_json: Option<String>,
     player_frames_json: Option<String>,
 }
 
@@ -99,6 +100,7 @@ pub struct WorldBloomRankingPageRow {
     card_default_image: Option<String>,
     profile_word: Option<String>,
     profile_honors_json: Option<String>,
+    honor_missions_json: Option<String>,
     player_frames_json: Option<String>,
 }
 
@@ -169,6 +171,7 @@ impl RankingPageRow {
             card_default_image: self.card_default_image,
             profile_word: self.profile_word,
             profile_honors: parse_json_array(self.profile_honors_json.as_deref()),
+            user_honor_missions: parse_json_array(self.honor_missions_json.as_deref()),
             user_player_frames: parse_json_array(self.player_frames_json.as_deref()),
         }
     }
@@ -247,6 +250,7 @@ impl WorldBloomRankingPageRow {
             card_default_image: self.card_default_image,
             profile_word: self.profile_word,
             profile_honors: parse_json_array(self.profile_honors_json.as_deref()),
+            user_honor_missions: parse_json_array(self.honor_missions_json.as_deref()),
             user_player_frames: parse_json_array(self.player_frames_json.as_deref()),
         }
     }
@@ -298,6 +302,10 @@ fn select_user_profile_columns(stmt: &mut SelectStatement, users_tbl: Alias) {
     .expr_as(
         Expr::col((users_tbl.clone(), event_users::Column::ProfileHonorsJson)),
         Alias::new("profile_honors_json"),
+    )
+    .expr_as(
+        Expr::col((users_tbl.clone(), event_users::Column::HonorMissionsJson)),
+        Alias::new("honor_missions_json"),
     )
     .expr_as(
         Expr::col((users_tbl, event_users::Column::PlayerFramesJson)),
@@ -1127,6 +1135,7 @@ pub async fn search_users(
         .column(event_users::Column::CardDefaultImage)
         .column(event_users::Column::ProfileWord)
         .column(event_users::Column::ProfileHonorsJson)
+        .column(event_users::Column::HonorMissionsJson)
         .column(event_users::Column::PlayerFramesJson)
         .column(event_users::Column::UserIdKey)
         .from(table)
@@ -1195,6 +1204,7 @@ pub struct UserSearchRow {
     pub card_default_image: Option<String>,
     pub profile_word: Option<String>,
     pub profile_honors_json: Option<String>,
+    pub honor_missions_json: Option<String>,
     pub player_frames_json: Option<String>,
     pub user_id_key: i64,
 }
@@ -1212,6 +1222,7 @@ impl UserSearchRow {
             card_default_image: self.card_default_image,
             profile_word: self.profile_word,
             profile_honors: parse_json_array(self.profile_honors_json.as_deref()),
+            user_honor_missions: parse_json_array(self.honor_missions_json.as_deref()),
             user_player_frames: parse_json_array(self.player_frames_json.as_deref()),
         }
     }

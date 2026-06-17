@@ -1,6 +1,5 @@
-//! Mounts the 14 routes from `api/api.go::RegisterRoutes` onto an Axum
-//! router. The middleware stack mirrors the Go fiber app: panic catcher
-//! → compression (gzip+brotli) → access log.
+//! Mounts the public Tracker API routes. The middleware stack mirrors the Go
+//! fiber app: panic catcher → compression (gzip+brotli) → access log.
 
 use std::sync::Arc;
 
@@ -11,16 +10,11 @@ use tower_http::catch_panic::CatchPanicLayer;
 use tower_http::compression::CompressionLayer;
 
 use crate::api::access_log::{self, ProxyTrust};
-use crate::api::handler::{health, lines, private, ranking, status, trace, user, web, world_bloom};
+use crate::api::handler::{health, leaderboard, private, status, web};
 use crate::api::state::AppState;
 use crate::api::{ws, ws_ticket};
 
 pub fn build_router(state: AppState, trust: Arc<ProxyTrust>) -> Router {
-    let event_routes = event_routes();
-    let private_routes = private_event_routes().route_layer(middleware::from_fn_with_state(
-        trust.clone(),
-        private::require_subject,
-    ));
     let ws_state = (state.clone(), trust.clone());
 
     Router::new()
@@ -31,90 +25,114 @@ pub fn build_router(state: AppState, trust: Arc<ProxyTrust>) -> Router {
             get(ws_ticket::issue_ticket).with_state(ws_state.clone()),
         )
         .route("/ws", get(ws::connect).with_state(ws_state))
-        .nest("/event/{server}/{event_id}/private", private_routes)
-        .nest("/event/{server}/{event_id}", event_routes)
+        .merge(cloud_v2_routes())
+        .merge(web_v2_routes(trust.clone()))
         .with_state(state)
         .layer(axum::middleware::from_fn_with_state(trust, access_log::log))
         .layer(CompressionLayer::new().gzip(true).br(true))
         .layer(CatchPanicLayer::new())
 }
 
-pub fn private_event_routes() -> Router<AppState> {
+pub fn cloud_v2_routes() -> Router<AppState> {
     Router::new()
         .route(
-            "/latest-ranking/user/{user_id}",
-            get(private::latest_by_user),
+            "/api/v2/cloud/events/{server}/{event_id}/leaderboards/total/sk/query",
+            get(leaderboard::cloud_total_query),
         )
         .route(
-            "/latest-world-bloom-ranking/character/{character_id}/user/{user_id}",
-            get(private::latest_world_bloom_by_user),
+            "/api/v2/cloud/events/{server}/{event_id}/leaderboards/total/sk/check-room",
+            get(leaderboard::cloud_total_check_room),
         )
-        .route("/trace-ranking/user/{user_id}", get(private::trace_by_user))
         .route(
-            "/trace-world-bloom-ranking/character/{character_id}/user/{user_id}",
-            get(private::trace_world_bloom_by_user),
+            "/api/v2/cloud/events/{server}/{event_id}/leaderboards/total/sk/line",
+            get(leaderboard::cloud_total_line),
+        )
+        .route(
+            "/api/v2/cloud/events/{server}/{event_id}/leaderboards/total/sk/speed",
+            get(leaderboard::cloud_total_speed),
+        )
+        .route(
+            "/api/v2/cloud/events/{server}/{event_id}/leaderboards/total/sk/trace",
+            get(leaderboard::cloud_total_trace),
+        )
+        .route(
+            "/api/v2/cloud/events/{server}/{event_id}/leaderboards/total/sk/status",
+            get(status::event_status),
+        )
+        .route(
+            "/api/v2/cloud/events/{server}/{event_id}/leaderboards/world-bloom/{character_id}/sk/query",
+            get(leaderboard::cloud_world_bloom_query),
+        )
+        .route(
+            "/api/v2/cloud/events/{server}/{event_id}/leaderboards/world-bloom/{character_id}/sk/check-room",
+            get(leaderboard::cloud_world_bloom_check_room),
+        )
+        .route(
+            "/api/v2/cloud/events/{server}/{event_id}/leaderboards/world-bloom/{character_id}/sk/line",
+            get(leaderboard::cloud_world_bloom_line),
+        )
+        .route(
+            "/api/v2/cloud/events/{server}/{event_id}/leaderboards/world-bloom/{character_id}/sk/speed",
+            get(leaderboard::cloud_world_bloom_speed),
+        )
+        .route(
+            "/api/v2/cloud/events/{server}/{event_id}/leaderboards/world-bloom/{character_id}/sk/trace",
+            get(leaderboard::cloud_world_bloom_trace),
         )
 }
 
-pub fn event_routes() -> Router<AppState> {
+pub fn web_v2_routes(trust: Arc<ProxyTrust>) -> Router<AppState> {
+    let private_routes = Router::new()
+        .route(
+            "/api/v2/web/events/{server}/{event_id}/leaderboards/total/private/details/user/{user_id}",
+            get(private::web_total_user_detail),
+        )
+        .route(
+            "/api/v2/web/events/{server}/{event_id}/leaderboards/world-bloom/{character_id}/private/details/user/{user_id}",
+            get(private::web_world_bloom_user_detail),
+        )
+        .route_layer(middleware::from_fn_with_state(trust, private::require_subject));
+
     Router::new()
         .route(
-            "/latest-ranking/user/{user_id}",
-            get(ranking::latest_by_user),
-        )
-        .route("/latest-ranking/rank/{rank}", get(ranking::latest_by_rank))
-        .route(
-            "/latest-world-bloom-ranking/character/{character_id}/user/{user_id}",
-            get(world_bloom::latest_by_user),
+            "/api/v2/web/events/{server}/{event_id}/leaderboards/total/overview",
+            get(leaderboard::web_total_overview),
         )
         .route(
-            "/latest-world-bloom-ranking/character/{character_id}/rank/{rank}",
-            get(world_bloom::latest_by_rank),
-        )
-        .route("/trace-ranking/user/{user_id}", get(trace::all_by_user))
-        .route("/trace-ranking/rank/{rank}", get(trace::all_by_rank))
-        .route("/trace-ranking/ranks", get(trace::all_by_ranks))
-        .route(
-            "/trace-world-bloom-ranking/character/{character_id}/user/{user_id}",
-            get(trace::wb_all_by_user),
+            "/api/v2/web/events/{server}/{event_id}/leaderboards/total/replay/overview",
+            get(leaderboard::web_total_replay_overview),
         )
         .route(
-            "/trace-world-bloom-ranking/character/{character_id}/rank/{rank}",
-            get(trace::wb_all_by_rank),
+            "/api/v2/web/events/{server}/{event_id}/leaderboards/total/details/rank/{rank}",
+            get(leaderboard::web_total_rank_detail),
         )
         .route(
-            "/trace-world-bloom-ranking/character/{character_id}/ranks",
-            get(trace::wb_all_by_ranks),
-        )
-        .route("/user-data/{user_id}", get(user::user_data))
-        .route("/web/overview", get(web::overview))
-        .route("/web/rankings", get(web::rankings))
-        .route(
-            "/web/world-bloom-overview/character/{character_id}",
-            get(web::world_bloom_overview),
+            "/api/v2/web/events/{server}/{event_id}/leaderboards/total/details/user/{user_id}",
+            get(leaderboard::web_total_user_detail),
         )
         .route(
-            "/web/world-bloom-rankings/character/{character_id}",
-            get(web::world_bloom_rankings),
-        )
-        .route("/web/trace-ranking/user/{user_id}", get(web::user_trace))
-        .route(
-            "/web/trace-world-bloom-ranking/character/{character_id}/user/{user_id}",
-            get(web::world_bloom_user_trace),
-        )
-        .route("/web/users", get(web::users))
-        .route("/ranking-lines", get(lines::ranking_lines))
-        .route(
-            "/ranking-score-growth/interval/{interval}",
-            get(lines::score_growth),
+            "/api/v2/web/events/{server}/{event_id}/leaderboards/total/users/search",
+            get(web::users),
         )
         .route(
-            "/world-bloom-ranking-lines/character/{character_id}",
-            get(lines::wb_ranking_lines),
+            "/api/v2/web/events/{server}/{event_id}/leaderboards/world-bloom/{character_id}/overview",
+            get(leaderboard::web_world_bloom_overview),
         )
         .route(
-            "/world-bloom-ranking-score-growth/character/{character_id}/interval/{interval}",
-            get(lines::wb_score_growth),
+            "/api/v2/web/events/{server}/{event_id}/leaderboards/world-bloom/{character_id}/replay/overview",
+            get(leaderboard::web_world_bloom_replay_overview),
         )
-        .route("/status", get(status::event_status))
+        .route(
+            "/api/v2/web/events/{server}/{event_id}/leaderboards/world-bloom/{character_id}/details/rank/{rank}",
+            get(leaderboard::web_world_bloom_rank_detail),
+        )
+        .route(
+            "/api/v2/web/events/{server}/{event_id}/leaderboards/world-bloom/{character_id}/details/user/{user_id}",
+            get(leaderboard::web_world_bloom_user_detail),
+        )
+        .route(
+            "/api/v2/web/events/{server}/{event_id}/leaderboards/world-bloom/{character_id}/users/search",
+            get(leaderboard::web_world_bloom_users),
+        )
+        .merge(private_routes)
 }

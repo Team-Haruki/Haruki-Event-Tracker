@@ -147,7 +147,13 @@ mod tests {
                 }
             ],
             "userCheerfulCarnival": {},
-            "userHonorMissions": [],
+            "userHonorMissions": [
+                {
+                    "honorMissionType": "character",
+                    "honorMissionId": 1001,
+                    "progress": 3
+                }
+            ],
             "userPlayerFrames": [
                 {
                     "playerFrameId": 10050,
@@ -164,10 +170,13 @@ mod tests {
             Some("なーんせんす文学")
         );
         assert_eq!(row.user_profile_honors[0].honor_id, Some(95));
+        assert_eq!(row.user_honor_missions.len(), 1);
         assert_eq!(row.user_player_frames[0].player_frame_id, Some(10050));
 
         let honors_json = sonic_rs::to_string(&row.user_profile_honors).unwrap();
         assert!(honors_json.contains("profileHonorType"));
+        let missions_json = sonic_rs::to_string(&row.user_honor_missions).unwrap();
+        assert!(missions_json.contains("honorMissionType"));
         let frames_json = sonic_rs::to_string(&row.user_player_frames).unwrap();
         assert!(frames_json.contains("playerFrameAttachStatus"));
     }

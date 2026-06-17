@@ -38,6 +38,7 @@ pub fn extract_player_profile(r: &PlayerRankingSchema) -> PlayerProfileSchema {
         card: r.user_card.clone(),
         profile_word: r.user_profile.as_ref().and_then(|p| p.word.clone()),
         profile_honors: r.user_profile_honors.clone(),
+        honor_missions: r.user_honor_missions.clone(),
         player_frames: r.user_player_frames.clone(),
     }
 }

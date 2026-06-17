@@ -1,9 +1,5 @@
 pub mod health;
-pub mod lines;
+pub mod leaderboard;
 pub mod private;
-pub mod ranking;
 pub mod status;
-pub mod trace;
-pub mod user;
 pub mod web;
-pub mod world_bloom;

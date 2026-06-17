@@ -37,6 +37,7 @@ pub struct Model {
     pub card_default_image: Option<String>,
     pub profile_word: Option<String>,
     pub profile_honors_json: Option<String>,
+    pub honor_missions_json: Option<String>,
     pub player_frames_json: Option<String>,
 }
 
@@ -54,6 +55,7 @@ pub enum Column {
     CardDefaultImage,
     ProfileWord,
     ProfileHonorsJson,
+    HonorMissionsJson,
     PlayerFramesJson,
 }
 
@@ -76,7 +78,7 @@ impl ColumnTrait for Column {
                 ColumnType::String(StringLen::N(64)).def().nullable()
             }
             Self::ProfileWord => ColumnType::String(StringLen::N(300)).def().nullable(),
-            Self::ProfileHonorsJson | Self::PlayerFramesJson => {
+            Self::ProfileHonorsJson | Self::HonorMissionsJson | Self::PlayerFramesJson => {
                 ColumnType::String(StringLen::None).def().nullable()
             }
         }

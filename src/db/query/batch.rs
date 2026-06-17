@@ -41,6 +41,7 @@ struct UserKeyRow {
     card_default_image: Option<String>,
     profile_word: Option<String>,
     profile_honors_json: Option<String>,
+    honor_missions_json: Option<String>,
     player_frames_json: Option<String>,
 }
 
@@ -100,6 +101,7 @@ pub(crate) struct UserDimRow {
     pub card_default_image: Option<String>,
     pub profile_word: Option<String>,
     pub profile_honors_json: Option<String>,
+    pub honor_missions_json: Option<String>,
     pub player_frames_json: Option<String>,
 }
 
@@ -124,6 +126,7 @@ impl UserDimRow {
             card_default_image: card.and_then(|c| c.default_image.clone()),
             profile_word: r.profile.profile_word.clone(),
             profile_honors_json: json_array_or_none(&r.profile.profile_honors),
+            honor_missions_json: json_array_or_none(&r.profile.honor_missions),
             player_frames_json: json_array_or_none(&r.profile.player_frames),
         }
     }
@@ -199,6 +202,10 @@ pub(crate) async fn batch_get_or_create_user_id_keys(
             Alias::new("profile_honors_json"),
         )
         .expr_as(
+            Expr::col(event_users::Column::HonorMissionsJson),
+            Alias::new("honor_missions_json"),
+        )
+        .expr_as(
             Expr::col(event_users::Column::PlayerFramesJson),
             Alias::new("player_frames_json"),
         )
@@ -242,6 +249,7 @@ pub(crate) async fn batch_get_or_create_user_id_keys(
                 || row.card_default_image != info.card_default_image
                 || row.profile_word != info.profile_word
                 || row.profile_honors_json != info.profile_honors_json
+                || row.honor_missions_json != info.honor_missions_json
                 || row.player_frames_json != info.player_frames_json
             {
                 let upd = Query::update()
@@ -261,6 +269,10 @@ pub(crate) async fn batch_get_or_create_user_id_keys(
                     .value(
                         event_users::Column::ProfileHonorsJson,
                         info.profile_honors_json.clone(),
+                    )
+                    .value(
+                        event_users::Column::HonorMissionsJson,
+                        info.honor_missions_json.clone(),
                     )
                     .value(
                         event_users::Column::PlayerFramesJson,
@@ -289,6 +301,7 @@ pub(crate) async fn batch_get_or_create_user_id_keys(
                 event_users::Column::CardDefaultImage,
                 event_users::Column::ProfileWord,
                 event_users::Column::ProfileHonorsJson,
+                event_users::Column::HonorMissionsJson,
                 event_users::Column::PlayerFramesJson,
             ])
             .values_panic([
@@ -303,6 +316,7 @@ pub(crate) async fn batch_get_or_create_user_id_keys(
                 info.card_default_image.clone().into(),
                 info.profile_word.clone().into(),
                 info.profile_honors_json.clone().into(),
+                info.honor_missions_json.clone().into(),
                 info.player_frames_json.clone().into(),
             ]);
         } else {
@@ -317,6 +331,7 @@ pub(crate) async fn batch_get_or_create_user_id_keys(
                 event_users::Column::CardDefaultImage,
                 event_users::Column::ProfileWord,
                 event_users::Column::ProfileHonorsJson,
+                event_users::Column::HonorMissionsJson,
                 event_users::Column::PlayerFramesJson,
             ])
             .values_panic([
@@ -330,6 +345,7 @@ pub(crate) async fn batch_get_or_create_user_id_keys(
                 info.card_default_image.clone().into(),
                 info.profile_word.clone().into(),
                 info.profile_honors_json.clone().into(),
+                info.honor_missions_json.clone().into(),
                 info.player_frames_json.clone().into(),
             ]);
         }
@@ -674,6 +690,9 @@ mod tests {
                     bonds_honor_view_type: Some("none".into()),
                     bonds_honor_word_id: Some(0),
                 }],
+                honor_missions: vec![
+                    sonic_rs::from_str(r#"{"honorMissionType":"character","progress":3}"#).unwrap(),
+                ],
                 player_frames: vec![UserPlayerFrame {
                     player_frame_id: Some(10050),
                     player_frame_attach_status: Some("first".into()),
@@ -698,6 +717,7 @@ mod tests {
         assert_eq!(user.card_id, Some(1404));
         assert_eq!(user.profile_word.as_deref(), Some("hello"));
         assert_eq!(user.profile_honors[0].honor_id, Some(95));
+        assert_eq!(user.user_honor_missions.len(), 1);
         assert_eq!(user.user_player_frames[0].player_frame_id, Some(10050));
 
         let stmt = Query::select()

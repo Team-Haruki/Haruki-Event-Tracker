@@ -246,7 +246,7 @@ pub async fn users(
     Ok(Json(response))
 }
 
-async fn build_overview(
+pub async fn build_overview(
     engine: &DatabaseEngine,
     event_id: i64,
     mode: PublicUserIdMode,
@@ -296,7 +296,7 @@ async fn build_overview(
     })
 }
 
-async fn build_world_bloom_overview(
+pub async fn build_world_bloom_overview(
     engine: &DatabaseEngine,
     event_id: i64,
     character_id: i64,
@@ -596,7 +596,7 @@ where
     }
 }
 
-async fn cached_overview<T, Fut>(
+pub async fn cached_overview<T, Fut>(
     state: &AppState,
     server: &str,
     event_id: i64,
@@ -635,7 +635,7 @@ where
     }
 }
 
-async fn cached_trace<T, Fut>(
+pub async fn cached_trace<T, Fut>(
     state: &AppState,
     server: &str,
     event_id: i64,

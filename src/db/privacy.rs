@@ -54,6 +54,7 @@ pub async fn ensure_profile_columns(
         ("card_default_image", "VARCHAR(64)"),
         ("profile_word", "VARCHAR(300)"),
         ("profile_honors_json", "TEXT"),
+        ("honor_missions_json", "TEXT"),
         ("player_frames_json", "TEXT"),
     ] {
         ensure_column(engine, table, column, ty).await?;

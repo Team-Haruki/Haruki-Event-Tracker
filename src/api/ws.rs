@@ -16,7 +16,7 @@ use tower::ServiceExt;
 use crate::api::access_log::ProxyTrust;
 use crate::api::handler::private::PrivateSubject;
 use crate::api::realtime::{RealtimeMessage, RealtimeTopic};
-use crate::api::router::{event_routes, private_event_routes};
+use crate::api::router::web_v2_routes;
 use crate::api::state::AppState;
 use crate::api::ws_ticket::{peer_from_connect_info, resolve_trusted_subject, unauthorized};
 use crate::model::enums::SekaiServerRegion;
@@ -123,8 +123,7 @@ async fn handle_socket(
     subject: String,
 ) {
     let router = Router::new()
-        .nest("/event/{server}/{event_id}/private", private_event_routes())
-        .nest("/event/{server}/{event_id}", event_routes())
+        .merge(web_v2_routes(trust.clone()))
         .with_state(state.clone())
         .layer(axum::middleware::from_fn_with_state(
             trust,
@@ -456,7 +455,7 @@ async fn send_event(socket: &mut WebSocket, event: &WsEvent<'_>) -> Result<(), a
 }
 
 fn is_allowed_event_path(path: &str) -> bool {
-    if !path.starts_with("/event/") {
+    if !path.starts_with("/api/v2/web/") {
         return false;
     }
     !path.contains("://") && !path.contains('\\') && !path.contains('\n') && !path.contains('\r')

@@ -20,6 +20,7 @@ struct RecordedUserNameRow {
     card_default_image: Option<String>,
     profile_word: Option<String>,
     profile_honors_json: Option<String>,
+    honor_missions_json: Option<String>,
     player_frames_json: Option<String>,
 }
 
@@ -36,6 +37,7 @@ impl RecordedUserNameRow {
             card_default_image: self.card_default_image,
             profile_word: self.profile_word,
             profile_honors: parse_json_array(self.profile_honors_json.as_deref()),
+            user_honor_missions: parse_json_array(self.honor_missions_json.as_deref()),
             user_player_frames: parse_json_array(self.player_frames_json.as_deref()),
         }
     }
@@ -83,6 +85,7 @@ pub async fn get_user_data(
         .column(event_users::Column::CardDefaultImage)
         .column(event_users::Column::ProfileWord)
         .column(event_users::Column::ProfileHonorsJson)
+        .column(event_users::Column::HonorMissionsJson)
         .column(event_users::Column::PlayerFramesJson)
         .from(table)
         .and_where(Expr::col(mode.output_column()).eq(user_id))

@@ -8,6 +8,7 @@ pub struct PlayerProfileSchema {
     pub card: Option<UserCard>,
     pub profile_word: Option<String>,
     pub profile_honors: Vec<UserProfileHonor>,
+    pub honor_missions: Vec<sonic_rs::Value>,
     pub player_frames: Vec<UserPlayerFrame>,
 }
 

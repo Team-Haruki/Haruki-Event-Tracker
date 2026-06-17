@@ -56,6 +56,8 @@ pub struct RecordedUserNameSchema {
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub profile_honors: Vec<UserProfileHonor>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub user_honor_missions: Vec<sonic_rs::Value>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub user_player_frames: Vec<UserPlayerFrame>,
 }
 
@@ -182,4 +184,178 @@ pub struct WebUserSearchPageSchema {
     pub items: Vec<RecordedUserNameSchema>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LeaderboardMetaSchema {
+    pub server: String,
+    pub event_id: i64,
+    pub scope: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub character_id: Option<i64>,
+    pub fetched_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LeaderboardOverviewSchema {
+    pub meta: LeaderboardMetaSchema,
+    #[serde(flatten)]
+    pub overview: WebOverviewSchema,
+    pub window_start: i64,
+    pub window_end: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RankSnapshotSchema {
+    pub rank: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub current: Option<WebRankingItemSchema>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub previous: Option<WebRankingItemSchema>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next: Option<WebRankingItemSchema>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metrics: Option<RankingScoreGrowthSchema>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RankSnapshotsResponseSchema {
+    pub meta: LeaderboardMetaSchema,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub items: Vec<RankSnapshotSchema>,
+    pub interval_seconds: i64,
+    pub window_start: i64,
+    pub window_end: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SubjectTraceMetaSchema {
+    pub subject_type: String,
+    pub subject: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resolved_user_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resolved_rank: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SubjectTraceResponseSchema {
+    pub meta: LeaderboardMetaSchema,
+    pub subject: SubjectTraceMetaSchema,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub current: Option<WebRankingItemSchema>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub rank_data: Vec<RecordedRankData>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_data: Option<RecordedUserNameSchema>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CloudRankInfoSchema {
+    pub rank: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_id: Option<String>,
+    pub name: String,
+    pub score: i64,
+    pub timestamp: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub speed: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub speed_window: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub character_id: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CloudRankQueryResponseSchema {
+    pub meta: LeaderboardMetaSchema,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub ranks: Vec<CloudRankInfoSchema>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub previous: Option<CloudRankInfoSchema>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next: Option<CloudRankInfoSchema>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CloudCheckRoomResponseSchema {
+    pub meta: LeaderboardMetaSchema,
+    pub rank: CloudRankInfoSchema,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub previous: Option<CloudRankInfoSchema>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next: Option<CloudRankInfoSchema>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CloudLineResponseSchema {
+    pub meta: LeaderboardMetaSchema,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub ranks: Vec<CloudRankInfoSchema>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CloudSpeedResponseSchema {
+    pub meta: LeaderboardMetaSchema,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub speeds: Vec<CloudRankInfoSchema>,
+    pub interval_seconds: i64,
+    pub unit_seconds: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CloudTraceResponseSchema {
+    pub meta: LeaderboardMetaSchema,
+    pub subject: SubjectTraceMetaSchema,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub rank_data: Vec<CloudRankInfoSchema>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WebRankDetailResponseSchema {
+    pub meta: LeaderboardMetaSchema,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub current: Option<WebRankingItemSchema>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub previous: Option<WebRankingItemSchema>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next: Option<WebRankingItemSchema>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metrics: Option<RankingScoreGrowthSchema>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub rank_trace: Vec<RecordedRankData>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub player_trace: Vec<RecordedRankData>,
+    pub interval_seconds: i64,
+    pub window_start: i64,
+    pub window_end: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WebUserDetailResponseSchema {
+    pub meta: LeaderboardMetaSchema,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub current: Option<WebRankingItemSchema>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub previous: Option<WebRankingItemSchema>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next: Option<WebRankingItemSchema>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub player_trace: Vec<RecordedRankData>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub profile: Option<RecordedUserNameSchema>,
 }
