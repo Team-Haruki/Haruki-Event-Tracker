@@ -21,7 +21,7 @@ RUN if [ "$VERSION" != "3.0.0-dev" ]; then \
     cargo build --release --bin haruki-event-tracker && \
     strip target/release/haruki-event-tracker
 
-FROM alpine:3.23 AS runtime
+FROM alpine:3.24 AS runtime
 RUN apk add --no-cache ca-certificates tzdata
 WORKDIR /app
 COPY --from=builder /app/target/release/haruki-event-tracker ./haruki-event-tracker
