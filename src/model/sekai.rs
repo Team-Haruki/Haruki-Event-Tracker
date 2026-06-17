@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -57,7 +58,7 @@ pub struct PlayerRankingSchema {
     pub user_profile_honors: Vec<UserProfileHonor>,
     pub user_cheerful_carnival: Option<UserCheerfulCarnival>,
     #[serde(default)]
-    pub user_honor_missions: Vec<sonic_rs::Value>,
+    pub user_honor_missions: Vec<Value>,
     #[serde(default)]
     pub user_player_frames: Vec<UserPlayerFrame>,
 }
@@ -177,6 +178,8 @@ mod tests {
         assert!(honors_json.contains("profileHonorType"));
         let missions_json = sonic_rs::to_string(&row.user_honor_missions).unwrap();
         assert!(missions_json.contains("honorMissionType"));
+        let missions_roundtrip: Vec<Value> = sonic_rs::from_str(&missions_json).unwrap();
+        assert_eq!(missions_roundtrip.len(), 1);
         let frames_json = sonic_rs::to_string(&row.user_player_frames).unwrap();
         assert!(frames_json.contains("playerFrameAttachStatus"));
     }

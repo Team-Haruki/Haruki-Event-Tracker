@@ -1,5 +1,6 @@
 use sea_orm::FromQueryResult;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::model::sekai::{UserPlayerFrame, UserProfileHonor};
 
@@ -56,7 +57,7 @@ pub struct RecordedUserNameSchema {
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub profile_honors: Vec<UserProfileHonor>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
-    pub user_honor_missions: Vec<sonic_rs::Value>,
+    pub user_honor_missions: Vec<Value>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub user_player_frames: Vec<UserPlayerFrame>,
 }
@@ -370,4 +371,60 @@ pub struct WebUserDetailResponseSchema {
     pub player_trace: Vec<RecordedRankData>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub profile: Option<RecordedUserNameSchema>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn leaderboard_overview_cache_round_trips_honor_missions() {
+        let response = LeaderboardOverviewSchema {
+            meta: LeaderboardMetaSchema {
+                server: "cn".to_owned(),
+                event_id: 170,
+                scope: "world-bloom/20".to_owned(),
+                character_id: Some(20),
+                fetched_at: 1_781_675_150,
+            },
+            overview: WebOverviewSchema {
+                top_rankings: vec![WebRankingItemSchema {
+                    rank_data: RecordedRankData::WorldBloom(RecordedWorldBloomRankingSchema {
+                        timestamp: 1_781_675_101,
+                        user_id: "100".to_owned(),
+                        score: 147_100_930,
+                        rank: 1,
+                        character_id: Some(20),
+                    }),
+                    user_data: Some(RecordedUserNameSchema {
+                        user_id: "100".to_owned(),
+                        name: "Miku".to_owned(),
+                        cheerful_team_id: None,
+                        card_id: Some(1041),
+                        card_level: Some(60),
+                        card_master_rank: Some(5),
+                        card_special_training_status: Some("done".to_owned()),
+                        card_default_image: Some("special_training".to_owned()),
+                        profile_word: Some("hello".to_owned()),
+                        profile_honors: Vec::new(),
+                        user_honor_missions: vec![
+                            serde_json::from_str(
+                                r#"{"honorMissionType":"character","progress":3}"#,
+                            )
+                            .unwrap(),
+                        ],
+                        user_player_frames: Vec::new(),
+                    }),
+                }],
+                interval_seconds: 3600,
+                ..WebOverviewSchema::default()
+            },
+            window_start: 1_781_671_550,
+            window_end: 1_781_675_150,
+        };
+
+        let bytes = sonic_rs::to_vec(&response).unwrap();
+        let decoded: LeaderboardOverviewSchema = sonic_rs::from_slice(&bytes).unwrap();
+        assert_eq!(decoded.overview.top_rankings.len(), 1);
+    }
 }

@@ -691,7 +691,8 @@ mod tests {
                     bonds_honor_word_id: Some(0),
                 }],
                 honor_missions: vec![
-                    sonic_rs::from_str(r#"{"honorMissionType":"character","progress":3}"#).unwrap(),
+                    serde_json::from_str(r#"{"honorMissionType":"character","progress":3}"#)
+                        .unwrap(),
                 ],
                 player_frames: vec![UserPlayerFrame {
                     player_frame_id: Some(10050),

@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::collections::HashMap;
 
 use super::sekai::{PlayerRankingSchema, UserCard, UserPlayerFrame, UserProfileHonor};
@@ -8,7 +9,7 @@ pub struct PlayerProfileSchema {
     pub card: Option<UserCard>,
     pub profile_word: Option<String>,
     pub profile_honors: Vec<UserProfileHonor>,
-    pub honor_missions: Vec<sonic_rs::Value>,
+    pub honor_missions: Vec<Value>,
     pub player_frames: Vec<UserPlayerFrame>,
 }
 
