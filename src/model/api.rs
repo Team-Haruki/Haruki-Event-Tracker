@@ -303,6 +303,8 @@ pub struct CloudRankQueryResponseSchema {
 pub struct CloudCheckRoomResponseSchema {
     pub meta: LeaderboardMetaSchema,
     pub rank: CloudRankInfoSchema,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub ranks: Vec<CloudRankInfoSchema>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub previous: Option<CloudRankInfoSchema>,
     #[serde(skip_serializing_if = "Option::is_none")]

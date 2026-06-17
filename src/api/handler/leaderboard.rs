@@ -37,6 +37,7 @@ const DEFAULT_INTERVAL_SECONDS: i64 = 3600;
 const MAX_TRACE_LIMIT: u64 = 10_000;
 const CLOUD_TRACE_METRICS_LIMIT: u64 = 5_000;
 const CLOUD_TRACE_METRICS_LOOKBACK_SECONDS: i64 = 12 * 60 * 60;
+const CLOUD_ROUND_METRICS_CACHE_PREFIX: &str = "cloud:v2:roundMetrics=v4-recent12h-sampleStart";
 const TRACKER_REALTIME_TAIL_MAX_LAG_SECONDS: i64 = 30 * 24 * 60 * 60;
 
 #[derive(Debug, Deserialize)]
@@ -370,7 +371,7 @@ async fn cloud_query_for_scope(
             SnapshotBuildRequest {
                 ranks,
                 include_adjacent,
-                include_metrics: true,
+                include_metrics: false,
                 interval: interval_seconds(query.interval),
                 at: None,
                 cache_prefix: "cloud:v2",
@@ -392,7 +393,7 @@ async fn cloud_query_for_scope(
                 cursor: None,
                 limit: Some(1),
             },
-            "cloud:v2",
+            cloud_round_metrics_cache_prefix(),
         )
         .await?;
         let Some(current) = subject.current else {
@@ -407,7 +408,7 @@ async fn cloud_query_for_scope(
             SnapshotBuildRequest {
                 ranks: vec![rank],
                 include_adjacent,
-                include_metrics: true,
+                include_metrics: false,
                 interval: interval_seconds(query.interval),
                 at: None,
                 cache_prefix: "cloud:v2",
@@ -461,14 +462,12 @@ async fn cloud_check_room_for_scope(
     )
     .await?;
     let response = response.0;
-    let rank = response
-        .ranks
-        .into_iter()
-        .next()
-        .ok_or(ApiError::NotFound)?;
+    let ranks = response.ranks;
+    let rank = ranks.first().cloned().ok_or(ApiError::NotFound)?;
     Ok(Json(CloudCheckRoomResponseSchema {
         meta: response.meta,
         rank,
+        ranks,
         previous: response.previous,
         next: response.next,
     }))
@@ -576,7 +575,7 @@ async fn cloud_trace_for_scope(
             cursor: None,
             limit: query.limit,
         },
-        "cloud:v2",
+        cloud_round_metrics_cache_prefix(),
     )
     .await?;
     let name = trace
@@ -631,12 +630,22 @@ async fn build_rank_snapshots_response(
     let all_ranks = requested.into_iter().collect::<Vec<_>>();
     let suffix = match character_id {
         Some(character_id) => format!(
-            "{cache_prefix}:wb:{character_id}:snapshots:ranks={}:adj={include_adjacent}:metrics={include_metrics}:interval={interval}:at={at:?}",
-            join_ranks(&ranks)
+            "{cache_prefix}:wb:{character_id}:snapshots:ranks={}:adj={include_adjacent}:metrics={include_metrics}:interval={interval}:at={at:?}:{}",
+            join_ranks(&ranks),
+            if include_metrics {
+                "lineMetrics=v1"
+            } else {
+                "lineMetrics=none"
+            }
         ),
         None => format!(
-            "{cache_prefix}:total:snapshots:ranks={}:adj={include_adjacent}:metrics={include_metrics}:interval={interval}:at={at:?}",
-            join_ranks(&ranks)
+            "{cache_prefix}:total:snapshots:ranks={}:adj={include_adjacent}:metrics={include_metrics}:interval={interval}:at={at:?}:{}",
+            join_ranks(&ranks),
+            if include_metrics {
+                "lineMetrics=v1"
+            } else {
+                "lineMetrics=none"
+            }
         ),
     };
     let cache_server = server.clone();
@@ -1231,10 +1240,12 @@ fn cloud_trace_metrics_filter(rank_timestamp: i64) -> WebTraceFilter {
 
 fn has_cloud_round_metrics(info: &CloudRankInfoSchema) -> bool {
     info.average_round.is_some()
-        || info.average_pt.is_some()
-        || info.hour_round.is_some()
-        || info.min20_times_3_speed.is_some()
-        || info.record_start_at.is_some()
+        && info.average_pt.is_some()
+        && info.latest_pt.is_some()
+        && info.hour_round.is_some()
+        && info.min20_times_3_speed.is_some()
+        && info.speed.is_some()
+        && info.record_start_at.is_some()
 }
 
 fn cloud_infos_from_snapshots(
@@ -1342,10 +1353,10 @@ fn apply_cloud_trace_metrics_at(
     }
     samples.sort_by_key(|sample| normalize_tracker_unix_seconds(sample.timestamp));
 
-    info.record_start_at = Some(format_tracker_timestamp(samples[0].timestamp));
     if samples.len() < 2 {
         return;
     }
+    info.record_start_at = Some(format_tracker_timestamp(samples[0].timestamp));
 
     let deltas = samples
         .windows(2)
@@ -1519,6 +1530,10 @@ fn positive_timestamp(timestamp: Option<i64>) -> Option<i64> {
     timestamp.filter(|timestamp| *timestamp > 0)
 }
 
+fn cloud_round_metrics_cache_prefix() -> &'static str {
+    CLOUD_ROUND_METRICS_CACHE_PREFIX
+}
+
 fn join_ranks(ranks: &[i64]) -> String {
     ranks
         .iter()
@@ -1631,6 +1646,81 @@ mod tests {
         assert_eq!(info.speed, Some(300_000));
         assert_eq!(info.hour_round, Some(1));
         assert_eq!(info.min20_times_3_speed, Some(900_000));
+    }
+
+    #[test]
+    fn cloud_trace_metrics_use_recent_sample_start_time() {
+        let trace = vec![
+            RecordedRankData::Normal(crate::model::api::RecordedRankingSchema {
+                rank: 100,
+                user_id: "12345".to_owned(),
+                score: 1_250_000,
+                timestamp: 1_704_063_600,
+            }),
+            RecordedRankData::Normal(crate::model::api::RecordedRankingSchema {
+                rank: 100,
+                user_id: "12345".to_owned(),
+                score: 1_550_000,
+                timestamp: 1_704_067_200,
+            }),
+        ];
+        let mut info = CloudRankInfoSchema {
+            rank: 100,
+            user_id: Some("12345".to_owned()),
+            name: "User".to_owned(),
+            score: 1_550_000,
+            timestamp: 1_704_067_200,
+            average_round: None,
+            average_pt: None,
+            latest_pt: None,
+            speed: None,
+            min20_times_3_speed: None,
+            hour_round: None,
+            record_start_at: Some(1_704_000_000_000),
+            speed_window: None,
+            character_id: None,
+        };
+
+        apply_cloud_trace_metrics_at(
+            &mut info,
+            &trace,
+            Utc.timestamp_opt(1_704_067_200, 0).single().unwrap(),
+        );
+
+        assert_eq!(info.record_start_at, Some(1_704_063_600_000));
+        assert_eq!(info.latest_pt, Some(300_000));
+        assert_eq!(info.speed, Some(300_000));
+    }
+
+    #[test]
+    fn cloud_check_room_response_serializes_batch_ranks() {
+        let rank = CloudRankInfoSchema {
+            rank: 1,
+            user_id: Some("12345".to_owned()),
+            name: "User".to_owned(),
+            score: 1_550_000,
+            timestamp: 1_704_067_200,
+            average_round: None,
+            average_pt: None,
+            latest_pt: None,
+            speed: None,
+            min20_times_3_speed: None,
+            hour_round: None,
+            record_start_at: None,
+            speed_window: None,
+            character_id: None,
+        };
+        let response = CloudCheckRoomResponseSchema {
+            meta: meta("cn", 170, None, 1),
+            rank: rank.clone(),
+            ranks: vec![rank],
+            previous: None,
+            next: None,
+        };
+
+        let value = sonic_rs::to_value(&response).expect("serialize check-room response");
+        assert_eq!(value["rank"]["rank"].as_i64(), Some(1));
+        assert_eq!(value["ranks"][0]["rank"].as_i64(), Some(1));
     }
 
     #[test]
