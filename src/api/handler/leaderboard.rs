@@ -35,10 +35,9 @@ use crate::model::api::{
 
 const DEFAULT_INTERVAL_SECONDS: i64 = 3600;
 const MAX_TRACE_LIMIT: u64 = 10_000;
-const CLOUD_TRACE_METRICS_LIMIT: u64 = 5_000;
 const CLOUD_TRACE_METRICS_LOOKBACK_SECONDS: i64 = 12 * 60 * 60;
 const CLOUD_RECOVERY_IDLE_SECONDS: i64 = 5 * 60;
-const CLOUD_ROUND_METRICS_CACHE_PREFIX: &str = "cloud:v2:roundMetrics=v6-recent12h-recoveryRt";
+const CLOUD_ROUND_METRICS_CACHE_PREFIX: &str = "cloud:v2:roundMetrics=v7-fullTraceRecoveryRt";
 const TRACKER_REALTIME_TAIL_MAX_LAG_SECONDS: i64 = 30 * 24 * 60 * 60;
 
 #[derive(Debug, Deserialize)]
@@ -1229,10 +1228,10 @@ async fn enrich_cloud_rank_infos_with_trace_metrics(
 fn cloud_trace_metrics_filter(rank_timestamp: i64) -> WebTraceFilter {
     let end_time = positive_timestamp(Some(normalize_tracker_unix_seconds(rank_timestamp)));
     WebTraceFilter {
-        start_time: end_time.map(|timestamp| timestamp - CLOUD_TRACE_METRICS_LOOKBACK_SECONDS),
+        start_time: None,
         end_time,
         cursor: None,
-        limit: Some(CLOUD_TRACE_METRICS_LIMIT),
+        limit: None,
     }
 }
 
@@ -1384,22 +1383,28 @@ fn apply_cloud_trace_metrics_at(
         return;
     };
     let end_sec = effective_tracker_window_end_unix_seconds(last.timestamp, now);
+    let metrics_start = end_sec - CLOUD_TRACE_METRICS_LOOKBACK_SECONDS;
+    let metrics_start_idx = find_window_baseline_index(&samples, metrics_start).unwrap_or(0);
+    let metric_samples = &samples[metrics_start_idx..];
+    if metric_samples.len() < 2 {
+        return;
+    }
 
     let hour_start = end_sec - 60 * 60;
-    if let Some(hour_base_idx) = find_window_baseline_index(&samples, hour_start) {
-        let hour_base = samples[hour_base_idx];
+    if let Some(hour_base_idx) = find_window_baseline_index(metric_samples, hour_start) {
+        let hour_base = metric_samples[hour_base_idx];
         let hour_base_sec = normalize_tracker_unix_seconds(hour_base.timestamp);
         if end_sec > hour_base_sec {
             let hour_gain = (last.score - hour_base.score).max(0);
             let hour_elapsed = end_sec - hour_base_sec;
             info.speed = Some(hour_gain * 3600 / hour_elapsed);
         }
-        info.hour_round = Some(count_positive_deltas(&samples[hour_base_idx..]));
+        info.hour_round = Some(count_positive_deltas(&metric_samples[hour_base_idx..]));
     }
 
     let window_start = end_sec - 20 * 60;
-    if let Some(window_base_idx) = find_window_baseline_index(&samples, window_start) {
-        let window_base = samples[window_base_idx];
+    if let Some(window_base_idx) = find_window_baseline_index(metric_samples, window_start) {
+        let window_base = metric_samples[window_base_idx];
         let window_gain = (last.score - window_base.score).max(0);
         info.min20_times_3_speed = Some(window_gain * 3);
     }
@@ -1775,6 +1780,68 @@ mod tests {
     }
 
     #[test]
+    fn cloud_trace_metrics_keep_rt_before_recent_metric_window() {
+        let trace = vec![
+            RecordedRankData::Normal(crate::model::api::RecordedRankingSchema {
+                rank: 1,
+                user_id: "12345".to_owned(),
+                score: 1_000_000,
+                timestamp: 1_704_000_000,
+            }),
+            RecordedRankData::Normal(crate::model::api::RecordedRankingSchema {
+                rank: 1,
+                user_id: "12345".to_owned(),
+                score: 1_000_000,
+                timestamp: 1_704_000_360,
+            }),
+            RecordedRankData::Normal(crate::model::api::RecordedRankingSchema {
+                rank: 1,
+                user_id: "12345".to_owned(),
+                score: 1_300_000,
+                timestamp: 1_704_000_420,
+            }),
+            RecordedRankData::Normal(crate::model::api::RecordedRankingSchema {
+                rank: 1,
+                user_id: "12345".to_owned(),
+                score: 2_000_000,
+                timestamp: 1_704_063_600,
+            }),
+            RecordedRankData::Normal(crate::model::api::RecordedRankingSchema {
+                rank: 1,
+                user_id: "12345".to_owned(),
+                score: 2_300_000,
+                timestamp: 1_704_067_200,
+            }),
+        ];
+        let mut info = CloudRankInfoSchema {
+            rank: 1,
+            user_id: Some("12345".to_owned()),
+            name: "User".to_owned(),
+            score: 2_300_000,
+            timestamp: 1_704_067_200,
+            average_round: None,
+            average_pt: None,
+            latest_pt: None,
+            speed: None,
+            min20_times_3_speed: None,
+            hour_round: None,
+            record_start_at: None,
+            speed_window: None,
+            character_id: None,
+        };
+
+        apply_cloud_trace_metrics_at(
+            &mut info,
+            &trace,
+            Utc.timestamp_opt(1_704_067_200, 0).single().unwrap(),
+        );
+
+        assert_eq!(info.record_start_at, Some(1_704_000_420_000));
+        assert_eq!(info.speed, Some(300_000));
+        assert_eq!(info.hour_round, Some(1));
+    }
+
+    #[test]
     fn cloud_check_room_response_serializes_batch_ranks() {
         let rank = CloudRankInfoSchema {
             rank: 1,
@@ -1809,9 +1876,9 @@ mod tests {
     fn cloud_trace_metrics_filter_looks_back_from_current_rank_time() {
         let filter = cloud_trace_metrics_filter(1_704_067_200);
         assert_eq!(filter.end_time, Some(1_704_067_200));
-        assert_eq!(filter.start_time, Some(1_704_024_000));
+        assert_eq!(filter.start_time, None);
         assert_eq!(filter.cursor, None);
-        assert_eq!(filter.limit, Some(CLOUD_TRACE_METRICS_LIMIT));
+        assert_eq!(filter.limit, None);
     }
 
     #[test]
