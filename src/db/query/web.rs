@@ -45,7 +45,7 @@ pub struct WebTraceFilter {
     pub start_time: Option<i64>,
     pub end_time: Option<i64>,
     pub cursor: Option<i64>,
-    pub limit: u64,
+    pub limit: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -976,8 +976,10 @@ pub async fn search_user_trace(
         Expr::col((time_tbl.clone(), time_id::Column::Timestamp)),
         filter,
     );
-    stmt.order_by((time_tbl, time_id::Column::Timestamp), Order::Asc)
-        .limit(filter.limit);
+    stmt.order_by((time_tbl, time_id::Column::Timestamp), Order::Asc);
+    if let Some(limit) = filter.limit {
+        stmt.limit(limit);
+    }
 
     let backend = engine.backend();
     Ok(RankingPageRow::find_by_statement(backend.build(&stmt))
@@ -1009,8 +1011,10 @@ pub async fn search_world_bloom_user_trace(
         Expr::col((time_tbl.clone(), time_id::Column::Timestamp)),
         filter,
     );
-    stmt.order_by((time_tbl, time_id::Column::Timestamp), Order::Asc)
-        .limit(filter.limit);
+    stmt.order_by((time_tbl, time_id::Column::Timestamp), Order::Asc);
+    if let Some(limit) = filter.limit {
+        stmt.limit(limit);
+    }
 
     let backend = engine.backend();
     Ok(
@@ -1041,8 +1045,10 @@ pub async fn search_rank_trace(
         Expr::col((time_tbl.clone(), time_id::Column::Timestamp)),
         filter,
     );
-    stmt.order_by((time_tbl, time_id::Column::Timestamp), Order::Asc)
-        .limit(filter.limit);
+    stmt.order_by((time_tbl, time_id::Column::Timestamp), Order::Asc);
+    if let Some(limit) = filter.limit {
+        stmt.limit(limit);
+    }
 
     let backend = engine.backend();
     Ok(RankingPageRow::find_by_statement(backend.build(&stmt))
@@ -1073,8 +1079,10 @@ pub async fn search_world_bloom_rank_trace(
         Expr::col((time_tbl.clone(), time_id::Column::Timestamp)),
         filter,
     );
-    stmt.order_by((time_tbl, time_id::Column::Timestamp), Order::Asc)
-        .limit(filter.limit);
+    stmt.order_by((time_tbl, time_id::Column::Timestamp), Order::Asc);
+    if let Some(limit) = filter.limit {
+        stmt.limit(limit);
+    }
 
     let backend = engine.backend();
     Ok(
@@ -1479,7 +1487,7 @@ mod tests {
             start_time: None,
             end_time: None,
             cursor: None,
-            limit: 10,
+            limit: Some(10),
         };
         let trace = search_rank_trace(&engine, event_id, 2, &filter, PublicUserIdMode::Unique)
             .await
@@ -1516,7 +1524,7 @@ mod tests {
             start_time: None,
             end_time: None,
             cursor: None,
-            limit: 10,
+            limit: Some(10),
         };
         let trace = search_world_bloom_rank_trace(
             &engine,

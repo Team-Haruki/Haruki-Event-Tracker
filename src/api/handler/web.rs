@@ -487,7 +487,11 @@ impl UserTraceQuery {
             start_time: self.start_time,
             end_time: self.end_time,
             cursor: self.cursor,
-            limit: clamp_limit(self.limit, DEFAULT_TRACE_LIMIT, MAX_TRACE_LIMIT),
+            limit: Some(clamp_limit(
+                self.limit,
+                DEFAULT_TRACE_LIMIT,
+                MAX_TRACE_LIMIT,
+            )),
         })
     }
 }
@@ -548,7 +552,7 @@ impl WebRankingFilter {
 impl WebTraceFilter {
     fn cache_key(&self) -> String {
         format!(
-            "start={:?}:end={:?}:cursor={:?}:limit={}",
+            "start={:?}:end={:?}:cursor={:?}:limit={:?}",
             self.start_time, self.end_time, self.cursor, self.limit
         )
     }

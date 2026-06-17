@@ -37,7 +37,8 @@ const DEFAULT_INTERVAL_SECONDS: i64 = 3600;
 const MAX_TRACE_LIMIT: u64 = 10_000;
 const CLOUD_TRACE_METRICS_LIMIT: u64 = 5_000;
 const CLOUD_TRACE_METRICS_LOOKBACK_SECONDS: i64 = 12 * 60 * 60;
-const CLOUD_ROUND_METRICS_CACHE_PREFIX: &str = "cloud:v2:roundMetrics=v4-recent12h-sampleStart";
+const CLOUD_RECOVERY_IDLE_SECONDS: i64 = 5 * 60;
+const CLOUD_ROUND_METRICS_CACHE_PREFIX: &str = "cloud:v2:roundMetrics=v6-recent12h-recoveryRt";
 const TRACKER_REALTIME_TAIL_MAX_LAG_SECONDS: i64 = 30 * 24 * 60 * 60;
 
 #[derive(Debug, Deserialize)]
@@ -892,18 +893,15 @@ async fn build_subject_trace_response(
         start_time: query.start_time,
         end_time: query.end_time,
         cursor: query.cursor,
-        limit: query
-            .limit
-            .unwrap_or(MAX_TRACE_LIMIT)
-            .clamp(1, MAX_TRACE_LIMIT),
+        limit: query.limit.map(|limit| limit.clamp(1, MAX_TRACE_LIMIT)),
     };
     let suffix = match character_id {
         Some(character_id) => format!(
-            "{cache_prefix}:wb:{character_id}:subject:{subject_type}:{subject}:current={include_current}:start={:?}:end={:?}:cursor={:?}:limit={}",
+            "{cache_prefix}:wb:{character_id}:subject:{subject_type}:{subject}:current={include_current}:start={:?}:end={:?}:cursor={:?}:limit={:?}",
             filter.start_time, filter.end_time, filter.cursor, filter.limit
         ),
         None => format!(
-            "{cache_prefix}:total:subject:{subject_type}:{subject}:current={include_current}:start={:?}:end={:?}:cursor={:?}:limit={}",
+            "{cache_prefix}:total:subject:{subject_type}:{subject}:current={include_current}:start={:?}:end={:?}:cursor={:?}:limit={:?}",
             filter.start_time, filter.end_time, filter.cursor, filter.limit
         ),
     };
@@ -1234,7 +1232,7 @@ fn cloud_trace_metrics_filter(rank_timestamp: i64) -> WebTraceFilter {
         start_time: end_time.map(|timestamp| timestamp - CLOUD_TRACE_METRICS_LOOKBACK_SECONDS),
         end_time,
         cursor: None,
-        limit: CLOUD_TRACE_METRICS_LIMIT,
+        limit: Some(CLOUD_TRACE_METRICS_LIMIT),
     }
 }
 
@@ -1356,7 +1354,9 @@ fn apply_cloud_trace_metrics_at(
     if samples.len() < 2 {
         return;
     }
-    info.record_start_at = Some(format_tracker_timestamp(samples[0].timestamp));
+    if let Some(record_start_at) = recovery_record_start_at(&samples) {
+        info.record_start_at = Some(format_tracker_timestamp(record_start_at));
+    }
 
     let deltas = samples
         .windows(2)
@@ -1467,6 +1467,34 @@ fn count_positive_deltas(samples: &[CloudTraceSample]) -> i64 {
         .windows(2)
         .filter(|window| window[1].score - window[0].score > 0)
         .count() as i64
+}
+
+fn recovery_record_start_at(samples: &[CloudTraceSample]) -> Option<i64> {
+    if samples.is_empty() {
+        return None;
+    }
+    let mut latest_recovery = samples[0].timestamp;
+    let mut flat_start = samples[0];
+    let mut in_flat = false;
+    for window in samples.windows(2) {
+        let previous = window[0];
+        let current = window[1];
+        if current.score == previous.score {
+            in_flat = true;
+        } else if current.score > previous.score {
+            let idle_seconds = normalize_tracker_unix_seconds(current.timestamp)
+                - normalize_tracker_unix_seconds(flat_start.timestamp);
+            if in_flat && idle_seconds >= CLOUD_RECOVERY_IDLE_SECONDS {
+                latest_recovery = current.timestamp;
+            }
+            flat_start = current;
+            in_flat = false;
+        } else if current.score < previous.score {
+            flat_start = current;
+            in_flat = false;
+        }
+    }
+    Some(latest_recovery)
 }
 
 fn rank_of_item(item: &WebRankingItemSchema) -> Option<i64> {
@@ -1649,7 +1677,7 @@ mod tests {
     }
 
     #[test]
-    fn cloud_trace_metrics_use_recent_sample_start_time() {
+    fn cloud_trace_metrics_use_recovery_start_time() {
         let trace = vec![
             RecordedRankData::Normal(crate::model::api::RecordedRankingSchema {
                 rank: 100,
@@ -1693,6 +1721,60 @@ mod tests {
     }
 
     #[test]
+    fn cloud_trace_metrics_keep_rt_after_recent_recovery() {
+        let trace = vec![
+            RecordedRankData::Normal(crate::model::api::RecordedRankingSchema {
+                rank: 1,
+                user_id: "12345".to_owned(),
+                score: 1_000_000,
+                timestamp: 1_704_060_000,
+            }),
+            RecordedRankData::Normal(crate::model::api::RecordedRankingSchema {
+                rank: 1,
+                user_id: "12345".to_owned(),
+                score: 1_000_000,
+                timestamp: 1_704_060_360,
+            }),
+            RecordedRankData::Normal(crate::model::api::RecordedRankingSchema {
+                rank: 1,
+                user_id: "12345".to_owned(),
+                score: 1_300_000,
+                timestamp: 1_704_060_420,
+            }),
+            RecordedRankData::Normal(crate::model::api::RecordedRankingSchema {
+                rank: 1,
+                user_id: "12345".to_owned(),
+                score: 1_600_000,
+                timestamp: 1_704_067_200,
+            }),
+        ];
+        let mut info = CloudRankInfoSchema {
+            rank: 1,
+            user_id: Some("12345".to_owned()),
+            name: "User".to_owned(),
+            score: 1_600_000,
+            timestamp: 1_704_067_200,
+            average_round: None,
+            average_pt: None,
+            latest_pt: None,
+            speed: None,
+            min20_times_3_speed: None,
+            hour_round: None,
+            record_start_at: None,
+            speed_window: None,
+            character_id: None,
+        };
+
+        apply_cloud_trace_metrics_at(
+            &mut info,
+            &trace,
+            Utc.timestamp_opt(1_704_067_200, 0).single().unwrap(),
+        );
+
+        assert_eq!(info.record_start_at, Some(1_704_060_420_000));
+    }
+
+    #[test]
     fn cloud_check_room_response_serializes_batch_ranks() {
         let rank = CloudRankInfoSchema {
             rank: 1,
@@ -1729,7 +1811,7 @@ mod tests {
         assert_eq!(filter.end_time, Some(1_704_067_200));
         assert_eq!(filter.start_time, Some(1_704_024_000));
         assert_eq!(filter.cursor, None);
-        assert_eq!(filter.limit, CLOUD_TRACE_METRICS_LIMIT);
+        assert_eq!(filter.limit, Some(CLOUD_TRACE_METRICS_LIMIT));
     }
 
     #[test]
