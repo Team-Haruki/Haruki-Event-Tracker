@@ -327,7 +327,7 @@ impl EventTrackerBase {
         }
 
         if !wl_rows.is_empty() {
-            if let Err(err) = batch_insert_world_bloom_rankings(
+            match batch_insert_world_bloom_rankings(
                 &self.db,
                 self.server,
                 self.event_id,
@@ -337,23 +337,35 @@ impl EventTrackerBase {
             )
             .await
             {
-                if batch_called
-                    && let Some(conn) = self.api_cache_redis.as_mut()
-                    && let Err(redis_err) =
-                        finish_event_update(conn, self.server, self.event_id).await
-                {
-                    tracing::warn!(%redis_err, "failed to bump API cache epoch after partial write");
+                Ok(inserted) => {
+                    if inserted > 0 {
+                        batch_called = true;
+                    } else if !batch_called
+                        && let Some(conn) = self.api_cache_redis.as_mut()
+                        && let Err(redis_err) =
+                            abort_event_update(conn, self.server, self.event_id).await
+                    {
+                        tracing::warn!(%redis_err, "failed to clear API cache dirty after no-op world bloom insert");
+                    }
                 }
-                if !batch_called
-                    && let Some(conn) = self.api_cache_redis.as_mut()
-                    && let Err(redis_err) =
-                        abort_event_update(conn, self.server, self.event_id).await
-                {
-                    tracing::warn!(%redis_err, "failed to clear API cache dirty after insert error");
+                Err(err) => {
+                    if batch_called
+                        && let Some(conn) = self.api_cache_redis.as_mut()
+                        && let Err(redis_err) =
+                            finish_event_update(conn, self.server, self.event_id).await
+                    {
+                        tracing::warn!(%redis_err, "failed to bump API cache epoch after partial write");
+                    }
+                    if !batch_called
+                        && let Some(conn) = self.api_cache_redis.as_mut()
+                        && let Err(redis_err) =
+                            abort_event_update(conn, self.server, self.event_id).await
+                    {
+                        tracing::warn!(%redis_err, "failed to clear API cache dirty after insert error");
+                    }
+                    return Err(err.into());
                 }
-                return Err(err.into());
             }
-            batch_called = true;
         }
 
         if !batch_called {

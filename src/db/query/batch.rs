@@ -510,9 +510,9 @@ pub async fn batch_insert_world_bloom_rankings(
     anonymizer: &UidAnonymizer,
     records: &[PlayerWorldBloomRankingRecordSchema],
     prev_state: &mut HashMap<WorldBloomKey, PlayerState>,
-) -> Result<(), DbErr> {
+) -> Result<usize, DbErr> {
     if records.is_empty() {
-        return Ok(());
+        return Ok(0);
     }
     let backend = engine.backend();
     let time_tbl = intern(TableKind::TimeId, event_id);
@@ -537,9 +537,9 @@ pub async fn batch_insert_world_bloom_rankings(
         .collect();
     let owned_state = std::mem::take(prev_state);
 
-    let updated_state = engine
+    let (updated_state, changed_len) = engine
         .conn()
-        .transaction::<_, HashMap<WorldBloomKey, PlayerState>, DbErr>(move |tx| {
+        .transaction::<_, (HashMap<WorldBloomKey, PlayerState>, usize), DbErr>(move |tx| {
             Box::pin(async move {
                 let mut state = owned_state;
                 let time_lookup =
@@ -573,8 +573,9 @@ pub async fn batch_insert_world_bloom_rankings(
                 }
 
                 if changed.is_empty() {
-                    return Ok(state);
+                    return Ok((state, 0));
                 }
+                let changed_len = changed.len();
 
                 let mut ins = Query::insert();
                 ins.into_table(Alias::new(wl_tbl)).columns([
@@ -607,14 +608,14 @@ pub async fn batch_insert_world_bloom_rankings(
                     .to_owned(),
                 );
                 tx.execute(&ins).await?;
-                Ok(state)
+                Ok((state, changed_len))
             })
         })
         .await
         .map_err(unwrap_tx_err)?;
 
     *prev_state = updated_state;
-    Ok(())
+    Ok(changed_len)
 }
 
 fn unwrap_tx_err(e: TransactionError<DbErr>) -> DbErr {
@@ -712,5 +713,82 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(count.n, 0);
+    }
+
+    #[tokio::test]
+    async fn world_bloom_insert_reports_noop_when_state_unchanged() {
+        let conn = Database::connect("sqlite::memory:").await.unwrap();
+        let engine = DatabaseEngine::from_connection(conn, DatabaseBackend::Sqlite);
+        let event_id = 6161;
+        create_event_tables(&engine, SekaiServerRegion::Cn, event_id, true)
+            .await
+            .unwrap();
+
+        let mut prev_state = HashMap::new();
+        let mut record = PlayerWorldBloomRankingRecordSchema {
+            base: PlayerEventRankingRecordSchema {
+                timestamp: 1_710_000_000,
+                user_id: "100".into(),
+                name: "Miku".into(),
+                score: 123,
+                rank: 1,
+                cheerful_team_id: None,
+                profile: PlayerProfileSchema::default(),
+            },
+            character_id: 19,
+        };
+
+        let inserted = batch_insert_world_bloom_rankings(
+            &engine,
+            SekaiServerRegion::Cn,
+            event_id,
+            &UidAnonymizer::disabled(),
+            &[record.clone()],
+            &mut prev_state,
+        )
+        .await
+        .unwrap();
+        assert_eq!(inserted, 1);
+
+        record.base.timestamp += 10;
+        let inserted = batch_insert_world_bloom_rankings(
+            &engine,
+            SekaiServerRegion::Cn,
+            event_id,
+            &UidAnonymizer::disabled(),
+            &[record.clone()],
+            &mut prev_state,
+        )
+        .await
+        .unwrap();
+        assert_eq!(inserted, 0);
+
+        record.base.timestamp += 10;
+        record.base.score += 1;
+        let inserted = batch_insert_world_bloom_rankings(
+            &engine,
+            SekaiServerRegion::Cn,
+            event_id,
+            &UidAnonymizer::disabled(),
+            &[record],
+            &mut prev_state,
+        )
+        .await
+        .unwrap();
+        assert_eq!(inserted, 1);
+
+        let stmt = Query::select()
+            .expr_as(
+                Func::count(Expr::col(world_bloom::Column::TimeId)),
+                Alias::new("n"),
+            )
+            .from(Alias::new(intern(TableKind::WorldBloom, event_id)))
+            .to_owned();
+        let count = CountRow::find_by_statement(engine.backend().build(&stmt))
+            .one(engine.conn())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(count.n, 2);
     }
 }
