@@ -36,6 +36,7 @@ use crate::model::api::{
 const DEFAULT_INTERVAL_SECONDS: i64 = 3600;
 const MAX_TRACE_LIMIT: u64 = 10_000;
 const CLOUD_TRACE_METRICS_LIMIT: u64 = 5_000;
+const CLOUD_TRACE_METRICS_LOOKBACK_SECONDS: i64 = 12 * 60 * 60;
 const TRACKER_REALTIME_TAIL_MAX_LAG_SECONDS: i64 = 30 * 24 * 60 * 60;
 
 #[derive(Debug, Deserialize)]
@@ -1196,12 +1197,7 @@ async fn enrich_cloud_rank_infos_with_trace_metrics(
         let Ok(_permit) = state.query_limiter().acquire_trace(region).await else {
             continue;
         };
-        let filter = WebTraceFilter {
-            start_time: None,
-            end_time: None,
-            cursor: None,
-            limit: CLOUD_TRACE_METRICS_LIMIT,
-        };
+        let filter = cloud_trace_metrics_filter(rank.timestamp);
         let trace = match character_id {
             Some(character_id) => {
                 search_world_bloom_user_trace(
@@ -1220,6 +1216,16 @@ async fn enrich_cloud_rank_infos_with_trace_metrics(
             continue;
         };
         apply_cloud_trace_metrics_at(rank, &trace, Utc::now());
+    }
+}
+
+fn cloud_trace_metrics_filter(rank_timestamp: i64) -> WebTraceFilter {
+    let end_time = positive_timestamp(Some(normalize_tracker_unix_seconds(rank_timestamp)));
+    WebTraceFilter {
+        start_time: end_time.map(|timestamp| timestamp - CLOUD_TRACE_METRICS_LOOKBACK_SECONDS),
+        end_time,
+        cursor: None,
+        limit: CLOUD_TRACE_METRICS_LIMIT,
     }
 }
 
@@ -1625,6 +1631,15 @@ mod tests {
         assert_eq!(info.speed, Some(300_000));
         assert_eq!(info.hour_round, Some(1));
         assert_eq!(info.min20_times_3_speed, Some(900_000));
+    }
+
+    #[test]
+    fn cloud_trace_metrics_filter_looks_back_from_current_rank_time() {
+        let filter = cloud_trace_metrics_filter(1_704_067_200);
+        assert_eq!(filter.end_time, Some(1_704_067_200));
+        assert_eq!(filter.start_time, Some(1_704_024_000));
+        assert_eq!(filter.cursor, None);
+        assert_eq!(filter.limit, CLOUD_TRACE_METRICS_LIMIT);
     }
 
     #[test]
