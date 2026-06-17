@@ -266,7 +266,19 @@ pub struct CloudRankInfoSchema {
     pub score: i64,
     pub timestamp: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub average_round: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub average_pt: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latest_pt: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub speed: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub min20_times_3_speed: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hour_round: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub record_start_at: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub speed_window: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]

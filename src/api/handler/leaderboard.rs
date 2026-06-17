@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use axum::extract::{Path, Query, State};
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use serde::Deserialize;
 
 use crate::api::cache::CacheTtl;
@@ -19,8 +19,8 @@ use crate::db::query::growth::{
 use crate::db::query::ranking::{fetch_all_rankings, fetch_latest_ranking_by_rank};
 use crate::db::query::user::{PublicUserIdMode, get_user_data};
 use crate::db::query::web::{
-    WebRankingFilter, WebTraceFilter, search_ranking_rows, search_user_trace,
-    search_world_bloom_ranking_rows, search_world_bloom_user_trace,
+    WebRankingFilter, WebTraceFilter, search_rank_trace, search_ranking_rows, search_user_trace,
+    search_world_bloom_rank_trace, search_world_bloom_ranking_rows, search_world_bloom_user_trace,
 };
 use crate::db::query::world_bloom::fetch_latest_world_bloom_ranking_by_rank;
 use crate::model::api::{
@@ -34,6 +34,8 @@ use crate::model::api::{
 
 const DEFAULT_INTERVAL_SECONDS: i64 = 3600;
 const MAX_TRACE_LIMIT: u64 = 10_000;
+const CLOUD_TRACE_METRICS_LIMIT: u64 = 5_000;
+const TRACKER_REALTIME_TAIL_MAX_LAG_SECONDS: i64 = 30 * 24 * 60 * 60;
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -93,7 +95,7 @@ pub async fn cloud_total_query(
     Query(query): Query<CloudQuery>,
     axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
 ) -> Result<Json<CloudRankQueryResponseSchema>, ApiError> {
-    cloud_query_for_scope(state, server, event_id, None, query, raw_query).await
+    cloud_query_for_scope(state, server, event_id, None, query, raw_query, true).await
 }
 
 #[tracing::instrument(skip(state, query, raw_query), fields(server, event_id, character_id))]
@@ -110,6 +112,7 @@ pub async fn cloud_world_bloom_query(
         Some(character_id),
         query,
         raw_query,
+        true,
     )
     .await
 }
@@ -352,6 +355,7 @@ async fn cloud_query_for_scope(
     character_id: Option<i64>,
     query: CloudQuery,
     raw_query: Option<String>,
+    include_round_metrics: bool,
 ) -> Result<Json<CloudRankQueryResponseSchema>, ApiError> {
     let ranks = parse_rank_query(raw_query.as_deref()).unwrap_or_default();
     let include_adjacent = query.include_adjacent.unwrap_or(true);
@@ -412,7 +416,17 @@ async fn cloud_query_for_scope(
         return Err(ApiError::BadRequest("rank or userId is required".into()));
     };
     let skip_missing = query.skip_missing.unwrap_or(false);
-    let ranks = cloud_infos_from_snapshots(&snapshots, skip_missing)?;
+    let mut ranks = cloud_infos_from_snapshots(&snapshots, skip_missing)?;
+    if include_round_metrics {
+        enrich_cloud_rank_infos_with_trace_metrics(
+            &state,
+            &server,
+            event_id,
+            character_id,
+            &mut ranks,
+        )
+        .await;
+    }
     let first = snapshots.items.first();
     Ok(Json(CloudRankQueryResponseSchema {
         meta: snapshots.meta,
@@ -434,8 +448,16 @@ async fn cloud_check_room_for_scope(
     query: CloudQuery,
     raw_query: Option<String>,
 ) -> Result<Json<CloudCheckRoomResponseSchema>, ApiError> {
-    let response =
-        cloud_query_for_scope(state, server, event_id, character_id, query, raw_query).await?;
+    let response = cloud_query_for_scope(
+        state,
+        server,
+        event_id,
+        character_id,
+        query,
+        raw_query,
+        true,
+    )
+    .await?;
     let response = response.0;
     let rank = response
         .ranks
@@ -459,8 +481,16 @@ async fn cloud_line_for_scope(
     raw_query: Option<String>,
 ) -> Result<Json<CloudLineResponseSchema>, ApiError> {
     query.include_adjacent = Some(false);
-    let response =
-        cloud_query_for_scope(state, server, event_id, character_id, query, raw_query).await?;
+    let response = cloud_query_for_scope(
+        state,
+        server,
+        event_id,
+        character_id,
+        query,
+        raw_query,
+        false,
+    )
+    .await?;
     let response = response.0;
     Ok(Json(CloudLineResponseSchema {
         meta: response.meta,
@@ -870,7 +900,7 @@ async fn build_subject_trace_response(
     let fetch = async {
         let (region, engine) = resolve_region_engine(&state, &server)?;
         let mode = prepare_user_id_mode(&state, &engine, region, event_id).await?;
-        let (user_id, resolved_rank, current) = resolve_subject(
+        let (user_id, resolved_rank, current, subject_kind) = resolve_subject(
             &engine,
             event_id,
             character_id,
@@ -883,18 +913,44 @@ async fn build_subject_trace_response(
         let limiter = state.query_limiter().clone();
         let _permit = limiter.acquire_trace(region).await?;
         let rank_data = match character_id {
-            Some(character_id) => {
-                search_world_bloom_user_trace(
-                    &engine,
-                    event_id,
-                    character_id,
-                    &user_id,
-                    &filter,
-                    mode,
-                )
-                .await?
-            }
-            None => search_user_trace(&engine, event_id, &user_id, &filter, mode).await?,
+            Some(character_id) => match subject_kind {
+                SubjectKind::Rank => {
+                    let rank = resolved_rank.ok_or_else(|| {
+                        ApiError::ServiceUnavailable("rank subject has no resolved rank".into())
+                    })?;
+                    search_world_bloom_rank_trace(
+                        &engine,
+                        event_id,
+                        character_id,
+                        rank,
+                        &filter,
+                        mode,
+                    )
+                    .await?
+                }
+                SubjectKind::User => {
+                    search_world_bloom_user_trace(
+                        &engine,
+                        event_id,
+                        character_id,
+                        &user_id,
+                        &filter,
+                        mode,
+                    )
+                    .await?
+                }
+            },
+            None => match subject_kind {
+                SubjectKind::Rank => {
+                    let rank = resolved_rank.ok_or_else(|| {
+                        ApiError::ServiceUnavailable("rank subject has no resolved rank".into())
+                    })?;
+                    search_rank_trace(&engine, event_id, rank, &filter, mode).await?
+                }
+                SubjectKind::User => {
+                    search_user_trace(&engine, event_id, &user_id, &filter, mode).await?
+                }
+            },
         };
         if rank_data.is_empty() {
             return Err(ApiError::NotFound);
@@ -1003,6 +1059,12 @@ async fn fetch_snapshot_metrics(
         .collect())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SubjectKind {
+    User,
+    Rank,
+}
+
 async fn resolve_subject(
     engine: &DatabaseEngine,
     event_id: i64,
@@ -1011,7 +1073,15 @@ async fn resolve_subject(
     subject_type: &str,
     mode: PublicUserIdMode,
     include_current: bool,
-) -> Result<(String, Option<i64>, Option<WebRankingItemSchema>), ApiError> {
+) -> Result<
+    (
+        String,
+        Option<i64>,
+        Option<WebRankingItemSchema>,
+        SubjectKind,
+    ),
+    ApiError,
+> {
     if subject_type.eq_ignore_ascii_case("rank") {
         let rank = subject
             .parse::<i64>()
@@ -1039,7 +1109,7 @@ async fn resolve_subject(
             rank_data,
             user_data: None,
         });
-        return Ok((user_id, Some(rank), current_item));
+        return Ok((user_id, Some(rank), current_item, SubjectKind::Rank));
     }
     if !subject_type.eq_ignore_ascii_case("user") {
         return Err(ApiError::BadRequest(
@@ -1069,7 +1139,12 @@ async fn resolve_subject(
         None
     };
     let resolved_rank = current.as_ref().and_then(rank_of_item);
-    Ok((subject.to_owned(), resolved_rank, current))
+    Ok((
+        subject.to_owned(),
+        resolved_rank,
+        current,
+        SubjectKind::User,
+    ))
 }
 
 async fn fetch_latest_user_rank(
@@ -1090,6 +1165,69 @@ fn user_id_of_rank_data(rank_data: &RecordedRankData) -> Option<String> {
         RecordedRankData::Normal(data) => Some(data.user_id.clone()),
         RecordedRankData::WorldBloom(data) => Some(data.user_id.clone()),
     }
+}
+
+async fn enrich_cloud_rank_infos_with_trace_metrics(
+    state: &AppState,
+    server: &str,
+    event_id: i64,
+    character_id: Option<i64>,
+    ranks: &mut [CloudRankInfoSchema],
+) {
+    let Ok((region, engine)) = resolve_region_engine(state, server) else {
+        return;
+    };
+    let Ok(mode) = prepare_user_id_mode(state, &engine, region, event_id).await else {
+        return;
+    };
+    for rank in ranks {
+        if has_cloud_round_metrics(rank) {
+            continue;
+        }
+        let Some(user_id) = rank
+            .user_id
+            .as_deref()
+            .filter(|user_id| !user_id.is_empty())
+        else {
+            continue;
+        };
+        let user_id = user_id.to_owned();
+        let Ok(_permit) = state.query_limiter().acquire_trace(region).await else {
+            continue;
+        };
+        let filter = WebTraceFilter {
+            start_time: None,
+            end_time: None,
+            cursor: None,
+            limit: CLOUD_TRACE_METRICS_LIMIT,
+        };
+        let trace = match character_id {
+            Some(character_id) => {
+                search_world_bloom_user_trace(
+                    &engine,
+                    event_id,
+                    character_id,
+                    user_id.as_str(),
+                    &filter,
+                    mode,
+                )
+                .await
+            }
+            None => search_user_trace(&engine, event_id, user_id.as_str(), &filter, mode).await,
+        };
+        let Ok(trace) = trace else {
+            continue;
+        };
+        apply_cloud_trace_metrics_at(rank, &trace, Utc::now());
+    }
+}
+
+fn has_cloud_round_metrics(info: &CloudRankInfoSchema) -> bool {
+    info.average_round.is_some()
+        || info.average_pt.is_some()
+        || info.hour_round.is_some()
+        || info.min20_times_3_speed.is_some()
+        || info.record_start_at.is_some()
 }
 
 fn cloud_infos_from_snapshots(
@@ -1160,10 +1298,157 @@ fn cloud_info_from_rank_data(
         name: name.unwrap_or_default().to_owned(),
         score,
         timestamp,
+        average_round: None,
+        average_pt: None,
+        latest_pt: metrics.and_then(|metrics| {
+            metrics
+                .score_earlier
+                .map(|earlier| metrics.score_latest - earlier)
+        }),
         speed: metrics.and_then(|metrics| metrics.growth),
+        min20_times_3_speed: None,
+        hour_round: None,
+        record_start_at: None,
         speed_window: metrics.and_then(|metrics| metrics.time_diff),
         character_id,
     })
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CloudTraceSample {
+    score: i64,
+    timestamp: i64,
+}
+
+fn apply_cloud_trace_metrics_at(
+    info: &mut CloudRankInfoSchema,
+    trace: &[RecordedRankData],
+    now: DateTime<Utc>,
+) {
+    let mut samples = trace
+        .iter()
+        .filter_map(cloud_trace_sample)
+        .filter(|sample| sample.timestamp > 0)
+        .collect::<Vec<_>>();
+    if samples.is_empty() {
+        return;
+    }
+    samples.sort_by_key(|sample| normalize_tracker_unix_seconds(sample.timestamp));
+
+    info.record_start_at = Some(format_tracker_timestamp(samples[0].timestamp));
+    if samples.len() < 2 {
+        return;
+    }
+
+    let deltas = samples
+        .windows(2)
+        .filter_map(|window| {
+            let diff = window[1].score - window[0].score;
+            (diff > 0).then_some(diff)
+        })
+        .collect::<Vec<_>>();
+    if let Some(latest) = deltas.last().copied() {
+        info.latest_pt = Some(latest);
+        let avg_window = if deltas.len() > 10 {
+            &deltas[deltas.len() - 10..]
+        } else {
+            &deltas[..]
+        };
+        let round_count = avg_window.len() as i64;
+        if round_count > 0 {
+            let sum = avg_window.iter().sum::<i64>();
+            info.average_round = Some(round_count);
+            info.average_pt = Some(sum / round_count);
+        }
+    }
+
+    let Some(last) = samples.last().copied() else {
+        return;
+    };
+    let end_sec = effective_tracker_window_end_unix_seconds(last.timestamp, now);
+
+    let hour_start = end_sec - 60 * 60;
+    if let Some(hour_base_idx) = find_window_baseline_index(&samples, hour_start) {
+        let hour_base = samples[hour_base_idx];
+        let hour_base_sec = normalize_tracker_unix_seconds(hour_base.timestamp);
+        if end_sec > hour_base_sec {
+            let hour_gain = (last.score - hour_base.score).max(0);
+            let hour_elapsed = end_sec - hour_base_sec;
+            info.speed = Some(hour_gain * 3600 / hour_elapsed);
+        }
+        info.hour_round = Some(count_positive_deltas(&samples[hour_base_idx..]));
+    }
+
+    let window_start = end_sec - 20 * 60;
+    if let Some(window_base_idx) = find_window_baseline_index(&samples, window_start) {
+        let window_base = samples[window_base_idx];
+        let window_gain = (last.score - window_base.score).max(0);
+        info.min20_times_3_speed = Some(window_gain * 3);
+    }
+}
+
+fn cloud_trace_sample(rank_data: &RecordedRankData) -> Option<CloudTraceSample> {
+    match rank_data {
+        RecordedRankData::Normal(data) => Some(CloudTraceSample {
+            score: data.score,
+            timestamp: data.timestamp,
+        }),
+        RecordedRankData::WorldBloom(data) => Some(CloudTraceSample {
+            score: data.score,
+            timestamp: data.timestamp,
+        }),
+    }
+}
+
+fn normalize_tracker_unix_seconds(timestamp: i64) -> i64 {
+    if timestamp > 1_000_000_000_000 {
+        timestamp / 1000
+    } else {
+        timestamp
+    }
+}
+
+fn format_tracker_timestamp(timestamp: i64) -> i64 {
+    if timestamp > 1_000_000_000_000 {
+        timestamp
+    } else {
+        timestamp * 1000
+    }
+}
+
+fn effective_tracker_window_end_unix_seconds(last_timestamp: i64, now: DateTime<Utc>) -> i64 {
+    let last_sec = normalize_tracker_unix_seconds(last_timestamp);
+    if last_sec <= 0 {
+        return last_sec;
+    }
+    let now_sec = now.timestamp();
+    if now_sec <= last_sec || now_sec - last_sec > TRACKER_REALTIME_TAIL_MAX_LAG_SECONDS {
+        return last_sec;
+    }
+    now_sec
+}
+
+fn find_window_baseline_index(samples: &[CloudTraceSample], window_start: i64) -> Option<usize> {
+    if samples.is_empty() {
+        return None;
+    }
+    let mut baseline = None;
+    for (idx, sample) in samples.iter().enumerate() {
+        let sec = normalize_tracker_unix_seconds(sample.timestamp);
+        if sec <= window_start {
+            baseline = Some(idx);
+            continue;
+        }
+        break;
+    }
+    Some(baseline.unwrap_or(0))
+}
+
+fn count_positive_deltas(samples: &[CloudTraceSample]) -> i64 {
+    samples
+        .windows(2)
+        .filter(|window| window[1].score - window[0].score > 0)
+        .count() as i64
 }
 
 fn rank_of_item(item: &WebRankingItemSchema) -> Option<i64> {
@@ -1238,6 +1523,8 @@ fn join_ranks(ranks: &[i64]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::TimeZone;
+    use sonic_rs::JsonValueTrait;
 
     #[test]
     fn interval_defaults_and_clamps() {
@@ -1255,5 +1542,104 @@ mod tests {
     #[test]
     fn join_ranks_preserves_request_order() {
         assert_eq!(join_ranks(&[10, 1, 100]), "10,1,100");
+    }
+
+    #[test]
+    fn cloud_rank_info_serializes_round_metric_fields() {
+        let info = CloudRankInfoSchema {
+            rank: 100,
+            user_id: Some("12345".to_owned()),
+            name: "User".to_owned(),
+            score: 1_500_000,
+            timestamp: 1_704_067_200,
+            average_round: Some(2),
+            average_pt: Some(250_000),
+            latest_pt: Some(300_000),
+            speed: Some(600_000),
+            min20_times_3_speed: Some(900_000),
+            hour_round: Some(2),
+            record_start_at: Some(1_704_060_000_000),
+            speed_window: Some(3_600),
+            character_id: Some(25),
+        };
+
+        let value = sonic_rs::to_value(&info).expect("serialize rank info");
+        assert_eq!(value["averageRound"].as_i64(), Some(2));
+        assert_eq!(value["averagePt"].as_i64(), Some(250_000));
+        assert_eq!(value["latestPt"].as_i64(), Some(300_000));
+        assert_eq!(value["min20Times3Speed"].as_i64(), Some(900_000));
+        assert_eq!(value["hourRound"].as_i64(), Some(2));
+        assert_eq!(value["recordStartAt"].as_i64(), Some(1_704_060_000_000));
+    }
+
+    #[test]
+    fn cloud_trace_metrics_match_cloud_fallback_semantics() {
+        let trace = vec![
+            RecordedRankData::Normal(crate::model::api::RecordedRankingSchema {
+                rank: 100,
+                user_id: "12345".to_owned(),
+                score: 1_000_000,
+                timestamp: 1_704_060_000,
+            }),
+            RecordedRankData::Normal(crate::model::api::RecordedRankingSchema {
+                rank: 100,
+                user_id: "12345".to_owned(),
+                score: 1_250_000,
+                timestamp: 1_704_063_600,
+            }),
+            RecordedRankData::Normal(crate::model::api::RecordedRankingSchema {
+                rank: 100,
+                user_id: "12345".to_owned(),
+                score: 1_550_000,
+                timestamp: 1_704_067_200,
+            }),
+        ];
+        let mut info = CloudRankInfoSchema {
+            rank: 100,
+            user_id: Some("12345".to_owned()),
+            name: "User".to_owned(),
+            score: 1_550_000,
+            timestamp: 1_704_067_200,
+            average_round: None,
+            average_pt: None,
+            latest_pt: None,
+            speed: None,
+            min20_times_3_speed: None,
+            hour_round: None,
+            record_start_at: None,
+            speed_window: None,
+            character_id: None,
+        };
+
+        apply_cloud_trace_metrics_at(
+            &mut info,
+            &trace,
+            Utc.timestamp_opt(1_704_067_200, 0).single().unwrap(),
+        );
+
+        assert_eq!(info.record_start_at, Some(1_704_060_000_000));
+        assert_eq!(info.latest_pt, Some(300_000));
+        assert_eq!(info.average_round, Some(2));
+        assert_eq!(info.average_pt, Some(275_000));
+        assert_eq!(info.speed, Some(300_000));
+        assert_eq!(info.hour_round, Some(1));
+        assert_eq!(info.min20_times_3_speed, Some(900_000));
+    }
+
+    #[test]
+    fn tracker_window_end_ignores_stale_tail() {
+        let last_timestamp = 1_704_067_200;
+        let now = Utc
+            .timestamp_opt(
+                last_timestamp + TRACKER_REALTIME_TAIL_MAX_LAG_SECONDS + 1,
+                0,
+            )
+            .single()
+            .unwrap();
+
+        assert_eq!(
+            effective_tracker_window_end_unix_seconds(last_timestamp, now),
+            last_timestamp
+        );
     }
 }

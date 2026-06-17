@@ -1024,6 +1024,70 @@ pub async fn search_world_bloom_user_trace(
     )
 }
 
+#[tracing::instrument(skip(engine, filter), fields(event_id, rank))]
+pub async fn search_rank_trace(
+    engine: &DatabaseEngine,
+    event_id: i64,
+    rank: i64,
+    filter: &WebTraceFilter,
+    mode: PublicUserIdMode,
+) -> Result<Vec<RecordedRankData>, DbErr> {
+    let event_tbl = Alias::new(intern(TableKind::Event, event_id));
+    let time_tbl = Alias::new(intern(TableKind::TimeId, event_id));
+    let mut stmt = ranking_select(event_id, mode);
+    stmt.and_where(Expr::col((event_tbl, event::Column::Rank)).eq(rank));
+    apply_trace_filters(
+        &mut stmt,
+        Expr::col((time_tbl.clone(), time_id::Column::Timestamp)),
+        filter,
+    );
+    stmt.order_by((time_tbl, time_id::Column::Timestamp), Order::Asc)
+        .limit(filter.limit);
+
+    let backend = engine.backend();
+    Ok(RankingPageRow::find_by_statement(backend.build(&stmt))
+        .all(engine.conn())
+        .await?
+        .into_iter()
+        .map(RankingPageRow::into_schema)
+        .map(RecordedRankData::Normal)
+        .collect())
+}
+
+#[tracing::instrument(skip(engine, filter), fields(event_id, character_id, rank))]
+pub async fn search_world_bloom_rank_trace(
+    engine: &DatabaseEngine,
+    event_id: i64,
+    character_id: i64,
+    rank: i64,
+    filter: &WebTraceFilter,
+    mode: PublicUserIdMode,
+) -> Result<Vec<RecordedRankData>, DbErr> {
+    let wl_tbl = Alias::new(intern(TableKind::WorldBloom, event_id));
+    let time_tbl = Alias::new(intern(TableKind::TimeId, event_id));
+    let mut stmt = world_bloom_select(event_id, mode);
+    stmt.and_where(Expr::col((wl_tbl.clone(), world_bloom::Column::Rank)).eq(rank))
+        .and_where(Expr::col((wl_tbl, world_bloom::Column::CharacterId)).eq(character_id));
+    apply_trace_filters(
+        &mut stmt,
+        Expr::col((time_tbl.clone(), time_id::Column::Timestamp)),
+        filter,
+    );
+    stmt.order_by((time_tbl, time_id::Column::Timestamp), Order::Asc)
+        .limit(filter.limit);
+
+    let backend = engine.backend();
+    Ok(
+        WorldBloomRankingPageRow::find_by_statement(backend.build(&stmt))
+            .all(engine.conn())
+            .await?
+            .into_iter()
+            .map(WorldBloomRankingPageRow::into_schema)
+            .map(RecordedRankData::WorldBloom)
+            .collect(),
+    )
+}
+
 fn apply_trace_filters(
     stmt: &mut SelectStatement,
     timestamp_col: SimpleExpr,
@@ -1403,6 +1467,95 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn search_rank_trace_follows_rank_not_current_player() {
+        let engine = sqlite_engine().await;
+        let event_id = 559;
+        create_event_tables(&engine, SekaiServerRegion::Jp, event_id, false)
+            .await
+            .unwrap();
+        seed_normal_event_with_rank_changes(&engine, event_id).await;
+
+        let filter = WebTraceFilter {
+            start_time: None,
+            end_time: None,
+            cursor: None,
+            limit: 10,
+        };
+        let trace = search_rank_trace(&engine, event_id, 2, &filter, PublicUserIdMode::Unique)
+            .await
+            .unwrap();
+
+        let rows = trace
+            .into_iter()
+            .map(|rank_data| match rank_data {
+                RecordedRankData::Normal(row) => row,
+                RecordedRankData::WorldBloom(_) => panic!("expected normal ranking"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            rows.iter()
+                .map(|row| (row.timestamp, row.user_id.as_str(), row.rank, row.score))
+                .collect::<Vec<_>>(),
+            vec![
+                (1_710_000_000, "u-public-2", 2, 900),
+                (1_710_000_060, "u-public-1", 2, 1500),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn search_world_bloom_rank_trace_follows_rank_not_current_player() {
+        let engine = sqlite_engine().await;
+        let event_id = 560;
+        create_event_tables(&engine, SekaiServerRegion::Jp, event_id, true)
+            .await
+            .unwrap();
+        seed_world_bloom_event_with_rank_changes(&engine, event_id).await;
+
+        let filter = WebTraceFilter {
+            start_time: None,
+            end_time: None,
+            cursor: None,
+            limit: 10,
+        };
+        let trace = search_world_bloom_rank_trace(
+            &engine,
+            event_id,
+            17,
+            2,
+            &filter,
+            PublicUserIdMode::Unique,
+        )
+        .await
+        .unwrap();
+
+        let rows = trace
+            .into_iter()
+            .map(|rank_data| match rank_data {
+                RecordedRankData::WorldBloom(row) => row,
+                RecordedRankData::Normal(_) => panic!("expected world bloom ranking"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            rows.iter()
+                .map(|row| {
+                    (
+                        row.timestamp,
+                        row.user_id.as_str(),
+                        row.rank,
+                        row.score,
+                        row.character_id,
+                    )
+                })
+                .collect::<Vec<_>>(),
+            vec![
+                (1_710_000_000, "u-public-2", 2, 1900, Some(17)),
+                (1_710_000_060, "u-public-1", 2, 2500, Some(17)),
+            ]
+        );
+    }
+
+    #[tokio::test]
     async fn ranking_score_growth_respects_replay_end_time() {
         let engine = sqlite_engine().await;
         let event_id = 558;
@@ -1761,6 +1914,39 @@ mod tests {
         }
     }
 
+    async fn seed_normal_event_with_rank_changes(engine: &DatabaseEngine, event_id: i64) {
+        let users_tbl = intern(TableKind::EventUsers, event_id);
+        let time_tbl = intern(TableKind::TimeId, event_id);
+        let event_tbl = intern(TableKind::Event, event_id);
+        for sql in [
+            format!(
+                "INSERT INTO {users_tbl} \
+                (user_id, unique_id, name, cheerful_team_id, card_id, card_level, \
+                card_master_rank, card_special_training_status, card_default_image, \
+                profile_word, profile_honors_json, player_frames_json) VALUES \
+                ('100', 'u-public-1', 'Alpha', NULL, 1404, 60, 5, 'done', 'original', \
+                'hello world', '[]', '[]'), \
+                ('200', 'u-public-2', 'Beta', NULL, 1300, 50, 0, 'none', 'original', \
+                'other word', '[]', '[]')"
+            ),
+            format!(
+                "INSERT INTO {time_tbl} (timestamp, status) VALUES \
+                (1710000000, 0), (1710000060, 0)"
+            ),
+            format!(
+                "INSERT INTO {event_tbl} (time_id, user_id_key, score, rank) VALUES \
+                (1, 1, 1000, 1), (1, 2, 900, 2), \
+                (2, 2, 1600, 1), (2, 1, 1500, 2)"
+            ),
+        ] {
+            engine
+                .conn()
+                .execute_raw(Statement::from_string(DatabaseBackend::Sqlite, sql))
+                .await
+                .unwrap();
+        }
+    }
+
     async fn seed_world_bloom_event_with_history(engine: &DatabaseEngine, event_id: i64) {
         let users_tbl = intern(TableKind::EventUsers, event_id);
         let time_tbl = intern(TableKind::TimeId, event_id);
@@ -1787,6 +1973,40 @@ mod tests {
                 (1, 1, 17, 2000, 1), (1, 2, 17, 1900, 2), (1, 3, 17, 1800, 3), \
                 (2, 1, 17, 2300, 1), (2, 2, 17, 2200, 2), (2, 3, 17, 2100, 3), \
                 (2, 1, 19, 9000, 1)"
+            ),
+        ] {
+            engine
+                .conn()
+                .execute_raw(Statement::from_string(DatabaseBackend::Sqlite, sql))
+                .await
+                .unwrap();
+        }
+    }
+
+    async fn seed_world_bloom_event_with_rank_changes(engine: &DatabaseEngine, event_id: i64) {
+        let users_tbl = intern(TableKind::EventUsers, event_id);
+        let time_tbl = intern(TableKind::TimeId, event_id);
+        let wl_tbl = intern(TableKind::WorldBloom, event_id);
+        for sql in [
+            format!(
+                "INSERT INTO {users_tbl} \
+                (user_id, unique_id, name, cheerful_team_id, card_id, card_level, \
+                card_master_rank, card_special_training_status, card_default_image, \
+                profile_word, profile_honors_json, player_frames_json) VALUES \
+                ('100', 'u-public-1', 'Alpha', NULL, 1404, 60, 5, 'done', 'original', \
+                'hello world', '[]', '[]'), \
+                ('200', 'u-public-2', 'Beta', NULL, 1300, 50, 0, 'none', 'original', \
+                'other word', '[]', '[]')"
+            ),
+            format!(
+                "INSERT INTO {time_tbl} (timestamp, status) VALUES \
+                (1710000000, 0), (1710000060, 0)"
+            ),
+            format!(
+                "INSERT INTO {wl_tbl} (time_id, user_id_key, character_id, score, rank) VALUES \
+                (1, 1, 17, 2000, 1), (1, 2, 17, 1900, 2), \
+                (2, 2, 17, 2600, 1), (2, 1, 17, 2500, 2), \
+                (1, 1, 19, 9000, 1), (2, 1, 19, 9100, 1)"
             ),
         ] {
             engine
