@@ -37,23 +37,23 @@ pub fn cloud_v2_routes() -> Router<AppState> {
     Router::new()
         .route(
             "/api/v2/cloud/events/{server}/{event_id}/leaderboards/total/sk/query",
-            get(leaderboard::cloud_total_query),
+            get(leaderboard::cloud::total_query),
         )
         .route(
             "/api/v2/cloud/events/{server}/{event_id}/leaderboards/total/sk/check-room",
-            get(leaderboard::cloud_total_check_room),
+            get(leaderboard::cloud::total_check_room),
         )
         .route(
             "/api/v2/cloud/events/{server}/{event_id}/leaderboards/total/sk/line",
-            get(leaderboard::cloud_total_line),
+            get(leaderboard::cloud::total_line),
         )
         .route(
             "/api/v2/cloud/events/{server}/{event_id}/leaderboards/total/sk/speed",
-            get(leaderboard::cloud_total_speed),
+            get(leaderboard::cloud::total_speed),
         )
         .route(
             "/api/v2/cloud/events/{server}/{event_id}/leaderboards/total/sk/trace",
-            get(leaderboard::cloud_total_trace),
+            get(leaderboard::cloud::total_trace),
         )
         .route(
             "/api/v2/cloud/events/{server}/{event_id}/leaderboards/total/sk/status",
@@ -61,23 +61,23 @@ pub fn cloud_v2_routes() -> Router<AppState> {
         )
         .route(
             "/api/v2/cloud/events/{server}/{event_id}/leaderboards/world-bloom/{character_id}/sk/query",
-            get(leaderboard::cloud_world_bloom_query),
+            get(leaderboard::cloud::world_bloom_query),
         )
         .route(
             "/api/v2/cloud/events/{server}/{event_id}/leaderboards/world-bloom/{character_id}/sk/check-room",
-            get(leaderboard::cloud_world_bloom_check_room),
+            get(leaderboard::cloud::world_bloom_check_room),
         )
         .route(
             "/api/v2/cloud/events/{server}/{event_id}/leaderboards/world-bloom/{character_id}/sk/line",
-            get(leaderboard::cloud_world_bloom_line),
+            get(leaderboard::cloud::world_bloom_line),
         )
         .route(
             "/api/v2/cloud/events/{server}/{event_id}/leaderboards/world-bloom/{character_id}/sk/speed",
-            get(leaderboard::cloud_world_bloom_speed),
+            get(leaderboard::cloud::world_bloom_speed),
         )
         .route(
             "/api/v2/cloud/events/{server}/{event_id}/leaderboards/world-bloom/{character_id}/sk/trace",
-            get(leaderboard::cloud_world_bloom_trace),
+            get(leaderboard::cloud::world_bloom_trace),
         )
 }
 
@@ -96,19 +96,19 @@ pub fn web_v2_routes(trust: Arc<ProxyTrust>) -> Router<AppState> {
     Router::new()
         .route(
             "/api/v2/web/events/{server}/{event_id}/leaderboards/total/overview",
-            get(leaderboard::web_total_overview),
+            get(leaderboard::web::total_overview),
         )
         .route(
             "/api/v2/web/events/{server}/{event_id}/leaderboards/total/replay/overview",
-            get(leaderboard::web_total_replay_overview),
+            get(leaderboard::web::total_replay_overview),
         )
         .route(
             "/api/v2/web/events/{server}/{event_id}/leaderboards/total/details/rank/{rank}",
-            get(leaderboard::web_total_rank_detail),
+            get(leaderboard::web::total_rank_detail),
         )
         .route(
             "/api/v2/web/events/{server}/{event_id}/leaderboards/total/details/user/{user_id}",
-            get(leaderboard::web_total_user_detail),
+            get(leaderboard::web::total_user_detail),
         )
         .route(
             "/api/v2/web/events/{server}/{event_id}/leaderboards/total/users/search",
@@ -116,23 +116,23 @@ pub fn web_v2_routes(trust: Arc<ProxyTrust>) -> Router<AppState> {
         )
         .route(
             "/api/v2/web/events/{server}/{event_id}/leaderboards/world-bloom/{character_id}/overview",
-            get(leaderboard::web_world_bloom_overview),
+            get(leaderboard::web::world_bloom_overview),
         )
         .route(
             "/api/v2/web/events/{server}/{event_id}/leaderboards/world-bloom/{character_id}/replay/overview",
-            get(leaderboard::web_world_bloom_replay_overview),
+            get(leaderboard::web::world_bloom_replay_overview),
         )
         .route(
             "/api/v2/web/events/{server}/{event_id}/leaderboards/world-bloom/{character_id}/details/rank/{rank}",
-            get(leaderboard::web_world_bloom_rank_detail),
+            get(leaderboard::web::world_bloom_rank_detail),
         )
         .route(
             "/api/v2/web/events/{server}/{event_id}/leaderboards/world-bloom/{character_id}/details/user/{user_id}",
-            get(leaderboard::web_world_bloom_user_detail),
+            get(leaderboard::web::world_bloom_user_detail),
         )
         .route(
             "/api/v2/web/events/{server}/{event_id}/leaderboards/world-bloom/{character_id}/users/search",
-            get(leaderboard::web_world_bloom_users),
+            get(leaderboard::web::world_bloom_users),
         )
         .merge(private_routes)
 }
