@@ -14,6 +14,11 @@ struct UserUniqueRow {
     unique_id: Option<String>,
 }
 
+#[derive(Debug, FromQueryResult)]
+struct ColumnTypeRow {
+    data_type: String,
+}
+
 pub async fn ensure_user_unique_ids(
     engine: &DatabaseEngine,
     server: SekaiServerRegion,
@@ -53,12 +58,12 @@ pub async fn ensure_profile_columns(
         ("card_special_training_status", "VARCHAR(64)"),
         ("card_default_image", "VARCHAR(64)"),
         ("profile_word", "VARCHAR(300)"),
-        ("profile_honors_json", "TEXT"),
-        ("honor_missions_json", "TEXT"),
-        ("player_frames_json", "TEXT"),
     ] {
         ensure_column(engine, table, column, ty).await?;
     }
+    ensure_text_column(engine, table, "profile_honors_json").await?;
+    ensure_text_column(engine, table, "honor_missions_json").await?;
+    ensure_text_column(engine, table, "player_frames_json").await?;
     Ok(())
 }
 
@@ -92,6 +97,61 @@ async fn ensure_column(
         return Err(err);
     }
     Ok(())
+}
+
+async fn ensure_text_column(
+    engine: &DatabaseEngine,
+    table: &'static str,
+    column: &str,
+) -> Result<(), DbErr> {
+    ensure_column(engine, table, column, "TEXT").await?;
+
+    let backend = engine.backend();
+    if !matches!(backend, DatabaseBackend::MySql) {
+        return Ok(());
+    }
+
+    if let Some(data_type) = mysql_column_data_type(engine, table, column).await?
+        && data_type.to_ascii_lowercase().ends_with("text")
+    {
+        return Ok(());
+    }
+
+    let stmt = Statement::from_string(
+        backend,
+        format!(
+            "ALTER TABLE {} MODIFY COLUMN {} TEXT NULL",
+            quote_ident(backend, table),
+            quote_ident(backend, column),
+        ),
+    );
+    engine.conn().execute_raw(stmt).await?;
+    Ok(())
+}
+
+async fn mysql_column_data_type(
+    engine: &DatabaseEngine,
+    table: &'static str,
+    column: &str,
+) -> Result<Option<String>, DbErr> {
+    let backend = engine.backend();
+    let stmt = Statement::from_string(
+        backend,
+        format!(
+            "SELECT DATA_TYPE AS data_type \
+             FROM information_schema.COLUMNS \
+             WHERE TABLE_SCHEMA = DATABASE() \
+               AND TABLE_NAME = {} \
+               AND COLUMN_NAME = {} \
+             LIMIT 1",
+            quote_literal(table),
+            quote_literal(column),
+        ),
+    );
+    Ok(ColumnTypeRow::find_by_statement(stmt)
+        .one(engine.conn())
+        .await?
+        .map(|row| row.data_type))
 }
 
 async fn backfill_unique_ids(
@@ -184,6 +244,10 @@ fn quote_ident(backend: DatabaseBackend, ident: &str) -> String {
         DatabaseBackend::Postgres | DatabaseBackend::Sqlite => format!("\"{escaped}\""),
         _ => format!("\"{escaped}\""),
     }
+}
+
+fn quote_literal(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
 }
 
 #[cfg(test)]

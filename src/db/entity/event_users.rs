@@ -79,7 +79,7 @@ impl ColumnTrait for Column {
             }
             Self::ProfileWord => ColumnType::String(StringLen::N(300)).def().nullable(),
             Self::ProfileHonorsJson | Self::HonorMissionsJson | Self::PlayerFramesJson => {
-                ColumnType::String(StringLen::None).def().nullable()
+                ColumnType::Text.def().nullable()
             }
         }
     }
@@ -101,3 +101,34 @@ impl PrimaryKeyTrait for PrimaryKey {
 pub enum Relation {}
 
 impl ActiveModelBehavior for ActiveModel {}
+
+#[cfg(test)]
+mod tests {
+    use sea_orm::sea_query::MysqlQueryBuilder;
+    use sea_orm::{DatabaseBackend, Schema};
+
+    use super::*;
+
+    #[test]
+    fn profile_json_columns_are_text_on_mysql() {
+        let schema = Schema::new(DatabaseBackend::MySql);
+        let sql = schema
+            .create_table_from_entity(Entity {
+                table_name: "event_208_users",
+            })
+            .to_string(MysqlQueryBuilder);
+
+        assert!(
+            sql.contains("`profile_honors_json` text"),
+            "unexpected MySQL schema SQL: {sql}",
+        );
+        assert!(
+            sql.contains("`player_frames_json` text"),
+            "unexpected MySQL schema SQL: {sql}",
+        );
+        assert!(
+            sql.contains("`honor_missions_json` text"),
+            "unexpected MySQL schema SQL: {sql}",
+        );
+    }
+}
