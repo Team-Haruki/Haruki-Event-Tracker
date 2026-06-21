@@ -52,7 +52,7 @@ pub(crate) async fn batch_get_or_create_time_ids(
     backend: DatabaseBackend,
     table_name: &str,
     timestamps: &HashSet<i64>,
-    status: i8,
+    status: i16,
 ) -> Result<HashMap<i64, i64>, DbErr> {
     let mut out = HashMap::with_capacity(timestamps.len());
     for &ts in timestamps {

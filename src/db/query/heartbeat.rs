@@ -18,7 +18,7 @@ use crate::db::table_name::{TableKind, intern};
 #[derive(FromQueryResult)]
 struct LatestHeartbeatRow {
     timestamp: i64,
-    status: i8,
+    status: i16,
 }
 
 #[tracing::instrument(skip(engine), fields(event_id, timestamp, status))]
@@ -26,7 +26,7 @@ pub async fn write_heartbeat(
     engine: &DatabaseEngine,
     event_id: i64,
     timestamp: i64,
-    status: i8,
+    status: i16,
 ) -> Result<(), DbErr> {
     let backend = engine.backend();
     let table = intern(TableKind::TimeId, event_id);
@@ -51,7 +51,7 @@ pub async fn write_heartbeat(
 pub async fn fetch_latest_heartbeat(
     engine: &DatabaseEngine,
     event_id: i64,
-) -> Result<Option<(i64, i8)>, DbErr> {
+) -> Result<Option<(i64, i16)>, DbErr> {
     fetch_latest_heartbeat_before(engine, event_id, None).await
 }
 
@@ -60,7 +60,7 @@ pub async fn fetch_latest_heartbeat_before(
     engine: &DatabaseEngine,
     event_id: i64,
     timestamp: Option<i64>,
-) -> Result<Option<(i64, i8)>, DbErr> {
+) -> Result<Option<(i64, i16)>, DbErr> {
     let backend = engine.backend();
     let table = intern(TableKind::TimeId, event_id);
     let mut stmt = Query::select()

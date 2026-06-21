@@ -420,7 +420,7 @@ async fn overview_status(
     let now = at.unwrap_or_else(|| Utc::now().timestamp());
     Ok(Some(EventStatusResponseSchema {
         timestamp,
-        status: status.into(),
+        status,
         status_desc: status_desc.to_owned(),
         time_ago: now - timestamp,
     }))
