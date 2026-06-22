@@ -95,7 +95,7 @@ chrono = { version = "0.4", default-features = false, features = [
 flate2 = "1"
 sha2 = "0.11"
 ipnet = "2"
-rand = "0.9"
+rand = "0.10"
 opendal = { version = "0.57", default-features = false, features = ["services-fs", "services-s3", "services-http", "reqwest-rustls-tls", "executors-tokio", "auto-register-services", "layers-retry", "layers-timeout"] }
 
 [dev-dependencies]
