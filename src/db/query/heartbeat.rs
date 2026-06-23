@@ -7,7 +7,7 @@
 //! ranking table.
 
 use sea_orm::sea_query::{Alias, Expr, Order, Query};
-use sea_orm::{DbErr, ExprTrait, FromQueryResult, TransactionTrait};
+use sea_orm::{DatabaseBackend, DbErr, ExprTrait, FromQueryResult, TransactionTrait};
 use std::collections::HashSet;
 
 use crate::db::engine::DatabaseEngine;
@@ -19,6 +19,23 @@ use crate::db::table_name::{TableKind, intern};
 struct LatestHeartbeatRow {
     timestamp: i64,
     status: i16,
+}
+
+fn heartbeat_status_expr(backend: DatabaseBackend) -> Expr {
+    match backend {
+        DatabaseBackend::Postgres => Expr::cust(
+            r#"CASE
+                WHEN pg_typeof("status")::text = '"char"' THEN
+                    CASE
+                        WHEN ascii("status"::text) BETWEEN 48 AND 57
+                            THEN (ascii("status"::text) - 48)::smallint
+                        ELSE ascii("status"::text)::smallint
+                    END
+                ELSE "status"::smallint
+            END"#,
+        ),
+        _ => Expr::col(time_id::Column::Status),
+    }
 }
 
 #[tracing::instrument(skip(engine), fields(event_id, timestamp, status))]
@@ -68,7 +85,7 @@ pub async fn fetch_latest_heartbeat_before(
             Expr::col(time_id::Column::Timestamp),
             Alias::new("timestamp"),
         )
-        .expr_as(Expr::col(time_id::Column::Status), Alias::new("status"))
+        .expr_as(heartbeat_status_expr(backend), Alias::new("status"))
         .from(Alias::new(table))
         .to_owned();
     if let Some(timestamp) = timestamp {
