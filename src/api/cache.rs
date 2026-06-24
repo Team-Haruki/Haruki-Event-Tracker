@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::io::Write;
 use std::sync::Arc;
+use std::sync::LazyLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
@@ -20,6 +21,9 @@ use crate::api::stats::{CACHE_STATS, incr};
 use crate::config::ApiCacheConfig;
 
 const DIRTY_TTL_SECS: u64 = 300;
+/// Payloads at or above this size are gzipped on a blocking thread so large
+/// batch responses don't stall the async worker.
+const GZIP_SPAWN_BLOCKING_THRESHOLD: usize = 32 * 1024;
 const READ_SCRIPT: &str = r#"
 local epoch = redis.call('GET', KEYS[1])
 if not epoch then
@@ -55,6 +59,11 @@ end
 redis.call('SETEX', KEYS[3], tonumber(ARGV[3]), ARGV[2])
 return 1
 "#;
+
+static READ_SCRIPT_HANDLE: LazyLock<redis::Script> =
+    LazyLock::new(|| redis::Script::new(READ_SCRIPT));
+static WRITE_SCRIPT_HANDLE: LazyLock<redis::Script> =
+    LazyLock::new(|| redis::Script::new(WRITE_SCRIPT));
 
 #[derive(Clone)]
 pub struct ApiCache {
@@ -1253,7 +1262,7 @@ impl ApiCache {
         if bytes.len() < self.cfg.precompress_min_bytes {
             return Ok(CachedJson::identity(bytes));
         }
-        let gzip = gzip_bytes(&bytes, self.cfg.gzip_level)?;
+        let gzip = self.gzip_response_bytes(bytes).await?;
         if let Some(ctx) = write_context {
             match self
                 .write_l2_if_clean(&ctx, &gzip_key(&ctx.value_key), gzip.clone(), ctx.ttl_secs)
@@ -1270,6 +1279,19 @@ impl ApiCache {
         Ok(CachedJson::gzip(gzip))
     }
 
+    async fn gzip_response_bytes(&self, bytes: Bytes) -> Result<Bytes, ApiError> {
+        let level = self.cfg.gzip_level;
+        if bytes.len() < GZIP_SPAWN_BLOCKING_THRESHOLD {
+            return gzip_bytes(&bytes, level);
+        }
+        tokio::task::spawn_blocking(move || gzip_bytes(&bytes, level))
+            .await
+            .map_err(|err| {
+                tracing::warn!(%err, "gzip blocking task failed");
+                ApiError::ServiceUnavailable("gzip encode error".into())
+            })?
+    }
+
     async fn read_l2_combined(
         &self,
         server: &str,
@@ -1278,8 +1300,7 @@ impl ApiCache {
     ) -> Result<L2CombinedRead, redis::RedisError> {
         let mut conn = self.conns.connection();
         let base = base_key(server, event_id);
-        let script = redis::Script::new(READ_SCRIPT);
-        let mut invocation = script.prepare_invoke();
+        let mut invocation = READ_SCRIPT_HANDLE.prepare_invoke();
         invocation
             .key(epoch_key(server, event_id))
             .key(dirty_key(server, event_id))
@@ -1348,8 +1369,7 @@ impl ApiCache {
         ttl_secs: u64,
     ) -> Result<bool, redis::RedisError> {
         let mut conn = self.conns.connection();
-        let script = redis::Script::new(WRITE_SCRIPT);
-        let mut invocation = script.prepare_invoke();
+        let mut invocation = WRITE_SCRIPT_HANDLE.prepare_invoke();
         invocation
             .key(epoch_key(&ctx.server, ctx.event_id))
             .key(dirty_key(&ctx.server, ctx.event_id))
@@ -1442,16 +1462,20 @@ impl CacheConnections {
     }
 }
 
-#[derive(Clone, Default)]
+/// Number of independently-locked L1 shards. Spreading keys across shards keeps
+/// the hot lookup path from serialising on a single mutex under load.
+const L1_SHARDS: usize = 16;
+
+#[derive(Clone)]
 struct L1Cache {
     max_entries: usize,
-    inner: Arc<Mutex<L1Inner>>,
+    inner: Arc<L1Shards>,
 }
 
-#[derive(Default)]
-struct L1Inner {
-    controls: HashMap<String, L1Control>,
-    values: HashMap<String, L1Value>,
+struct L1Shards {
+    max_per_shard: usize,
+    controls: Box<[Mutex<HashMap<String, L1Control>>]>,
+    values: Box<[Mutex<HashMap<String, L1Value>>]>,
 }
 
 #[derive(Clone, Copy)]
@@ -1461,27 +1485,57 @@ struct L1Control {
     expires_at: Instant,
 }
 
+impl Expiring for L1Control {
+    fn expires_at(&self) -> Instant {
+        self.expires_at
+    }
+}
+
 #[derive(Clone)]
 struct L1Value {
     bytes: Bytes,
     expires_at: Instant,
 }
 
+impl Expiring for L1Value {
+    fn expires_at(&self) -> Instant {
+        self.expires_at
+    }
+}
+
+trait Expiring {
+    fn expires_at(&self) -> Instant;
+}
+
 impl L1Cache {
     fn new(max_entries: usize) -> Self {
+        let max_per_shard = max_entries.div_ceil(L1_SHARDS).max(1);
+        let controls = (0..L1_SHARDS).map(|_| Mutex::new(HashMap::new())).collect();
+        let values = (0..L1_SHARDS).map(|_| Mutex::new(HashMap::new())).collect();
         Self {
             max_entries,
-            inner: Arc::new(Mutex::new(L1Inner::default())),
+            inner: Arc::new(L1Shards {
+                max_per_shard,
+                controls,
+                values,
+            }),
         }
+    }
+
+    fn shard(key: &str) -> usize {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        key.hash(&mut hasher);
+        (hasher.finish() as usize) % L1_SHARDS
     }
 
     async fn get_control(&self, key: &str) -> Option<L1Control> {
         let now = Instant::now();
-        let mut inner = self.inner.lock().await;
-        match inner.controls.get(key).copied() {
+        let mut shard = self.inner.controls[Self::shard(key)].lock().await;
+        match shard.get(key).copied() {
             Some(control) if control.expires_at > now => Some(control),
             Some(_) => {
-                inner.controls.remove(key);
+                shard.remove(key);
                 None
             }
             None => None,
@@ -1492,18 +1546,18 @@ impl L1Cache {
         if self.max_entries == 0 {
             return;
         }
-        let mut inner = self.inner.lock().await;
-        prune_if_full(self.max_entries, &mut inner.controls);
-        inner.controls.insert(key, value);
+        let mut shard = self.inner.controls[Self::shard(&key)].lock().await;
+        evict_if_full(self.inner.max_per_shard, &mut shard);
+        shard.insert(key, value);
     }
 
     async fn get_value(&self, key: &str) -> Option<Bytes> {
         let now = Instant::now();
-        let mut inner = self.inner.lock().await;
-        match inner.values.get(key) {
+        let mut shard = self.inner.values[Self::shard(key)].lock().await;
+        match shard.get(key) {
             Some(value) if value.expires_at > now => Some(value.bytes.clone()),
             Some(_) => {
-                inner.values.remove(key);
+                shard.remove(key);
                 None
             }
             None => None,
@@ -1514,17 +1568,29 @@ impl L1Cache {
         if self.max_entries == 0 {
             return;
         }
-        let mut inner = self.inner.lock().await;
-        prune_if_full(self.max_entries, &mut inner.values);
-        inner.values.insert(key, value);
+        let mut shard = self.inner.values[Self::shard(&key)].lock().await;
+        evict_if_full(self.inner.max_per_shard, &mut shard);
+        shard.insert(key, value);
     }
 }
 
-fn prune_if_full<T>(max_entries: usize, values: &mut HashMap<String, T>) {
-    if values.len() < max_entries {
+/// Make room in a full shard without the thundering-herd of clearing it whole:
+/// drop expired entries first, and if still full evict roughly the oldest
+/// quarter by expiry (≈ insertion order, since each entry type has a fixed TTL).
+fn evict_if_full<T: Expiring>(max_per_shard: usize, map: &mut HashMap<String, T>) {
+    if map.len() < max_per_shard {
         return;
     }
-    values.clear();
+    let now = Instant::now();
+    map.retain(|_, v| v.expires_at() > now);
+    if map.len() < max_per_shard || map.len() <= 1 {
+        return;
+    }
+    let drop = (map.len() / 4).max(1).min(map.len() - 1);
+    let mut deadlines: Vec<Instant> = map.values().map(Expiring::expires_at).collect();
+    deadlines.select_nth_unstable(drop);
+    let cutoff = deadlines[drop];
+    map.retain(|_, v| v.expires_at() >= cutoff);
 }
 
 enum L2CombinedRead {
@@ -1993,6 +2059,56 @@ mod tests {
         let control = l1.get_control("control").await.unwrap();
         assert_eq!(control.epoch, 7);
         assert!(control.dirty);
+    }
+
+    #[test]
+    fn evict_if_full_drops_oldest_quarter_not_everything() {
+        let base = Instant::now();
+        let mut map: HashMap<String, L1Value> = (0..100)
+            .map(|i| {
+                (
+                    i.to_string(),
+                    L1Value {
+                        bytes: Bytes::from_static(b"x"),
+                        // Distinct, all-in-the-future deadlines; higher i == newer.
+                        expires_at: base + Duration::from_secs(100 + i),
+                    },
+                )
+            })
+            .collect();
+
+        evict_if_full(100, &mut map);
+
+        // ~25% evicted, not a full clear.
+        assert_eq!(map.len(), 75);
+        // The oldest entries (smallest deadlines) are the ones removed.
+        assert!(!map.contains_key("0"));
+        assert!(map.contains_key("99"));
+    }
+
+    #[test]
+    fn evict_if_full_drops_expired_before_live_entries() {
+        let now = Instant::now();
+        let mut map: HashMap<String, L1Value> = HashMap::new();
+        map.insert(
+            "expired".to_owned(),
+            L1Value {
+                bytes: Bytes::from_static(b"x"),
+                expires_at: now - Duration::from_secs(1),
+            },
+        );
+        map.insert(
+            "live".to_owned(),
+            L1Value {
+                bytes: Bytes::from_static(b"x"),
+                expires_at: now + Duration::from_secs(60),
+            },
+        );
+
+        evict_if_full(2, &mut map);
+
+        assert!(!map.contains_key("expired"));
+        assert!(map.contains_key("live"));
     }
 
     #[tokio::test]
