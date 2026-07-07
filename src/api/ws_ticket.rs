@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 use axum::extract::ConnectInfo;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
-use rand::RngCore;
+use rand::Rng;
 use serde::Serialize;
 use tokio::sync::Mutex;
 
