@@ -18,7 +18,7 @@ use crate::db::privacy::ensure_user_table_extensions;
 use crate::model::enums::SekaiServerRegion;
 use crate::privacy::UidAnonymizer;
 use sea_orm::DbErr;
-use tokio::sync::Mutex;
+use tokio::sync::RwLock;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -30,7 +30,7 @@ struct Inner {
     cache: Option<ApiCache>,
     query_limiter: ApiQueryLimiter,
     anonymizer: UidAnonymizer,
-    user_table_extension_cache: Mutex<HashSet<UserTableExtensionKey>>,
+    user_table_extension_cache: RwLock<HashSet<UserTableExtensionKey>>,
     private_lookup: Option<PrivateLookupVerifier>,
     realtime: RealtimeHub,
     ws_tickets: WsTicketStore,
@@ -59,7 +59,7 @@ impl AppState {
                 cache,
                 query_limiter,
                 anonymizer,
-                user_table_extension_cache: Mutex::new(HashSet::new()),
+                user_table_extension_cache: RwLock::new(HashSet::new()),
                 private_lookup,
                 realtime,
                 ws_tickets,
@@ -101,7 +101,20 @@ impl AppState {
             event_id,
             anonymization_enabled: self.inner.anonymizer.is_enabled(),
         };
-        let mut cache = self.inner.user_table_extension_cache.lock().await;
+        // Warm path: shared read lock, so requests don't serialize on a
+        // global mutex once the (server, event) pair has been migrated.
+        if self
+            .inner
+            .user_table_extension_cache
+            .read()
+            .await
+            .contains(&key)
+        {
+            return Ok(());
+        }
+        // Cold path: the write lock is intentionally held across the DDL so
+        // concurrent first-hitters of the same event don't race the ALTERs.
+        let mut cache = self.inner.user_table_extension_cache.write().await;
         if cache.contains(&key) {
             return Ok(());
         }

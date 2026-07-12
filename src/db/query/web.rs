@@ -35,6 +35,14 @@ impl WebRankingFilter {
     fn is_rank_window(&self) -> bool {
         self.rank_min.is_some() || self.rank_max.is_some() || self.rank_in.is_some()
     }
+
+    fn has_time_filter(&self) -> bool {
+        self.start_time.is_some()
+            || self.end_time.is_some()
+            || self.before.is_some()
+            || self.after.is_some()
+            || self.timestamp.is_some()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -521,12 +529,23 @@ fn latest_rank_window_select(
             Expr::col((event_tbl.clone(), event::Column::TimeId)).max(),
             Alias::new("time_id"),
         )
-        .from(event_tbl.clone())
-        .inner_join(
+        .from(event_tbl.clone());
+    // The time table is only needed to translate time filters into
+    // `time_id`s; without them, `MAX(time_id) GROUP BY rank` runs entirely
+    // on the `(rank, time_id)` index instead of probing the time table for
+    // every history row in the rank range.
+    if filter.has_time_filter() {
+        latest.inner_join(
             time_tbl.clone(),
             Expr::col((event_tbl.clone(), event::Column::TimeId))
                 .equals((time_tbl.clone(), time_id::Column::TimeId)),
         );
+        apply_rank_window_time_filters(
+            &mut latest,
+            Expr::col((time_tbl.clone(), time_id::Column::Timestamp)),
+            filter,
+        );
+    }
     if let Some(rank_min) = filter.rank_min {
         latest.and_where(Expr::col((event_tbl.clone(), event::Column::Rank)).gte(rank_min));
     }
@@ -538,11 +557,6 @@ fn latest_rank_window_select(
             Expr::col((event_tbl.clone(), event::Column::Rank)).is_in(ranks.iter().copied()),
         );
     }
-    apply_rank_window_time_filters(
-        &mut latest,
-        Expr::col((time_tbl.clone(), time_id::Column::Timestamp)),
-        filter,
-    );
     apply_rank_window_score_filters(
         &mut latest,
         Expr::col((event_tbl.clone(), event::Column::Score)),
@@ -630,12 +644,19 @@ fn latest_world_bloom_rank_window_select(
             Alias::new("time_id"),
         )
         .from(wl_tbl.clone())
-        .inner_join(
+        .and_where(Expr::col((wl_tbl.clone(), world_bloom::Column::CharacterId)).eq(character_id));
+    if filter.has_time_filter() {
+        latest.inner_join(
             time_tbl.clone(),
             Expr::col((wl_tbl.clone(), world_bloom::Column::TimeId))
                 .equals((time_tbl.clone(), time_id::Column::TimeId)),
-        )
-        .and_where(Expr::col((wl_tbl.clone(), world_bloom::Column::CharacterId)).eq(character_id));
+        );
+        apply_rank_window_time_filters(
+            &mut latest,
+            Expr::col((time_tbl.clone(), time_id::Column::Timestamp)),
+            filter,
+        );
+    }
     if let Some(rank_min) = filter.rank_min {
         latest.and_where(Expr::col((wl_tbl.clone(), world_bloom::Column::Rank)).gte(rank_min));
     }
@@ -647,11 +668,6 @@ fn latest_world_bloom_rank_window_select(
             Expr::col((wl_tbl.clone(), world_bloom::Column::Rank)).is_in(ranks.iter().copied()),
         );
     }
-    apply_rank_window_time_filters(
-        &mut latest,
-        Expr::col((time_tbl.clone(), time_id::Column::Timestamp)),
-        filter,
-    );
     apply_rank_window_score_filters(
         &mut latest,
         Expr::col((wl_tbl.clone(), world_bloom::Column::Score)),

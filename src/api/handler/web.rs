@@ -101,10 +101,10 @@ pub async fn rankings(
     Query(query): Query<RankingSearchQuery>,
 ) -> Result<Json<WebRankingPageSchema>, ApiError> {
     let (region, engine) = resolve_region_engine(&state, &server)?;
-    let mode = prepare_web_user_id_mode(&state, &engine, region, event_id).await?;
     let filter = query.into_filter()?;
     let suffix = format!("web:v2:rankings:{}", filter.cache_key());
     let fetch = async {
+        let mode = prepare_web_user_id_mode(&state, &engine, region, event_id).await?;
         let (items, cursor) = search_rankings(&engine, event_id, &filter, mode).await?;
         Ok(WebRankingPageSchema {
             items,
@@ -141,10 +141,10 @@ pub async fn world_bloom_rankings(
     Query(query): Query<RankingSearchQuery>,
 ) -> Result<Json<WebRankingPageSchema>, ApiError> {
     let (region, engine) = resolve_region_engine(&state, &server)?;
-    let mode = prepare_web_user_id_mode(&state, &engine, region, event_id).await?;
     let filter = query.into_filter()?;
     let suffix = format!("web:v2:wb:{character_id}:rankings:{}", filter.cache_key());
     let fetch = async {
+        let mode = prepare_web_user_id_mode(&state, &engine, region, event_id).await?;
         let (items, cursor) =
             search_world_bloom_rankings(&engine, event_id, character_id, &filter, mode).await?;
         Ok(WebRankingPageSchema {
@@ -182,11 +182,12 @@ pub async fn user_trace(
     Query(query): Query<UserTraceQuery>,
 ) -> Result<Json<UserAllRankingDataQueryResponseSchema>, ApiError> {
     let (region, engine) = resolve_region_engine(&state, &server)?;
-    let mode = prepare_web_user_id_mode(&state, &engine, region, event_id).await?;
     let filter = query.into_filter()?;
     let suffix = format!("web:trace:user:{user_id}:{}", filter.cache_key());
     let limiter = state.query_limiter().clone();
+    let state_for_fetch = state.clone();
     let fetch = async move {
+        let mode = prepare_web_user_id_mode(&state_for_fetch, &engine, region, event_id).await?;
         let _permit = limiter.acquire_trace(region).await?;
         let rank_data = search_user_trace(&engine, event_id, &user_id, &filter, mode).await?;
         not_found_if_empty(&rank_data)?;
@@ -206,14 +207,15 @@ pub async fn world_bloom_user_trace(
     Query(query): Query<UserTraceQuery>,
 ) -> Result<Json<UserAllRankingDataQueryResponseSchema>, ApiError> {
     let (region, engine) = resolve_region_engine(&state, &server)?;
-    let mode = prepare_web_user_id_mode(&state, &engine, region, event_id).await?;
     let filter = query.into_filter()?;
     let suffix = format!(
         "web:wb:{character_id}:trace:user:{user_id}:{}",
         filter.cache_key()
     );
     let limiter = state.query_limiter().clone();
+    let state_for_fetch = state.clone();
     let fetch = async move {
+        let mode = prepare_web_user_id_mode(&state_for_fetch, &engine, region, event_id).await?;
         let _permit = limiter.acquire_trace(region).await?;
         let rank_data =
             search_world_bloom_user_trace(&engine, event_id, character_id, &user_id, &filter, mode)
@@ -235,10 +237,10 @@ pub async fn users(
     Query(query): Query<UserSearchQuery>,
 ) -> Result<Json<WebUserSearchPageSchema>, ApiError> {
     let (region, engine) = resolve_region_engine(&state, &server)?;
-    let mode = prepare_web_user_id_mode(&state, &engine, region, event_id).await?;
     let filter = query.into_filter()?;
     let suffix = format!("web:users:{}", filter.cache_key());
     let fetch = async {
+        let mode = prepare_web_user_id_mode(&state, &engine, region, event_id).await?;
         let (items, cursor) = search_users(&engine, event_id, &filter, mode).await?;
         Ok(WebUserSearchPageSchema {
             items,

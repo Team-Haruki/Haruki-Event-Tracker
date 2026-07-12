@@ -64,11 +64,13 @@ pub async fn fetch_latest_world_bloom_ranking(
 ) -> Result<Option<RecordedWorldBloomRankingSchema>, DbErr> {
     let users_tbl = Alias::new(intern(TableKind::EventUsers, event_id));
     let wl_tbl = Alias::new(intern(TableKind::WorldBloom, event_id));
-    let time_tbl = Alias::new(intern(TableKind::TimeId, event_id));
+    // Ordering by the World Bloom table's own `time_id` (monotone with
+    // `timestamp`) keeps the `(character_id, *, time_id)` indexes able to
+    // provide the order — see the same note in `ranking.rs`.
     let stmt = wl_select(event_id, mode)
         .and_where(Expr::col((users_tbl, mode.output_column())).eq(user_id))
         .and_where(Expr::col((wl_tbl.clone(), world_bloom::Column::CharacterId)).eq(character_id))
-        .order_by((time_tbl, time_id::Column::Timestamp), Order::Desc)
+        .order_by((wl_tbl, world_bloom::Column::TimeId), Order::Desc)
         .limit(1)
         .to_owned();
 
@@ -88,11 +90,10 @@ pub async fn fetch_all_world_bloom_rankings(
 ) -> Result<Vec<RecordedWorldBloomRankingSchema>, DbErr> {
     let users_tbl = Alias::new(intern(TableKind::EventUsers, event_id));
     let wl_tbl = Alias::new(intern(TableKind::WorldBloom, event_id));
-    let time_tbl = Alias::new(intern(TableKind::TimeId, event_id));
     let stmt = wl_select(event_id, mode)
         .and_where(Expr::col((users_tbl, mode.output_column())).eq(user_id))
         .and_where(Expr::col((wl_tbl.clone(), world_bloom::Column::CharacterId)).eq(character_id))
-        .order_by((time_tbl, time_id::Column::Timestamp), Order::Asc)
+        .order_by((wl_tbl, world_bloom::Column::TimeId), Order::Asc)
         .to_owned();
 
     let backend = engine.backend();
@@ -110,11 +111,10 @@ pub async fn fetch_latest_world_bloom_ranking_by_rank(
     mode: PublicUserIdMode,
 ) -> Result<Option<RecordedWorldBloomRankingSchema>, DbErr> {
     let wl_tbl = Alias::new(intern(TableKind::WorldBloom, event_id));
-    let time_tbl = Alias::new(intern(TableKind::TimeId, event_id));
     let stmt = wl_select(event_id, mode)
         .and_where(Expr::col((wl_tbl.clone(), world_bloom::Column::Rank)).eq(rank))
         .and_where(Expr::col((wl_tbl.clone(), world_bloom::Column::CharacterId)).eq(character_id))
-        .order_by((time_tbl, time_id::Column::Timestamp), Order::Desc)
+        .order_by((wl_tbl, world_bloom::Column::TimeId), Order::Desc)
         .limit(1)
         .to_owned();
 
@@ -133,11 +133,10 @@ pub async fn fetch_all_world_bloom_rankings_by_rank(
     mode: PublicUserIdMode,
 ) -> Result<Vec<RecordedWorldBloomRankingSchema>, DbErr> {
     let wl_tbl = Alias::new(intern(TableKind::WorldBloom, event_id));
-    let time_tbl = Alias::new(intern(TableKind::TimeId, event_id));
     let stmt = wl_select(event_id, mode)
         .and_where(Expr::col((wl_tbl.clone(), world_bloom::Column::Rank)).eq(rank))
         .and_where(Expr::col((wl_tbl.clone(), world_bloom::Column::CharacterId)).eq(character_id))
-        .order_by((time_tbl, time_id::Column::Timestamp), Order::Asc)
+        .order_by((wl_tbl, world_bloom::Column::TimeId), Order::Asc)
         .to_owned();
 
     let backend = engine.backend();
@@ -159,12 +158,11 @@ pub async fn fetch_all_world_bloom_rankings_by_ranks(
     }
 
     let wl_tbl = Alias::new(intern(TableKind::WorldBloom, event_id));
-    let time_tbl = Alias::new(intern(TableKind::TimeId, event_id));
     let stmt = wl_select(event_id, mode)
         .and_where(Expr::col((wl_tbl.clone(), world_bloom::Column::Rank)).is_in(ranks.to_vec()))
         .and_where(Expr::col((wl_tbl.clone(), world_bloom::Column::CharacterId)).eq(character_id))
         .order_by((wl_tbl.clone(), world_bloom::Column::Rank), Order::Asc)
-        .order_by((time_tbl, time_id::Column::Timestamp), Order::Asc)
+        .order_by((wl_tbl, world_bloom::Column::TimeId), Order::Asc)
         .to_owned();
 
     let backend = engine.backend();

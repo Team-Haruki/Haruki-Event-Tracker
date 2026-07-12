@@ -122,13 +122,20 @@ async fn handle_socket(
     trust: Arc<ProxyTrust>,
     subject: String,
 ) {
-    let router = Router::new()
-        .merge(web_v2_routes(trust.clone()))
-        .with_state(state.clone())
-        .layer(axum::middleware::from_fn_with_state(
-            trust,
-            crate::api::access_log::log,
-        ));
+    // The routing table and middleware stack are identical for every
+    // connection; build them once and hand out cheap clones.
+    static WS_ROUTER: std::sync::OnceLock<Router> = std::sync::OnceLock::new();
+    let router = WS_ROUTER
+        .get_or_init(|| {
+            Router::new()
+                .merge(web_v2_routes(trust.clone()))
+                .with_state(state.clone())
+                .layer(axum::middleware::from_fn_with_state(
+                    trust.clone(),
+                    crate::api::access_log::log,
+                ))
+        })
+        .clone();
     let hub = state.realtime().clone();
     let mut rx = hub.subscribe();
     let mut topics: HashSet<RealtimeTopic> = HashSet::new();

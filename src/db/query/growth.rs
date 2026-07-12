@@ -7,7 +7,8 @@
 //! whole window. Ranks with fewer than two rows are skipped. Errors are
 //! silently dropped to mirror the Go goroutines.
 
-use futures::future;
+use futures::StreamExt;
+use futures::stream;
 use sea_orm::sea_query::{Alias, Expr, Order, Query, SelectStatement};
 use sea_orm::{DbErr, ExprTrait, FromQueryResult};
 
@@ -39,9 +40,11 @@ fn build_growth(
     })
 }
 
+const GROWTH_CONCURRENCY: usize = 8;
+
 async fn fetch_window_edges(
     engine: &DatabaseEngine,
-    time_tbl: &'static str,
+    rank_tbl: &'static str,
     base: SelectStatement,
 ) -> Result<
     (
@@ -51,20 +54,17 @@ async fn fetch_window_edges(
     DbErr,
 > {
     let backend = engine.backend();
+    // Order by the ranking table's own `time_id` (monotone with
+    // `timestamp`) so the `(rank, time_id)` index serves each edge as a
+    // single seek — see the note in `ranking.rs`.
     let earliest = base
         .clone()
-        .order_by(
-            (Alias::new(time_tbl), time_id::Column::Timestamp),
-            Order::Asc,
-        )
+        .order_by((Alias::new(rank_tbl), Alias::new("time_id")), Order::Asc)
         .limit(1)
         .to_owned();
     let latest = base
         .clone()
-        .order_by(
-            (Alias::new(time_tbl), time_id::Column::Timestamp),
-            Order::Desc,
-        )
+        .order_by((Alias::new(rank_tbl), Alias::new("time_id")), Order::Desc)
         .limit(1)
         .to_owned();
     let earliest = RankingLineScoreSchema::find_by_statement(backend.build(&earliest))
@@ -118,10 +118,13 @@ pub async fn fetch_ranking_score_growths(
             );
         }
 
-        async move { (rank, fetch_window_edges(engine, time_tbl, base).await) }
+        async move { (rank, fetch_window_edges(engine, event_tbl, base).await) }
     });
 
-    let results = future::join_all(futs).await;
+    let results: Vec<_> = stream::iter(futs)
+        .buffered(GROWTH_CONCURRENCY)
+        .collect()
+        .await;
     Ok(results
         .into_iter()
         .filter_map(|(rank, res)| {
@@ -177,10 +180,13 @@ pub async fn fetch_world_bloom_ranking_score_growths(
             );
         }
 
-        async move { (rank, fetch_window_edges(engine, time_tbl, base).await) }
+        async move { (rank, fetch_window_edges(engine, wl_tbl, base).await) }
     });
 
-    let results = future::join_all(futs).await;
+    let results: Vec<_> = stream::iter(futs)
+        .buffered(GROWTH_CONCURRENCY)
+        .collect()
+        .await;
     Ok(results
         .into_iter()
         .filter_map(|(rank, res)| {

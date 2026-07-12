@@ -60,10 +60,15 @@ pub async fn fetch_latest_ranking(
     mode: PublicUserIdMode,
 ) -> Result<Option<RecordedRankingSchema>, DbErr> {
     let users_tbl = Alias::new(intern(TableKind::EventUsers, event_id));
-    let time_tbl = Alias::new(intern(TableKind::TimeId, event_id));
+    let event_tbl = Alias::new(intern(TableKind::Event, event_id));
+    // `time_id` is autoincrement and monotone with `timestamp` (rows are
+    // only ever appended at tick time), so ordering by the event table's
+    // own column gives identical results while letting the
+    // `(user_id_key, time_id)` / `(rank, time_id)` indexes provide the
+    // order — no join-then-sort.
     let stmt = ranking_select(event_id, mode)
         .and_where(Expr::col((users_tbl, mode.output_column())).eq(user_id))
-        .order_by((time_tbl, time_id::Column::Timestamp), Order::Desc)
+        .order_by((event_tbl, event::Column::TimeId), Order::Desc)
         .limit(1)
         .to_owned();
 
@@ -81,10 +86,10 @@ pub async fn fetch_all_rankings(
     mode: PublicUserIdMode,
 ) -> Result<Vec<RecordedRankingSchema>, DbErr> {
     let users_tbl = Alias::new(intern(TableKind::EventUsers, event_id));
-    let time_tbl = Alias::new(intern(TableKind::TimeId, event_id));
+    let event_tbl = Alias::new(intern(TableKind::Event, event_id));
     let stmt = ranking_select(event_id, mode)
         .and_where(Expr::col((users_tbl, mode.output_column())).eq(user_id))
-        .order_by((time_tbl, time_id::Column::Timestamp), Order::Asc)
+        .order_by((event_tbl, event::Column::TimeId), Order::Asc)
         .to_owned();
 
     let backend = engine.backend();
@@ -101,10 +106,9 @@ pub async fn fetch_latest_ranking_by_rank(
     mode: PublicUserIdMode,
 ) -> Result<Option<RecordedRankingSchema>, DbErr> {
     let event_tbl = Alias::new(intern(TableKind::Event, event_id));
-    let time_tbl = Alias::new(intern(TableKind::TimeId, event_id));
     let stmt = ranking_select(event_id, mode)
         .and_where(Expr::col((event_tbl.clone(), event::Column::Rank)).eq(rank))
-        .order_by((time_tbl, time_id::Column::Timestamp), Order::Desc)
+        .order_by((event_tbl, event::Column::TimeId), Order::Desc)
         .limit(1)
         .to_owned();
 
@@ -122,10 +126,9 @@ pub async fn fetch_all_rankings_by_rank(
     mode: PublicUserIdMode,
 ) -> Result<Vec<RecordedRankingSchema>, DbErr> {
     let event_tbl = Alias::new(intern(TableKind::Event, event_id));
-    let time_tbl = Alias::new(intern(TableKind::TimeId, event_id));
     let stmt = ranking_select(event_id, mode)
         .and_where(Expr::col((event_tbl.clone(), event::Column::Rank)).eq(rank))
-        .order_by((time_tbl, time_id::Column::Timestamp), Order::Asc)
+        .order_by((event_tbl, event::Column::TimeId), Order::Asc)
         .to_owned();
 
     let backend = engine.backend();
@@ -146,11 +149,10 @@ pub async fn fetch_all_rankings_by_ranks(
     }
 
     let event_tbl = Alias::new(intern(TableKind::Event, event_id));
-    let time_tbl = Alias::new(intern(TableKind::TimeId, event_id));
     let stmt = ranking_select(event_id, mode)
         .and_where(Expr::col((event_tbl.clone(), event::Column::Rank)).is_in(ranks.to_vec()))
         .order_by((event_tbl.clone(), event::Column::Rank), Order::Asc)
-        .order_by((time_tbl, time_id::Column::Timestamp), Order::Asc)
+        .order_by((event_tbl, event::Column::TimeId), Order::Asc)
         .to_owned();
 
     let backend = engine.backend();
