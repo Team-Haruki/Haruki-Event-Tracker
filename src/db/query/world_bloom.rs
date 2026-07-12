@@ -14,7 +14,7 @@ use crate::db::query::user::PublicUserIdMode;
 use crate::db::table_name::{TableKind, intern};
 use crate::model::api::RecordedWorldBloomRankingSchema;
 
-fn wl_select(event_id: i64, mode: PublicUserIdMode) -> SelectStatement {
+pub(crate) fn wl_select(event_id: i64, mode: PublicUserIdMode) -> SelectStatement {
     let wl_tbl = Alias::new(intern(TableKind::WorldBloom, event_id));
     let time_tbl = Alias::new(intern(TableKind::TimeId, event_id));
     let users_tbl = Alias::new(intern(TableKind::EventUsers, event_id));

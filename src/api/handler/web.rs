@@ -370,6 +370,7 @@ fn top_rank_filter(timestamp: Option<i64>) -> WebRankingFilter {
     WebRankingFilter {
         rank_min: Some(1),
         rank_max: Some(TOP_RANK_LIMIT),
+        rank_in: None,
         score_min: None,
         score_max: None,
         start_time: None,
@@ -463,6 +464,7 @@ impl RankingSearchQuery {
         Ok(WebRankingFilter {
             rank_min: self.rank_min,
             rank_max: self.rank_max,
+            rank_in: None,
             score_min: self.score_min,
             score_max: self.score_max,
             start_time: self.start_time,

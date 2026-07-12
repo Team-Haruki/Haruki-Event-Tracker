@@ -1,9 +1,8 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::io::Write;
-use std::sync::Arc;
-use std::sync::LazyLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, LazyLock, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -362,7 +361,7 @@ impl ApiCache {
             return fetch.await;
         }
         let key = static_value_key(server, event_id, &suffix);
-        if let Some(bytes) = self.l1.get_value(&key).await {
+        if let Some(bytes) = self.l1.get_value(&key) {
             if cached_bytes_are_valid(options, &bytes) {
                 incr(&CACHE_STATS.l1_hit);
                 tracing::debug!(cache_status = "static_l1_hit", "api static cache L1 hit");
@@ -386,7 +385,7 @@ impl ApiCache {
                                 cache_status = "static_l2_hit",
                                 "api static cache L2 hit"
                             );
-                            self.store_l1_value(key, bytes.clone()).await;
+                            self.store_l1_value(key, bytes.clone());
                             Ok(bytes)
                         } else {
                             tracing::warn!(
@@ -431,7 +430,7 @@ impl ApiCache {
             return fetch.await;
         }
 
-        if let Some(control) = self.l1.get_control(&control_key).await {
+        if let Some(control) = self.l1.get_control(&control_key) {
             incr(&CACHE_STATS.l1_control_hit);
             if control.dirty {
                 incr(&CACHE_STATS.dirty_bypass);
@@ -446,7 +445,7 @@ impl ApiCache {
                     .await;
             }
             let key = value_key(server, event_id, control.epoch, &suffix);
-            if let Some(bytes) = self.l1.get_value(&key).await {
+            if let Some(bytes) = self.l1.get_value(&key) {
                 if cached_bytes_are_valid(options, &bytes) {
                     incr(&CACHE_STATS.l1_hit);
                     if options.is_batch {
@@ -476,7 +475,7 @@ impl ApiCache {
                                         cache_status = cache_status(options, "l2_hit"),
                                         "api cache L2 hit"
                                     );
-                                    self.store_l1_value(key, bytes.clone()).await;
+                                    self.store_l1_value(key, bytes.clone());
                                     Ok(bytes)
                                 } else {
                                     tracing::warn!(
@@ -556,7 +555,7 @@ impl ApiCache {
             async {
                 match self.read_l2_combined(server, event_id, &suffix).await {
                     Ok(L2CombinedRead::Dirty { epoch }) => {
-                        self.store_l1_control(control_key, epoch, true).await;
+                        self.store_l1_control(control_key, epoch, true);
                         incr(&CACHE_STATS.dirty_bypass);
                         tracing::debug!(cache_status = "dirty_bypass", "api cache dirty bypass");
                         self.fetch_bytes_with_singleflight(
@@ -568,9 +567,9 @@ impl ApiCache {
                         .await
                     }
                     Ok(L2CombinedRead::Hit { epoch, key, bytes }) => {
-                        self.store_l1_control(control_key, epoch, false).await;
+                        self.store_l1_control(control_key, epoch, false);
                         if cached_bytes_are_valid(options, &bytes) {
-                            self.store_l1_value(key, bytes.clone()).await;
+                            self.store_l1_value(key, bytes.clone());
                             incr(&CACHE_STATS.l2_hit);
                             if options.is_batch {
                                 incr(&CACHE_STATS.batch_l2_hit);
@@ -601,13 +600,13 @@ impl ApiCache {
                         }
                     }
                     Ok(L2CombinedRead::NotFound { epoch }) => {
-                        self.store_l1_control(control_key, epoch, false).await;
+                        self.store_l1_control(control_key, epoch, false);
                         incr(&CACHE_STATS.l2_not_found);
                         tracing::debug!(cache_status = "l2_not_found", "api cache negative hit");
                         Err(ApiError::NotFound)
                     }
                     Ok(L2CombinedRead::Miss { epoch, key }) => {
-                        self.store_l1_control(control_key, epoch, false).await;
+                        self.store_l1_control(control_key, epoch, false);
                         incr(&CACHE_STATS.l2_miss);
                         if options.is_batch {
                             incr(&CACHE_STATS.batch_miss);
@@ -684,7 +683,7 @@ impl ApiCache {
             return self.encode_response(fetch.await?, None, options).await;
         }
 
-        if let Some(control) = self.l1.get_control(&control_key).await {
+        if let Some(control) = self.l1.get_control(&control_key) {
             incr(&CACHE_STATS.l1_control_hit);
             if control.dirty {
                 incr(&CACHE_STATS.dirty_bypass);
@@ -701,7 +700,7 @@ impl ApiCache {
 
             let key = value_key(server, event_id, control.epoch, &suffix);
             let gzip = gzip_key(&key);
-            if let Some(bytes) = self.l1.get_value(&gzip).await {
+            if let Some(bytes) = self.l1.get_value(&gzip) {
                 incr(&CACHE_STATS.l1_hit);
                 if options.is_batch {
                     incr(&CACHE_STATS.batch_l1_hit);
@@ -712,7 +711,7 @@ impl ApiCache {
                 );
                 return Ok(CachedJson::gzip(bytes));
             }
-            if let Some(bytes) = self.l1.get_value(&key).await {
+            if let Some(bytes) = self.l1.get_value(&key) {
                 incr(&CACHE_STATS.l1_hit);
                 if options.is_batch {
                     incr(&CACHE_STATS.batch_l1_hit);
@@ -752,7 +751,7 @@ impl ApiCache {
                                     cache_status = cache_status(options, "l2_gzip_hit"),
                                     "api cache L2 gzip hit"
                                 );
-                                self.store_l1_value(gzip, bytes.clone()).await;
+                                self.store_l1_value(gzip, bytes.clone());
                                 Ok(CachedJson::gzip(bytes))
                             }
                             Ok(L2EncodedRead::Identity(bytes)) => {
@@ -764,7 +763,7 @@ impl ApiCache {
                                     cache_status = cache_status(options, "l2_hit"),
                                     "api cache L2 hit, building gzip"
                                 );
-                                self.store_l1_value(key.clone(), bytes.clone()).await;
+                                self.store_l1_value(key.clone(), bytes.clone());
                                 self.encode_response(
                                     bytes,
                                     Some(CacheWriteContext {
@@ -837,7 +836,7 @@ impl ApiCache {
             async {
                 match self.read_l2_combined(server, event_id, &suffix).await {
                     Ok(L2CombinedRead::Dirty { epoch }) => {
-                        self.store_l1_control(control_key, epoch, true).await;
+                        self.store_l1_control(control_key, epoch, true);
                         incr(&CACHE_STATS.dirty_bypass);
                         tracing::debug!(cache_status = "dirty_bypass", "api cache dirty bypass");
                         self.fetch_encoded_with_singleflight(
@@ -849,8 +848,8 @@ impl ApiCache {
                         .await
                     }
                     Ok(L2CombinedRead::Hit { epoch, key, bytes }) => {
-                        self.store_l1_control(control_key, epoch, false).await;
-                        self.store_l1_value(key.clone(), bytes.clone()).await;
+                        self.store_l1_control(control_key, epoch, false);
+                        self.store_l1_value(key.clone(), bytes.clone());
                         incr(&CACHE_STATS.l2_hit);
                         if options.is_batch {
                             incr(&CACHE_STATS.batch_l2_hit);
@@ -874,13 +873,13 @@ impl ApiCache {
                         .await
                     }
                     Ok(L2CombinedRead::NotFound { epoch }) => {
-                        self.store_l1_control(control_key, epoch, false).await;
+                        self.store_l1_control(control_key, epoch, false);
                         incr(&CACHE_STATS.l2_not_found);
                         tracing::debug!(cache_status = "l2_not_found", "api cache negative hit");
                         Err(ApiError::NotFound)
                     }
                     Ok(L2CombinedRead::Miss { epoch, key }) => {
-                        self.store_l1_control(control_key, epoch, false).await;
+                        self.store_l1_control(control_key, epoch, false);
                         incr(&CACHE_STATS.l2_miss);
                         if options.is_batch {
                             incr(&CACHE_STATS.batch_miss);
@@ -1144,10 +1143,7 @@ impl ApiCache {
             .write_l2_if_clean(&ctx, &ctx.value_key, bytes.clone(), ctx.ttl_secs)
             .await
         {
-            Ok(true) => {
-                self.store_l1_value(ctx.value_key.clone(), bytes.clone())
-                    .await
-            }
+            Ok(true) => self.store_l1_value(ctx.value_key.clone(), bytes.clone()),
             Ok(false) => {}
             Err(err) => tracing::warn!(%err, "api cache write failed"),
         }
@@ -1175,7 +1171,7 @@ impl ApiCache {
             return Ok(bytes);
         }
         match self.write_l2_static(&key, bytes.clone(), ttl_secs).await {
-            Ok(()) => self.store_l1_value(key, bytes.clone()).await,
+            Ok(()) => self.store_l1_value(key, bytes.clone()),
             Err(err) => tracing::warn!(%err, "api static cache write failed"),
         }
         Ok(bytes)
@@ -1241,10 +1237,9 @@ impl ApiCache {
             .await
         {
             Ok(true) => {
-                self.store_l1_value(ctx.value_key.clone(), bytes).await;
+                self.store_l1_value(ctx.value_key.clone(), bytes);
                 if encoded.encoding == CachedJsonEncoding::Gzip {
-                    self.store_l1_value(gzip_key(&ctx.value_key), encoded.bytes.clone())
-                        .await;
+                    self.store_l1_value(gzip_key(&ctx.value_key), encoded.bytes.clone());
                 }
             }
             Ok(false) => {}
@@ -1268,10 +1263,7 @@ impl ApiCache {
                 .write_l2_if_clean(&ctx, &gzip_key(&ctx.value_key), gzip.clone(), ctx.ttl_secs)
                 .await
             {
-                Ok(true) => {
-                    self.store_l1_value(gzip_key(&ctx.value_key), gzip.clone())
-                        .await
-                }
+                Ok(true) => self.store_l1_value(gzip_key(&ctx.value_key), gzip.clone()),
                 Ok(false) => {}
                 Err(err) => tracing::warn!(%err, "api cache gzip write failed"),
             }
@@ -1406,36 +1398,31 @@ impl ApiCache {
             })?
     }
 
-    async fn store_l1_control(&self, key: String, epoch: i64, dirty: bool) {
+    fn store_l1_control(&self, key: String, epoch: i64, dirty: bool) {
         if self.cfg.local_control_ttl_ms == 0 {
             return;
         }
-        self.l1
-            .insert_control(
-                key,
-                L1Control {
-                    epoch,
-                    dirty,
-                    expires_at: Instant::now()
-                        + Duration::from_millis(self.cfg.local_control_ttl_ms),
-                },
-            )
-            .await;
+        self.l1.insert_control(
+            key,
+            L1Control {
+                epoch,
+                dirty,
+                expires_at: Instant::now() + Duration::from_millis(self.cfg.local_control_ttl_ms),
+            },
+        );
     }
 
-    async fn store_l1_value(&self, key: String, bytes: Bytes) {
+    fn store_l1_value(&self, key: String, bytes: Bytes) {
         if self.cfg.local_value_ttl_ms == 0 {
             return;
         }
-        self.l1
-            .insert_value(
-                key,
-                L1Value {
-                    bytes,
-                    expires_at: Instant::now() + Duration::from_millis(self.cfg.local_value_ttl_ms),
-                },
-            )
-            .await;
+        self.l1.insert_value(
+            key,
+            L1Value {
+                bytes,
+                expires_at: Instant::now() + Duration::from_millis(self.cfg.local_value_ttl_ms),
+            },
+        );
     }
 }
 
@@ -1472,10 +1459,12 @@ struct L1Cache {
     inner: Arc<L1Shards>,
 }
 
+/// Shards use `std` mutexes: the critical sections never await, so the brief
+/// blocking lock is cheaper than an async mutex on the hot lookup path.
 struct L1Shards {
     max_per_shard: usize,
-    controls: Box<[Mutex<HashMap<String, L1Control>>]>,
-    values: Box<[Mutex<HashMap<String, L1Value>>]>,
+    controls: Box<[StdMutex<HashMap<String, L1Control>>]>,
+    values: Box<[StdMutex<HashMap<String, L1Value>>]>,
 }
 
 #[derive(Clone, Copy)]
@@ -1510,8 +1499,12 @@ trait Expiring {
 impl L1Cache {
     fn new(max_entries: usize) -> Self {
         let max_per_shard = max_entries.div_ceil(L1_SHARDS).max(1);
-        let controls = (0..L1_SHARDS).map(|_| Mutex::new(HashMap::new())).collect();
-        let values = (0..L1_SHARDS).map(|_| Mutex::new(HashMap::new())).collect();
+        let controls = (0..L1_SHARDS)
+            .map(|_| StdMutex::new(HashMap::new()))
+            .collect();
+        let values = (0..L1_SHARDS)
+            .map(|_| StdMutex::new(HashMap::new()))
+            .collect();
         Self {
             max_entries,
             inner: Arc::new(L1Shards {
@@ -1529,9 +1522,9 @@ impl L1Cache {
         (hasher.finish() as usize) % L1_SHARDS
     }
 
-    async fn get_control(&self, key: &str) -> Option<L1Control> {
+    fn get_control(&self, key: &str) -> Option<L1Control> {
         let now = Instant::now();
-        let mut shard = self.inner.controls[Self::shard(key)].lock().await;
+        let mut shard = lock_ignore_poison(&self.inner.controls[Self::shard(key)]);
         match shard.get(key).copied() {
             Some(control) if control.expires_at > now => Some(control),
             Some(_) => {
@@ -1542,18 +1535,18 @@ impl L1Cache {
         }
     }
 
-    async fn insert_control(&self, key: String, value: L1Control) {
+    fn insert_control(&self, key: String, value: L1Control) {
         if self.max_entries == 0 {
             return;
         }
-        let mut shard = self.inner.controls[Self::shard(&key)].lock().await;
+        let mut shard = lock_ignore_poison(&self.inner.controls[Self::shard(&key)]);
         evict_if_full(self.inner.max_per_shard, &mut shard);
         shard.insert(key, value);
     }
 
-    async fn get_value(&self, key: &str) -> Option<Bytes> {
+    fn get_value(&self, key: &str) -> Option<Bytes> {
         let now = Instant::now();
-        let mut shard = self.inner.values[Self::shard(key)].lock().await;
+        let mut shard = lock_ignore_poison(&self.inner.values[Self::shard(key)]);
         match shard.get(key) {
             Some(value) if value.expires_at > now => Some(value.bytes.clone()),
             Some(_) => {
@@ -1564,14 +1557,20 @@ impl L1Cache {
         }
     }
 
-    async fn insert_value(&self, key: String, value: L1Value) {
+    fn insert_value(&self, key: String, value: L1Value) {
         if self.max_entries == 0 {
             return;
         }
-        let mut shard = self.inner.values[Self::shard(&key)].lock().await;
+        let mut shard = lock_ignore_poison(&self.inner.values[Self::shard(&key)]);
         evict_if_full(self.inner.max_per_shard, &mut shard);
         shard.insert(key, value);
     }
+}
+
+fn lock_ignore_poison<T>(mutex: &StdMutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// Make room in a full shard without the thundering-herd of clearing it whole:
@@ -2009,8 +2008,8 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn l1_value_hit_returns_cached_bytes() {
+    #[test]
+    fn l1_value_hit_returns_cached_bytes() {
         let l1 = L1Cache::new(16);
         l1.insert_value(
             "value".to_owned(),
@@ -2018,17 +2017,13 @@ mod tests {
                 bytes: Bytes::from_static(b"cached"),
                 expires_at: Instant::now() + Duration::from_secs(1),
             },
-        )
-        .await;
-
-        assert_eq!(
-            l1.get_value("value").await,
-            Some(Bytes::from_static(b"cached"))
         );
+
+        assert_eq!(l1.get_value("value"), Some(Bytes::from_static(b"cached")));
     }
 
-    #[tokio::test]
-    async fn l1_value_expiry_removes_cached_bytes() {
+    #[test]
+    fn l1_value_expiry_removes_cached_bytes() {
         let l1 = L1Cache::new(16);
         l1.insert_value(
             "value".to_owned(),
@@ -2036,15 +2031,14 @@ mod tests {
                 bytes: Bytes::from_static(b"stale"),
                 expires_at: Instant::now() - Duration::from_secs(1),
             },
-        )
-        .await;
+        );
 
-        assert_eq!(l1.get_value("value").await, None);
-        assert_eq!(l1.get_value("value").await, None);
+        assert_eq!(l1.get_value("value"), None);
+        assert_eq!(l1.get_value("value"), None);
     }
 
-    #[tokio::test]
-    async fn l1_control_tracks_epoch_and_dirty_state() {
+    #[test]
+    fn l1_control_tracks_epoch_and_dirty_state() {
         let l1 = L1Cache::new(16);
         l1.insert_control(
             "control".to_owned(),
@@ -2053,10 +2047,9 @@ mod tests {
                 dirty: true,
                 expires_at: Instant::now() + Duration::from_secs(1),
             },
-        )
-        .await;
+        );
 
-        let control = l1.get_control("control").await.unwrap();
+        let control = l1.get_control("control").unwrap();
         assert_eq!(control.epoch, 7);
         assert!(control.dirty);
     }
@@ -2111,8 +2104,8 @@ mod tests {
         assert!(map.contains_key("live"));
     }
 
-    #[tokio::test]
-    async fn l1_zero_max_entries_disables_storage() {
+    #[test]
+    fn l1_zero_max_entries_disables_storage() {
         let l1 = L1Cache::new(0);
         l1.insert_value(
             "value".to_owned(),
@@ -2120,10 +2113,9 @@ mod tests {
                 bytes: Bytes::from_static(b"cached"),
                 expires_at: Instant::now() + Duration::from_secs(1),
             },
-        )
-        .await;
+        );
 
-        assert_eq!(l1.get_value("value").await, None);
+        assert_eq!(l1.get_value("value"), None);
     }
 
     #[derive(Deserialize, Serialize, PartialEq, Debug)]

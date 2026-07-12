@@ -25,40 +25,52 @@ pub(super) async fn enrich_cloud_rank_infos_with_trace_metrics(
     let Ok(mode) = prepare_user_id_mode(state, &engine, region, event_id).await else {
         return;
     };
-    for rank in ranks {
-        if has_cloud_round_metrics(rank) {
-            continue;
+    let jobs: Vec<(usize, String, i64)> = ranks
+        .iter()
+        .enumerate()
+        .filter(|(_, rank)| !has_cloud_round_metrics(rank))
+        .filter_map(|(idx, rank)| {
+            rank.user_id
+                .as_deref()
+                .filter(|user_id| !user_id.is_empty())
+                .map(|user_id| (idx, user_id.to_owned(), rank.timestamp))
+        })
+        .collect();
+    if jobs.is_empty() {
+        return;
+    }
+    // Per-rank fetches are independent; run them concurrently and let the
+    // trace limiter bound how many actually hit the DB at once.
+    let traces = futures::future::join_all(jobs.into_iter().map(|(idx, user_id, timestamp)| {
+        let engine = engine.clone();
+        async move {
+            let Ok(_permit) = state.query_limiter().acquire_trace(region).await else {
+                return (idx, None);
+            };
+            let filter = cloud_trace_metrics_filter(timestamp);
+            let trace = match character_id {
+                Some(character_id) => {
+                    search_world_bloom_user_trace(
+                        &engine,
+                        event_id,
+                        character_id,
+                        user_id.as_str(),
+                        &filter,
+                        mode,
+                    )
+                    .await
+                }
+                None => search_user_trace(&engine, event_id, user_id.as_str(), &filter, mode).await,
+            };
+            (idx, trace.ok())
         }
-        let Some(user_id) = rank
-            .user_id
-            .as_deref()
-            .filter(|user_id| !user_id.is_empty())
-        else {
-            continue;
-        };
-        let user_id = user_id.to_owned();
-        let Ok(_permit) = state.query_limiter().acquire_trace(region).await else {
-            continue;
-        };
-        let filter = cloud_trace_metrics_filter(rank.timestamp);
-        let trace = match character_id {
-            Some(character_id) => {
-                search_world_bloom_user_trace(
-                    &engine,
-                    event_id,
-                    character_id,
-                    user_id.as_str(),
-                    &filter,
-                    mode,
-                )
-                .await
-            }
-            None => search_user_trace(&engine, event_id, user_id.as_str(), &filter, mode).await,
-        };
-        let Ok(trace) = trace else {
-            continue;
-        };
-        apply_cloud_trace_metrics_at(rank, &trace, Utc::now());
+    }))
+    .await;
+    let now = Utc::now();
+    for (idx, trace) in traces {
+        if let Some(trace) = trace {
+            apply_cloud_trace_metrics_at(&mut ranks[idx], &trace, now);
+        }
     }
 }
 

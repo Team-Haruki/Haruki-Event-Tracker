@@ -386,9 +386,13 @@ impl EventTrackerBase {
     }
 
     async fn handle_ranking_data(&mut self) -> Result<HandledRankingData, TrackerError> {
-        let top100: Top100RankingResponse = self.api.get_top100(self.server, self.event_id).await?;
-        let (border_hash, border): ([u8; 32], BorderRankingResponse) =
-            self.api.get_border(self.server, self.event_id).await?;
+        let (top100, (border_hash, border)): (
+            Top100RankingResponse,
+            ([u8; 32], BorderRankingResponse),
+        ) = tokio::try_join!(
+            self.api.get_top100(self.server, self.event_id),
+            self.api.get_border(self.server, self.event_id)
+        )?;
 
         let record_time = Utc::now().timestamp();
         let main_top100 = top100.rankings;

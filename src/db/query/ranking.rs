@@ -16,7 +16,7 @@ use crate::model::api::RecordedRankingSchema;
 
 /// Build the shared `SELECT t.timestamp, u.user_id, e.score, e.rank FROM event_<id> e
 /// INNER JOIN event_<id>_time_id t ... INNER JOIN event_<id>_users u ...` query.
-fn ranking_select(event_id: i64, mode: PublicUserIdMode) -> SelectStatement {
+pub(crate) fn ranking_select(event_id: i64, mode: PublicUserIdMode) -> SelectStatement {
     let event_tbl = Alias::new(intern(TableKind::Event, event_id));
     let time_tbl = Alias::new(intern(TableKind::TimeId, event_id));
     let users_tbl = Alias::new(intern(TableKind::EventUsers, event_id));
