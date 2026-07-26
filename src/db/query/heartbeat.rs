@@ -6,13 +6,11 @@
 //! `/status` endpoint can report freshness without having to read any
 //! ranking table.
 
-use sea_orm::sea_query::{Alias, Expr, Order, Query};
-use sea_orm::{DatabaseBackend, DbErr, ExprTrait, FromQueryResult, TransactionTrait};
-use std::collections::HashSet;
+use sea_orm::sea_query::{Alias, Expr, OnConflict, Order, Query};
+use sea_orm::{ConnectionTrait, DatabaseBackend, DbErr, ExprTrait, FromQueryResult};
 
 use crate::db::engine::DatabaseEngine;
 use crate::db::entity::time_id;
-use crate::db::query::batch::batch_get_or_create_time_ids;
 use crate::db::table_name::{TableKind, intern};
 
 #[derive(FromQueryResult)]
@@ -45,23 +43,22 @@ pub async fn write_heartbeat(
     timestamp: i64,
     status: i16,
 ) -> Result<(), DbErr> {
-    let backend = engine.backend();
     let table = intern(TableKind::TimeId, event_id);
-    engine
-        .conn()
-        .transaction::<_, (), DbErr>(|tx| {
-            Box::pin(async move {
-                let mut set = HashSet::with_capacity(1);
-                set.insert(timestamp);
-                batch_get_or_create_time_ids(tx, backend, table, &set, status).await?;
-                Ok(())
-            })
-        })
-        .await
-        .map_err(|e| match e {
-            sea_orm::TransactionError::Connection(err) => err,
-            sea_orm::TransactionError::Transaction(err) => err,
-        })
+    // The caller never reads the generated `time_id` back, so a single
+    // conflict-ignoring insert replaces the SELECT/INSERT/re-SELECT
+    // transaction this used to share with the batch writer.
+    let ins = Query::insert()
+        .into_table(Alias::new(table))
+        .columns([time_id::Column::Timestamp, time_id::Column::Status])
+        .values_panic([timestamp.into(), status.into()])
+        .on_conflict(
+            OnConflict::column(time_id::Column::Timestamp)
+                .do_nothing_on([time_id::Column::Timestamp])
+                .to_owned(),
+        )
+        .to_owned();
+    engine.conn().execute(&ins).await?;
+    Ok(())
 }
 
 #[tracing::instrument(skip(engine), fields(event_id))]

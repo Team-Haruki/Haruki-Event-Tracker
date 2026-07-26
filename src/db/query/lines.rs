@@ -4,8 +4,14 @@
 //! Per-rank query errors are silently dropped — matching the Go reference,
 //! which discards goroutine errors and only collects rows that actually
 //! came back.
+//!
+//! Each per-rank query orders by the ranking table's own `time_id`
+//! (monotone with `timestamp`) so the `(rank, time_id)` index serves it as
+//! a single backward seek, and the fan-out is bounded so one request can't
+//! drain the connection pool out from under the tracker's write path.
 
-use futures::future;
+use futures::StreamExt;
+use futures::stream;
 use sea_orm::sea_query::{Alias, Expr, Order, Query};
 use sea_orm::{DbErr, ExprTrait, FromQueryResult};
 
@@ -13,6 +19,8 @@ use crate::db::engine::DatabaseEngine;
 use crate::db::entity::{event, time_id, world_bloom};
 use crate::db::table_name::{TableKind, intern};
 use crate::model::api::RankingLineScoreSchema;
+
+const LINES_CONCURRENCY: usize = 8;
 
 #[tracing::instrument(skip(engine, ranks), fields(event_id, ranks_len = ranks.len()))]
 pub async fn fetch_ranking_lines(
@@ -25,7 +33,7 @@ pub async fn fetch_ranking_lines(
     let event_tbl = intern(TableKind::Event, event_id);
     let time_tbl = intern(TableKind::TimeId, event_id);
 
-    let futs = ranks.iter().copied().map(|rank| {
+    let futs = ranks.iter().copied().enumerate().map(|(idx, rank)| {
         let mut stmt = Query::select()
             .expr_as(
                 Expr::col((Alias::new(time_tbl), time_id::Column::Timestamp)),
@@ -52,23 +60,25 @@ pub async fn fetch_ranking_lines(
                 Expr::col((Alias::new(time_tbl), time_id::Column::Timestamp)).lte(timestamp),
             );
         }
-        stmt.order_by(
-            (Alias::new(time_tbl), time_id::Column::Timestamp),
-            Order::Desc,
-        )
-        .limit(1);
+        stmt.order_by((Alias::new(event_tbl), event::Column::TimeId), Order::Desc)
+            .limit(1);
 
         async move {
-            RankingLineScoreSchema::find_by_statement(backend.build(&stmt))
+            let row = RankingLineScoreSchema::find_by_statement(backend.build(&stmt))
                 .one(engine.conn())
-                .await
+                .await;
+            (idx, row)
         }
     });
 
-    let results = future::join_all(futs).await;
+    let mut results: Vec<_> = stream::iter(futs)
+        .buffer_unordered(LINES_CONCURRENCY)
+        .collect()
+        .await;
+    results.sort_unstable_by_key(|(idx, _)| *idx);
     Ok(results
         .into_iter()
-        .filter_map(|r| r.ok().flatten())
+        .filter_map(|(_, r)| r.ok().flatten())
         .collect())
 }
 
@@ -84,7 +94,7 @@ pub async fn fetch_world_bloom_ranking_lines(
     let wl_tbl = intern(TableKind::WorldBloom, event_id);
     let time_tbl = intern(TableKind::TimeId, event_id);
 
-    let futs = ranks.iter().copied().map(|rank| {
+    let futs = ranks.iter().copied().enumerate().map(|(idx, rank)| {
         let mut stmt = Query::select()
             .expr_as(
                 Expr::col((Alias::new(time_tbl), time_id::Column::Timestamp)),
@@ -115,21 +125,26 @@ pub async fn fetch_world_bloom_ranking_lines(
             );
         }
         stmt.order_by(
-            (Alias::new(time_tbl), time_id::Column::Timestamp),
+            (Alias::new(wl_tbl), world_bloom::Column::TimeId),
             Order::Desc,
         )
         .limit(1);
 
         async move {
-            RankingLineScoreSchema::find_by_statement(backend.build(&stmt))
+            let row = RankingLineScoreSchema::find_by_statement(backend.build(&stmt))
                 .one(engine.conn())
-                .await
+                .await;
+            (idx, row)
         }
     });
 
-    let results = future::join_all(futs).await;
+    let mut results: Vec<_> = stream::iter(futs)
+        .buffer_unordered(LINES_CONCURRENCY)
+        .collect()
+        .await;
+    results.sort_unstable_by_key(|(idx, _)| *idx);
     Ok(results
         .into_iter()
-        .filter_map(|r| r.ok().flatten())
+        .filter_map(|(_, r)| r.ok().flatten())
         .collect())
 }

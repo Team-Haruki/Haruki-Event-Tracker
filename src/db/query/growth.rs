@@ -2,13 +2,14 @@
 //! `/score-growths` endpoint (Go: `FetchRankingScoreGrowths`,
 //! `FetchWorldBloomRankingScoreGrowths`).
 //!
-//! For each rank we fetch all rows since `start_time` ordered ASC and
-//! compute `(latest - earliest)` for both score and timestamp. Ranks with
-//! fewer than two rows are skipped. Errors are silently dropped to mirror
-//! the Go goroutines.
+//! For each rank we only need the earliest and latest row in the window, so
+//! we issue two `LIMIT 1` index seeks (ASC + DESC) instead of streaming the
+//! whole window. Ranks with fewer than two rows are skipped. Errors are
+//! silently dropped to mirror the Go goroutines.
 
-use futures::future;
-use sea_orm::sea_query::{Alias, Expr, Order, Query};
+use futures::StreamExt;
+use futures::stream;
+use sea_orm::sea_query::{Alias, Expr, Order, Query, SelectStatement};
 use sea_orm::{DbErr, ExprTrait, FromQueryResult};
 
 use crate::db::engine::DatabaseEngine;
@@ -16,12 +17,16 @@ use crate::db::entity::{event, time_id, world_bloom};
 use crate::db::table_name::{TableKind, intern};
 use crate::model::api::{RankingLineScoreSchema, RankingScoreGrowthSchema};
 
-fn build_growth(rank: i64, rows: Vec<RankingLineScoreSchema>) -> Option<RankingScoreGrowthSchema> {
-    if rows.len() < 2 {
+fn build_growth(
+    rank: i64,
+    earlier: RankingLineScoreSchema,
+    latest: RankingLineScoreSchema,
+) -> Option<RankingScoreGrowthSchema> {
+    // Same earliest and latest row means the window holds a single sample,
+    // which the full-window variant skipped via `rows.len() < 2`.
+    if earlier.timestamp == latest.timestamp {
         return None;
     }
-    let earlier = rows.first()?;
-    let latest = rows.last()?;
     let growth = latest.score - earlier.score;
     let diff = latest.timestamp - earlier.timestamp;
     Some(RankingScoreGrowthSchema {
@@ -35,6 +40,42 @@ fn build_growth(rank: i64, rows: Vec<RankingLineScoreSchema>) -> Option<RankingS
     })
 }
 
+const GROWTH_CONCURRENCY: usize = 8;
+
+async fn fetch_window_edges(
+    engine: &DatabaseEngine,
+    rank_tbl: &'static str,
+    base: SelectStatement,
+) -> Result<
+    (
+        Option<RankingLineScoreSchema>,
+        Option<RankingLineScoreSchema>,
+    ),
+    DbErr,
+> {
+    let backend = engine.backend();
+    // Order by the ranking table's own `time_id` (monotone with
+    // `timestamp`) so the `(rank, time_id)` index serves each edge as a
+    // single seek — see the note in `ranking.rs`.
+    let earliest = base
+        .clone()
+        .order_by((Alias::new(rank_tbl), Alias::new("time_id")), Order::Asc)
+        .limit(1)
+        .to_owned();
+    let latest = base
+        .clone()
+        .order_by((Alias::new(rank_tbl), Alias::new("time_id")), Order::Desc)
+        .limit(1)
+        .to_owned();
+    let earliest = RankingLineScoreSchema::find_by_statement(backend.build(&earliest))
+        .one(engine.conn())
+        .await?;
+    let latest = RankingLineScoreSchema::find_by_statement(backend.build(&latest))
+        .one(engine.conn())
+        .await?;
+    Ok((earliest, latest))
+}
+
 #[tracing::instrument(skip(engine, ranks), fields(event_id, ranks_len = ranks.len(), start_time))]
 pub async fn fetch_ranking_score_growths(
     engine: &DatabaseEngine,
@@ -43,12 +84,11 @@ pub async fn fetch_ranking_score_growths(
     start_time: i64,
     end_time: Option<i64>,
 ) -> Result<Vec<RankingScoreGrowthSchema>, DbErr> {
-    let backend = engine.backend();
     let event_tbl = intern(TableKind::Event, event_id);
     let time_tbl = intern(TableKind::TimeId, event_id);
 
     let futs = ranks.iter().copied().map(|rank| {
-        let mut stmt = Query::select()
+        let mut base = Query::select()
             .expr_as(
                 Expr::col((Alias::new(time_tbl), time_id::Column::Timestamp)),
                 Alias::new("timestamp"),
@@ -73,27 +113,24 @@ pub async fn fetch_ranking_score_growths(
             )
             .to_owned();
         if let Some(end_time) = end_time {
-            stmt.and_where(
+            base.and_where(
                 Expr::col((Alias::new(time_tbl), time_id::Column::Timestamp)).lte(end_time),
             );
         }
-        stmt.order_by(
-            (Alias::new(time_tbl), time_id::Column::Timestamp),
-            Order::Asc,
-        );
 
-        async move {
-            let rows = RankingLineScoreSchema::find_by_statement(backend.build(&stmt))
-                .all(engine.conn())
-                .await;
-            (rank, rows)
-        }
+        async move { (rank, fetch_window_edges(engine, event_tbl, base).await) }
     });
 
-    let results = future::join_all(futs).await;
+    let results: Vec<_> = stream::iter(futs)
+        .buffered(GROWTH_CONCURRENCY)
+        .collect()
+        .await;
     Ok(results
         .into_iter()
-        .filter_map(|(rank, res)| res.ok().and_then(|rows| build_growth(rank, rows)))
+        .filter_map(|(rank, res)| {
+            let (earliest, latest) = res.ok()?;
+            build_growth(rank, earliest?, latest?)
+        })
         .collect())
 }
 
@@ -106,12 +143,11 @@ pub async fn fetch_world_bloom_ranking_score_growths(
     start_time: i64,
     end_time: Option<i64>,
 ) -> Result<Vec<RankingScoreGrowthSchema>, DbErr> {
-    let backend = engine.backend();
     let wl_tbl = intern(TableKind::WorldBloom, event_id);
     let time_tbl = intern(TableKind::TimeId, event_id);
 
     let futs = ranks.iter().copied().map(|rank| {
-        let mut stmt = Query::select()
+        let mut base = Query::select()
             .expr_as(
                 Expr::col((Alias::new(time_tbl), time_id::Column::Timestamp)),
                 Alias::new("timestamp"),
@@ -139,26 +175,23 @@ pub async fn fetch_world_bloom_ranking_score_growths(
             )
             .to_owned();
         if let Some(end_time) = end_time {
-            stmt.and_where(
+            base.and_where(
                 Expr::col((Alias::new(time_tbl), time_id::Column::Timestamp)).lte(end_time),
             );
         }
-        stmt.order_by(
-            (Alias::new(time_tbl), time_id::Column::Timestamp),
-            Order::Asc,
-        );
 
-        async move {
-            let rows = RankingLineScoreSchema::find_by_statement(backend.build(&stmt))
-                .all(engine.conn())
-                .await;
-            (rank, rows)
-        }
+        async move { (rank, fetch_window_edges(engine, wl_tbl, base).await) }
     });
 
-    let results = future::join_all(futs).await;
+    let results: Vec<_> = stream::iter(futs)
+        .buffered(GROWTH_CONCURRENCY)
+        .collect()
+        .await;
     Ok(results
         .into_iter()
-        .filter_map(|(rank, res)| res.ok().and_then(|rows| build_growth(rank, rows)))
+        .filter_map(|(rank, res)| {
+            let (earliest, latest) = res.ok()?;
+            build_growth(rank, earliest?, latest?)
+        })
         .collect())
 }

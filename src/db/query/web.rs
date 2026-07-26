@@ -16,6 +16,10 @@ use crate::model::api::{
 pub struct WebRankingFilter {
     pub rank_min: Option<i64>,
     pub rank_max: Option<i64>,
+    /// Restrict to exactly these ranks. Cheaper than a `rank_min..=rank_max`
+    /// span when only a few scattered ranks are wanted (ranking lines,
+    /// snapshots), since the window subquery then groups over just those.
+    pub rank_in: Option<Vec<i64>>,
     pub score_min: Option<i64>,
     pub score_max: Option<i64>,
     pub start_time: Option<i64>,
@@ -29,7 +33,15 @@ pub struct WebRankingFilter {
 
 impl WebRankingFilter {
     fn is_rank_window(&self) -> bool {
-        self.rank_min.is_some() || self.rank_max.is_some()
+        self.rank_min.is_some() || self.rank_max.is_some() || self.rank_in.is_some()
+    }
+
+    fn has_time_filter(&self) -> bool {
+        self.start_time.is_some()
+            || self.end_time.is_some()
+            || self.before.is_some()
+            || self.after.is_some()
+            || self.timestamp.is_some()
     }
 }
 
@@ -113,15 +125,6 @@ impl RankingPageRow {
         }
     }
 
-    fn into_schema(self) -> RecordedRankingSchema {
-        RecordedRankingSchema {
-            timestamp: self.timestamp,
-            user_id: self.user_id,
-            score: self.score,
-            rank: self.rank,
-        }
-    }
-
     pub fn into_web_item(self) -> WebRankingItemSchema {
         let rank_data = RecordedRankData::Normal(self.clone_rank_schema());
         WebRankingItemSchema {
@@ -183,16 +186,6 @@ impl WorldBloomRankingPageRow {
             timestamp: self.timestamp,
             rank: self.rank,
             user_id_key: self.user_id_key,
-        }
-    }
-
-    fn into_schema(self) -> RecordedWorldBloomRankingSchema {
-        RecordedWorldBloomRankingSchema {
-            timestamp: self.timestamp,
-            user_id: self.user_id,
-            score: self.score,
-            rank: self.rank,
-            character_id: self.character_id,
         }
     }
 
@@ -536,23 +529,34 @@ fn latest_rank_window_select(
             Expr::col((event_tbl.clone(), event::Column::TimeId)).max(),
             Alias::new("time_id"),
         )
-        .from(event_tbl.clone())
-        .inner_join(
+        .from(event_tbl.clone());
+    // The time table is only needed to translate time filters into
+    // `time_id`s; without them, `MAX(time_id) GROUP BY rank` runs entirely
+    // on the `(rank, time_id)` index instead of probing the time table for
+    // every history row in the rank range.
+    if filter.has_time_filter() {
+        latest.inner_join(
             time_tbl.clone(),
             Expr::col((event_tbl.clone(), event::Column::TimeId))
                 .equals((time_tbl.clone(), time_id::Column::TimeId)),
         );
+        apply_rank_window_time_filters(
+            &mut latest,
+            Expr::col((time_tbl.clone(), time_id::Column::Timestamp)),
+            filter,
+        );
+    }
     if let Some(rank_min) = filter.rank_min {
         latest.and_where(Expr::col((event_tbl.clone(), event::Column::Rank)).gte(rank_min));
     }
     if let Some(rank_max) = filter.rank_max {
         latest.and_where(Expr::col((event_tbl.clone(), event::Column::Rank)).lte(rank_max));
     }
-    apply_rank_window_time_filters(
-        &mut latest,
-        Expr::col((time_tbl.clone(), time_id::Column::Timestamp)),
-        filter,
-    );
+    if let Some(ranks) = &filter.rank_in {
+        latest.and_where(
+            Expr::col((event_tbl.clone(), event::Column::Rank)).is_in(ranks.iter().copied()),
+        );
+    }
     apply_rank_window_score_filters(
         &mut latest,
         Expr::col((event_tbl.clone(), event::Column::Score)),
@@ -640,23 +644,30 @@ fn latest_world_bloom_rank_window_select(
             Alias::new("time_id"),
         )
         .from(wl_tbl.clone())
-        .inner_join(
+        .and_where(Expr::col((wl_tbl.clone(), world_bloom::Column::CharacterId)).eq(character_id));
+    if filter.has_time_filter() {
+        latest.inner_join(
             time_tbl.clone(),
             Expr::col((wl_tbl.clone(), world_bloom::Column::TimeId))
                 .equals((time_tbl.clone(), time_id::Column::TimeId)),
-        )
-        .and_where(Expr::col((wl_tbl.clone(), world_bloom::Column::CharacterId)).eq(character_id));
+        );
+        apply_rank_window_time_filters(
+            &mut latest,
+            Expr::col((time_tbl.clone(), time_id::Column::Timestamp)),
+            filter,
+        );
+    }
     if let Some(rank_min) = filter.rank_min {
         latest.and_where(Expr::col((wl_tbl.clone(), world_bloom::Column::Rank)).gte(rank_min));
     }
     if let Some(rank_max) = filter.rank_max {
         latest.and_where(Expr::col((wl_tbl.clone(), world_bloom::Column::Rank)).lte(rank_max));
     }
-    apply_rank_window_time_filters(
-        &mut latest,
-        Expr::col((time_tbl.clone(), time_id::Column::Timestamp)),
-        filter,
-    );
+    if let Some(ranks) = &filter.rank_in {
+        latest.and_where(
+            Expr::col((wl_tbl.clone(), world_bloom::Column::Rank)).is_in(ranks.iter().copied()),
+        );
+    }
     apply_rank_window_score_filters(
         &mut latest,
         Expr::col((wl_tbl.clone(), world_bloom::Column::Score)),
@@ -969,7 +980,10 @@ pub async fn search_user_trace(
 ) -> Result<Vec<RecordedRankData>, DbErr> {
     let users_tbl = Alias::new(intern(TableKind::EventUsers, event_id));
     let time_tbl = Alias::new(intern(TableKind::TimeId, event_id));
-    let mut stmt = ranking_select(event_id, mode);
+    // Traces only surface `(timestamp, user_id, score, rank)`; the lean
+    // select skips the users-table profile columns (three of them multi-KB
+    // JSON blobs) that `ranking_select` drags along for page rows.
+    let mut stmt = crate::db::query::ranking::ranking_select(event_id, mode);
     stmt.and_where(Expr::col((users_tbl, mode.output_column())).eq(user_id));
     apply_trace_filters(
         &mut stmt,
@@ -982,13 +996,14 @@ pub async fn search_user_trace(
     }
 
     let backend = engine.backend();
-    Ok(RankingPageRow::find_by_statement(backend.build(&stmt))
-        .all(engine.conn())
-        .await?
-        .into_iter()
-        .map(RankingPageRow::into_schema)
-        .map(RecordedRankData::Normal)
-        .collect())
+    Ok(
+        RecordedRankingSchema::find_by_statement(backend.build(&stmt))
+            .all(engine.conn())
+            .await?
+            .into_iter()
+            .map(RecordedRankData::Normal)
+            .collect(),
+    )
 }
 
 #[tracing::instrument(skip(engine, filter), fields(event_id, character_id, user_id = %user_id))]
@@ -1003,7 +1018,7 @@ pub async fn search_world_bloom_user_trace(
     let users_tbl = Alias::new(intern(TableKind::EventUsers, event_id));
     let wl_tbl = Alias::new(intern(TableKind::WorldBloom, event_id));
     let time_tbl = Alias::new(intern(TableKind::TimeId, event_id));
-    let mut stmt = world_bloom_select(event_id, mode);
+    let mut stmt = crate::db::query::world_bloom::wl_select(event_id, mode);
     stmt.and_where(Expr::col((users_tbl, mode.output_column())).eq(user_id))
         .and_where(Expr::col((wl_tbl, world_bloom::Column::CharacterId)).eq(character_id));
     apply_trace_filters(
@@ -1018,11 +1033,10 @@ pub async fn search_world_bloom_user_trace(
 
     let backend = engine.backend();
     Ok(
-        WorldBloomRankingPageRow::find_by_statement(backend.build(&stmt))
+        RecordedWorldBloomRankingSchema::find_by_statement(backend.build(&stmt))
             .all(engine.conn())
             .await?
             .into_iter()
-            .map(WorldBloomRankingPageRow::into_schema)
             .map(RecordedRankData::WorldBloom)
             .collect(),
     )
@@ -1038,7 +1052,7 @@ pub async fn search_rank_trace(
 ) -> Result<Vec<RecordedRankData>, DbErr> {
     let event_tbl = Alias::new(intern(TableKind::Event, event_id));
     let time_tbl = Alias::new(intern(TableKind::TimeId, event_id));
-    let mut stmt = ranking_select(event_id, mode);
+    let mut stmt = crate::db::query::ranking::ranking_select(event_id, mode);
     stmt.and_where(Expr::col((event_tbl, event::Column::Rank)).eq(rank));
     apply_trace_filters(
         &mut stmt,
@@ -1051,13 +1065,14 @@ pub async fn search_rank_trace(
     }
 
     let backend = engine.backend();
-    Ok(RankingPageRow::find_by_statement(backend.build(&stmt))
-        .all(engine.conn())
-        .await?
-        .into_iter()
-        .map(RankingPageRow::into_schema)
-        .map(RecordedRankData::Normal)
-        .collect())
+    Ok(
+        RecordedRankingSchema::find_by_statement(backend.build(&stmt))
+            .all(engine.conn())
+            .await?
+            .into_iter()
+            .map(RecordedRankData::Normal)
+            .collect(),
+    )
 }
 
 #[tracing::instrument(skip(engine, filter), fields(event_id, character_id, rank))]
@@ -1071,7 +1086,7 @@ pub async fn search_world_bloom_rank_trace(
 ) -> Result<Vec<RecordedRankData>, DbErr> {
     let wl_tbl = Alias::new(intern(TableKind::WorldBloom, event_id));
     let time_tbl = Alias::new(intern(TableKind::TimeId, event_id));
-    let mut stmt = world_bloom_select(event_id, mode);
+    let mut stmt = crate::db::query::world_bloom::wl_select(event_id, mode);
     stmt.and_where(Expr::col((wl_tbl.clone(), world_bloom::Column::Rank)).eq(rank))
         .and_where(Expr::col((wl_tbl, world_bloom::Column::CharacterId)).eq(character_id));
     apply_trace_filters(
@@ -1086,11 +1101,10 @@ pub async fn search_world_bloom_rank_trace(
 
     let backend = engine.backend();
     Ok(
-        WorldBloomRankingPageRow::find_by_statement(backend.build(&stmt))
+        RecordedWorldBloomRankingSchema::find_by_statement(backend.build(&stmt))
             .all(engine.conn())
             .await?
             .into_iter()
-            .map(WorldBloomRankingPageRow::into_schema)
             .map(RecordedRankData::WorldBloom)
             .collect(),
     )
@@ -1342,6 +1356,7 @@ mod tests {
         let filter = WebRankingFilter {
             rank_min: Some(1),
             rank_max: Some(2),
+            rank_in: None,
             score_min: None,
             score_max: None,
             start_time: None,
@@ -1385,6 +1400,7 @@ mod tests {
         let filter = WebRankingFilter {
             rank_min: Some(1),
             rank_max: Some(3),
+            rank_in: None,
             score_min: None,
             score_max: None,
             start_time: None,
@@ -1442,6 +1458,7 @@ mod tests {
         let filter = WebRankingFilter {
             rank_min: Some(1),
             rank_max: Some(3),
+            rank_in: None,
             score_min: None,
             score_max: None,
             start_time: None,
@@ -1615,6 +1632,7 @@ mod tests {
         let filter = WebRankingFilter {
             rank_min: Some(1),
             rank_max: Some(3),
+            rank_in: None,
             score_min: None,
             score_max: None,
             start_time: None,
@@ -1665,6 +1683,7 @@ mod tests {
         let filter = WebRankingFilter {
             rank_min: Some(1),
             rank_max: Some(3),
+            rank_in: None,
             score_min: None,
             score_max: None,
             start_time: None,
@@ -1723,6 +1742,7 @@ mod tests {
         let filter = WebRankingFilter {
             rank_min: Some(1),
             rank_max: Some(3),
+            rank_in: None,
             score_min: None,
             score_max: None,
             start_time: None,
@@ -1780,6 +1800,7 @@ mod tests {
         let filter = WebRankingFilter {
             rank_min: Some(1),
             rank_max: Some(3),
+            rank_in: None,
             score_min: None,
             score_max: None,
             start_time: None,

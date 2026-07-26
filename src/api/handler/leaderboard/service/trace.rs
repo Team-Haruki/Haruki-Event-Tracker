@@ -5,7 +5,7 @@ use crate::api::extract::{prepare_user_id_mode, resolve_region_engine};
 use crate::api::handler::web::cached_trace;
 use crate::api::state::AppState;
 use crate::db::engine::DatabaseEngine;
-use crate::db::query::ranking::{fetch_all_rankings, fetch_latest_ranking_by_rank};
+use crate::db::query::ranking::{fetch_latest_ranking, fetch_latest_ranking_by_rank};
 use crate::db::query::user::{PublicUserIdMode, get_user_data};
 use crate::db::query::web::{
     WebTraceFilter, search_rank_trace, search_user_trace, search_world_bloom_rank_trace,
@@ -236,8 +236,8 @@ async fn fetch_latest_user_rank(
     user_id: &str,
     mode: PublicUserIdMode,
 ) -> Result<Option<WebRankingItemSchema>, ApiError> {
-    let rows = fetch_all_rankings(engine, event_id, user_id, mode).await?;
-    Ok(rows.into_iter().last().map(|rank| WebRankingItemSchema {
+    let latest = fetch_latest_ranking(engine, event_id, user_id, mode).await?;
+    Ok(latest.map(|rank| WebRankingItemSchema {
         rank_data: RecordedRankData::Normal(rank),
         user_data: None,
     }))

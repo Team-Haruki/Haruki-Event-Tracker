@@ -24,14 +24,19 @@ async fn main() -> ExitCode {
         (!cfg.backend.main_log_file.is_empty()).then(|| cfg.backend.main_log_file.clone());
     let access_log_file =
         (!cfg.backend.access_log_path.is_empty()).then(|| cfg.backend.access_log_path.clone());
-    if let Err(err) = logger::init(
+    // Keeps the non-blocking log worker threads alive; dropped on exit so
+    // buffered lines flush.
+    let _log_guards = match logger::init(
         &cfg.backend.log_level,
         log_file.as_deref(),
         access_log_file.as_deref(),
     ) {
-        eprintln!("failed to init logger: {err}");
-        return ExitCode::from(1);
-    }
+        Ok(guards) => guards,
+        Err(err) => {
+            eprintln!("failed to init logger: {err}");
+            return ExitCode::from(1);
+        }
+    };
 
     tracing::info!(
         "========================= Haruki Event Tracker v{} =========================",

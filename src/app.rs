@@ -158,8 +158,21 @@ pub async fn build(cfg: &Config) -> Result<AppContext, BootstrapError> {
         let job = Job::new_async(cron_expr.as_str(), move |_uuid, _l| {
             let daemon = daemon_for_job.clone();
             Box::pin(async move {
-                tracing::info!(server = %server_label, "tracker tick");
-                daemon.lock().await.track_ranking_data().await;
+                // A tick that outlives the cron interval must not queue the
+                // next firing behind the mutex — back-to-back stale ticks
+                // would pile onto an already slow upstream/DB.
+                match daemon.try_lock() {
+                    Ok(mut daemon) => {
+                        tracing::info!(server = %server_label, "tracker tick");
+                        daemon.track_ranking_data().await;
+                    }
+                    Err(_) => {
+                        tracing::warn!(
+                            server = %server_label,
+                            "previous tracker tick still running; skipping this tick"
+                        );
+                    }
+                }
             })
         })?;
         scheduler

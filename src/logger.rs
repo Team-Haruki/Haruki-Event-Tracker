@@ -1,11 +1,11 @@
 use std::fs::OpenOptions;
 use std::io;
 use std::path::Path;
-use std::sync::Mutex;
 
 use chrono::Local;
 use tracing::field::{Field, Visit};
 use tracing::{Event, Level, Subscriber};
+use tracing_appender::non_blocking::{NonBlockingBuilder, WorkerGuard};
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::filter::{LevelFilter, Targets};
 use tracing_subscriber::fmt::format::Writer;
@@ -259,11 +259,16 @@ fn open_log_file(path: &Path) -> Result<std::fs::File, LoggerError> {
 /// - `access_log_file` (optional): only `target = "access"` events, no ANSI.
 ///   Empty path disables; access events still go to stdout (and the main
 ///   file when no access path is configured) so dev runs don't lose them.
+///
+/// File sinks write through `tracing_appender`'s non-blocking worker thread
+/// (non-lossy), so request-path log calls never perform the file syscall
+/// inline. The returned `WorkerGuard`s must stay alive for the process
+/// lifetime or buffered lines are dropped on exit.
 pub fn init<P: AsRef<Path>>(
     level: &str,
     main_log_file: Option<P>,
     access_log_file: Option<P>,
-) -> Result<(), LoggerError> {
+) -> Result<Vec<WorkerGuard>, LoggerError> {
     let level_filter = parse_level(level);
     let env_filter = EnvFilter::builder()
         .with_default_directive(level_filter.into())
@@ -278,13 +283,17 @@ pub fn init<P: AsRef<Path>>(
         .map(|p| p.as_ref())
         .filter(|p| !p.as_os_str().is_empty());
 
+    let mut guards = Vec::new();
+
     let access_layer = match access_path {
         Some(path) => {
             let f = open_log_file(path)?;
+            let (writer, guard) = NonBlockingBuilder::default().lossy(false).finish(f);
+            guards.push(guard);
             Some(
                 fmt::layer()
                     .event_format(HarukiFormat { ansi: false })
-                    .with_writer(Mutex::new(f))
+                    .with_writer(writer)
                     .with_filter(Targets::new().with_target(ACCESS_TARGET, LevelFilter::TRACE)),
             )
         }
@@ -299,12 +308,14 @@ pub fn init<P: AsRef<Path>>(
     let main_file_layer = match main_path {
         Some(path) => {
             let f = open_log_file(path)?;
+            let (writer, guard) = NonBlockingBuilder::default().lossy(false).finish(f);
+            guards.push(guard);
             // When access goes to its own file we exclude it from the main
             // file; otherwise keep it in the main file so a single
             // `main_log_file` config still captures everything.
             let layer = fmt::layer()
                 .event_format(HarukiFormat { ansi: false })
-                .with_writer(Mutex::new(f));
+                .with_writer(writer);
             let layer = if access_path.is_some() {
                 layer
                     .with_filter(
@@ -327,5 +338,5 @@ pub fn init<P: AsRef<Path>>(
         .with(main_file_layer)
         .with(access_layer)
         .try_init()?;
-    Ok(())
+    Ok(guards)
 }

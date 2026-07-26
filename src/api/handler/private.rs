@@ -304,16 +304,24 @@ async fn web_user_detail_for_scope(
             .map(RecordedRankData::Normal),
     };
     let rank = current.as_ref().map(rank_of_rank_data);
-    let previous = if let Some(rank) = rank.filter(|rank| *rank > 1) {
-        fetch_rank_item(&engine, event_id, character_id, rank - 1, mode).await?
-    } else {
-        None
-    };
-    let next = if let Some(rank) = rank {
-        fetch_rank_item(&engine, event_id, character_id, rank + 1, mode).await?
-    } else {
-        None
-    };
+    let (previous, next) = tokio::try_join!(
+        async {
+            match rank.filter(|rank| *rank > 1) {
+                Some(rank) => {
+                    fetch_rank_item(&engine, event_id, character_id, rank - 1, mode).await
+                }
+                None => Ok(None),
+            }
+        },
+        async {
+            match rank {
+                Some(rank) => {
+                    fetch_rank_item(&engine, event_id, character_id, rank + 1, mode).await
+                }
+                None => Ok(None),
+            }
+        },
+    )?;
     let current = current.map(|rank_data| WebRankingItemSchema {
         rank_data,
         user_data: None,

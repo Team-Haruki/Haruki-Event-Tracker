@@ -135,10 +135,10 @@ async fn fetch_snapshot_items(
     if ranks.is_empty() {
         return Ok(BTreeMap::new());
     }
-    let max_rank = ranks.iter().copied().max().unwrap_or(0);
     let filter = WebRankingFilter {
-        rank_min: Some(1),
-        rank_max: Some(max_rank),
+        rank_min: None,
+        rank_max: None,
+        rank_in: Some(ranks.to_vec()),
         score_min: None,
         score_max: None,
         start_time: None,
@@ -147,7 +147,7 @@ async fn fetch_snapshot_items(
         after: None,
         timestamp: at,
         cursor: None,
-        limit: max_rank as u64,
+        limit: ranks.len() as u64,
     };
     let wanted = ranks.iter().copied().collect::<BTreeSet<_>>();
     let mut out = BTreeMap::new();

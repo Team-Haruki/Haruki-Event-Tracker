@@ -30,6 +30,7 @@ struct TimeIdRow {
 
 #[derive(FromQueryResult)]
 struct UserKeyRow {
+    user_id: String,
     user_id_key: i64,
     unique_id: Option<String>,
     name: String,
@@ -154,9 +155,187 @@ pub(crate) async fn batch_get_or_create_user_id_keys(
 ) -> Result<HashMap<String, i64>, DbErr> {
     let mut out = HashMap::with_capacity(users.len());
     let use_unique_ids = users.values().any(|u| u.unique_id.is_some());
-    for (user_id, info) in users {
+    let all_ids: Vec<&str> = users.keys().map(String::as_str).collect();
+
+    for row in select_user_rows(tx, backend, table_name, &all_ids, use_unique_ids).await? {
+        let Some(info) = users.get(&row.user_id) else {
+            continue;
+        };
+        let name_changed = row.name != info.name;
+        let cheerful_changed = match (row.cheerful_team_id, info.cheerful_team_id) {
+            (_, None) => false,
+            (Some(stored), Some(new)) => stored != new,
+            (None, Some(_)) => true,
+        };
+        let unique_changed = use_unique_ids && row.unique_id != info.unique_id;
+        let profile_changed = row.card_id != info.card_id
+            || row.card_level != info.card_level
+            || row.card_master_rank != info.card_master_rank
+            || row.card_special_training_status != info.card_special_training_status
+            || row.card_default_image != info.card_default_image
+            || row.profile_word != info.profile_word
+            || row.profile_honors_json != info.profile_honors_json
+            || row.honor_missions_json != info.honor_missions_json
+            || row.player_frames_json != info.player_frames_json;
+
+        if name_changed || cheerful_changed || unique_changed || profile_changed {
+            let mut upd = Query::update();
+            upd.table(Alias::new(table_name))
+                .and_where(Expr::col(event_users::Column::UserIdKey).eq(row.user_id_key));
+            if name_changed || cheerful_changed {
+                upd.value(event_users::Column::Name, info.name.clone());
+                if let Some(ct) = info.cheerful_team_id {
+                    upd.value(event_users::Column::CheerfulTeamId, ct);
+                }
+            }
+            if unique_changed {
+                upd.value(event_users::Column::UniqueId, info.unique_id.clone());
+            }
+            if profile_changed {
+                upd.value(event_users::Column::CardId, info.card_id)
+                    .value(event_users::Column::CardLevel, info.card_level)
+                    .value(event_users::Column::CardMasterRank, info.card_master_rank)
+                    .value(
+                        event_users::Column::CardSpecialTrainingStatus,
+                        info.card_special_training_status.clone(),
+                    )
+                    .value(
+                        event_users::Column::CardDefaultImage,
+                        info.card_default_image.clone(),
+                    )
+                    .value(event_users::Column::ProfileWord, info.profile_word.clone())
+                    .value(
+                        event_users::Column::ProfileHonorsJson,
+                        info.profile_honors_json.clone(),
+                    )
+                    .value(
+                        event_users::Column::HonorMissionsJson,
+                        info.honor_missions_json.clone(),
+                    )
+                    .value(
+                        event_users::Column::PlayerFramesJson,
+                        info.player_frames_json.clone(),
+                    );
+            }
+            tx.execute(&upd).await?;
+        }
+        out.insert(row.user_id, row.user_id_key);
+    }
+
+    let missing: Vec<&str> = users
+        .keys()
+        .filter(|k| !out.contains_key(*k))
+        .map(String::as_str)
+        .collect();
+    if missing.is_empty() {
+        return Ok(out);
+    }
+
+    for chunk in missing.chunks(INSERT_CHUNK) {
+        let mut ins = Query::insert();
+        ins.into_table(Alias::new(table_name));
+        if use_unique_ids {
+            ins.columns([
+                event_users::Column::UserId,
+                event_users::Column::UniqueId,
+                event_users::Column::Name,
+                event_users::Column::CheerfulTeamId,
+                event_users::Column::CardId,
+                event_users::Column::CardLevel,
+                event_users::Column::CardMasterRank,
+                event_users::Column::CardSpecialTrainingStatus,
+                event_users::Column::CardDefaultImage,
+                event_users::Column::ProfileWord,
+                event_users::Column::ProfileHonorsJson,
+                event_users::Column::HonorMissionsJson,
+                event_users::Column::PlayerFramesJson,
+            ]);
+            for user_id in chunk {
+                let info = &users[*user_id];
+                ins.values_panic([
+                    (*user_id).into(),
+                    info.unique_id.clone().into(),
+                    info.name.clone().into(),
+                    info.cheerful_team_id.into(),
+                    info.card_id.into(),
+                    info.card_level.into(),
+                    info.card_master_rank.into(),
+                    info.card_special_training_status.clone().into(),
+                    info.card_default_image.clone().into(),
+                    info.profile_word.clone().into(),
+                    info.profile_honors_json.clone().into(),
+                    info.honor_missions_json.clone().into(),
+                    info.player_frames_json.clone().into(),
+                ]);
+            }
+        } else {
+            ins.columns([
+                event_users::Column::UserId,
+                event_users::Column::Name,
+                event_users::Column::CheerfulTeamId,
+                event_users::Column::CardId,
+                event_users::Column::CardLevel,
+                event_users::Column::CardMasterRank,
+                event_users::Column::CardSpecialTrainingStatus,
+                event_users::Column::CardDefaultImage,
+                event_users::Column::ProfileWord,
+                event_users::Column::ProfileHonorsJson,
+                event_users::Column::HonorMissionsJson,
+                event_users::Column::PlayerFramesJson,
+            ]);
+            for user_id in chunk {
+                let info = &users[*user_id];
+                ins.values_panic([
+                    (*user_id).into(),
+                    info.name.clone().into(),
+                    info.cheerful_team_id.into(),
+                    info.card_id.into(),
+                    info.card_level.into(),
+                    info.card_master_rank.into(),
+                    info.card_special_training_status.clone().into(),
+                    info.card_default_image.clone().into(),
+                    info.profile_word.clone().into(),
+                    info.profile_honors_json.clone().into(),
+                    info.honor_missions_json.clone().into(),
+                    info.player_frames_json.clone().into(),
+                ]);
+            }
+        }
+        tx.execute(&ins).await?;
+    }
+
+    for row in select_user_rows(tx, backend, table_name, &missing, use_unique_ids).await? {
+        out.insert(row.user_id, row.user_id_key);
+    }
+    if out.len() != users.len() {
+        return Err(DbErr::Custom(format!(
+            "inserted user_id_key rows vanished ({} of {} resolved)",
+            out.len(),
+            users.len()
+        )));
+    }
+    Ok(out)
+}
+
+/// Keep multi-row statements well under every backend's bind-parameter cap
+/// (13 columns × 500 rows = 6 500 params; Postgres allows 65 535).
+const INSERT_CHUNK: usize = 500;
+
+async fn select_user_rows(
+    tx: &DatabaseTransaction,
+    backend: DatabaseBackend,
+    table_name: &str,
+    user_ids: &[&str],
+    use_unique_ids: bool,
+) -> Result<Vec<UserKeyRow>, DbErr> {
+    let mut rows = Vec::with_capacity(user_ids.len());
+    for chunk in user_ids.chunks(INSERT_CHUNK) {
         let mut sel = Query::select();
         sel.expr_as(
+            Expr::col(event_users::Column::UserId),
+            Alias::new("user_id"),
+        )
+        .expr_as(
             Expr::col(event_users::Column::UserIdKey),
             Alias::new("user_id_key"),
         )
@@ -210,159 +389,14 @@ pub(crate) async fn batch_get_or_create_user_id_keys(
             Alias::new("player_frames_json"),
         )
         .from(Alias::new(table_name))
-        .and_where(Expr::col(event_users::Column::UserId).eq(user_id.as_str()))
-        .limit(1);
-        let sel = sel.to_owned();
-
-        if let Some(row) = UserKeyRow::find_by_statement(backend.build(&sel))
-            .one(tx)
-            .await?
-        {
-            let name_changed = row.name != info.name;
-            let cheerful_changed = match (row.cheerful_team_id, info.cheerful_team_id) {
-                (_, None) => false,
-                (Some(stored), Some(new)) => stored != new,
-                (None, Some(_)) => true,
-            };
-            if name_changed || cheerful_changed {
-                let mut upd = Query::update();
-                upd.table(Alias::new(table_name))
-                    .value(event_users::Column::Name, info.name.clone())
-                    .and_where(Expr::col(event_users::Column::UserIdKey).eq(row.user_id_key));
-                if let Some(ct) = info.cheerful_team_id {
-                    upd.value(event_users::Column::CheerfulTeamId, ct);
-                }
-                tx.execute(&upd).await?;
-            }
-            if use_unique_ids && row.unique_id != info.unique_id {
-                let upd = Query::update()
-                    .table(Alias::new(table_name))
-                    .value(event_users::Column::UniqueId, info.unique_id.clone())
-                    .and_where(Expr::col(event_users::Column::UserIdKey).eq(row.user_id_key))
-                    .to_owned();
-                tx.execute(&upd).await?;
-            }
-            if row.card_id != info.card_id
-                || row.card_level != info.card_level
-                || row.card_master_rank != info.card_master_rank
-                || row.card_special_training_status != info.card_special_training_status
-                || row.card_default_image != info.card_default_image
-                || row.profile_word != info.profile_word
-                || row.profile_honors_json != info.profile_honors_json
-                || row.honor_missions_json != info.honor_missions_json
-                || row.player_frames_json != info.player_frames_json
-            {
-                let upd = Query::update()
-                    .table(Alias::new(table_name))
-                    .value(event_users::Column::CardId, info.card_id)
-                    .value(event_users::Column::CardLevel, info.card_level)
-                    .value(event_users::Column::CardMasterRank, info.card_master_rank)
-                    .value(
-                        event_users::Column::CardSpecialTrainingStatus,
-                        info.card_special_training_status.clone(),
-                    )
-                    .value(
-                        event_users::Column::CardDefaultImage,
-                        info.card_default_image.clone(),
-                    )
-                    .value(event_users::Column::ProfileWord, info.profile_word.clone())
-                    .value(
-                        event_users::Column::ProfileHonorsJson,
-                        info.profile_honors_json.clone(),
-                    )
-                    .value(
-                        event_users::Column::HonorMissionsJson,
-                        info.honor_missions_json.clone(),
-                    )
-                    .value(
-                        event_users::Column::PlayerFramesJson,
-                        info.player_frames_json.clone(),
-                    )
-                    .and_where(Expr::col(event_users::Column::UserIdKey).eq(row.user_id_key))
-                    .to_owned();
-                tx.execute(&upd).await?;
-            }
-            out.insert(user_id.clone(), row.user_id_key);
-            continue;
-        }
-
-        let mut ins = Query::insert();
-        ins.into_table(Alias::new(table_name));
-        if use_unique_ids {
-            ins.columns([
-                event_users::Column::UserId,
-                event_users::Column::UniqueId,
-                event_users::Column::Name,
-                event_users::Column::CheerfulTeamId,
-                event_users::Column::CardId,
-                event_users::Column::CardLevel,
-                event_users::Column::CardMasterRank,
-                event_users::Column::CardSpecialTrainingStatus,
-                event_users::Column::CardDefaultImage,
-                event_users::Column::ProfileWord,
-                event_users::Column::ProfileHonorsJson,
-                event_users::Column::HonorMissionsJson,
-                event_users::Column::PlayerFramesJson,
-            ])
-            .values_panic([
-                user_id.as_str().into(),
-                info.unique_id.clone().into(),
-                info.name.clone().into(),
-                info.cheerful_team_id.into(),
-                info.card_id.into(),
-                info.card_level.into(),
-                info.card_master_rank.into(),
-                info.card_special_training_status.clone().into(),
-                info.card_default_image.clone().into(),
-                info.profile_word.clone().into(),
-                info.profile_honors_json.clone().into(),
-                info.honor_missions_json.clone().into(),
-                info.player_frames_json.clone().into(),
-            ]);
-        } else {
-            ins.columns([
-                event_users::Column::UserId,
-                event_users::Column::Name,
-                event_users::Column::CheerfulTeamId,
-                event_users::Column::CardId,
-                event_users::Column::CardLevel,
-                event_users::Column::CardMasterRank,
-                event_users::Column::CardSpecialTrainingStatus,
-                event_users::Column::CardDefaultImage,
-                event_users::Column::ProfileWord,
-                event_users::Column::ProfileHonorsJson,
-                event_users::Column::HonorMissionsJson,
-                event_users::Column::PlayerFramesJson,
-            ])
-            .values_panic([
-                user_id.as_str().into(),
-                info.name.clone().into(),
-                info.cheerful_team_id.into(),
-                info.card_id.into(),
-                info.card_level.into(),
-                info.card_master_rank.into(),
-                info.card_special_training_status.clone().into(),
-                info.card_default_image.clone().into(),
-                info.profile_word.clone().into(),
-                info.profile_honors_json.clone().into(),
-                info.honor_missions_json.clone().into(),
-                info.player_frames_json.clone().into(),
-            ]);
-        }
-        let ins = ins.to_owned();
-        tx.execute(&ins).await?;
-
-        let row = UserKeyRow::find_by_statement(backend.build(&sel))
-            .one(tx)
-            .await?
-            .ok_or_else(|| {
-                DbErr::Custom(format!(
-                    "inserted user_id_key row vanished for user_id={user_id}"
-                ))
-            })?;
-        out.insert(user_id.clone(), row.user_id_key);
+        .and_where(Expr::col(event_users::Column::UserId).is_in(chunk.iter().copied()));
+        rows.extend(
+            UserKeyRow::find_by_statement(backend.build(&sel))
+                .all(tx)
+                .await?,
+        );
     }
-    Ok(out)
+    Ok(rows)
 }
 
 /// Owned per-record fields we move into the transaction closure. Avoids the

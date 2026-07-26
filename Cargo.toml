@@ -81,6 +81,7 @@ tracing-subscriber = { version = "0.3", features = [
     "time",
     "local-time",
 ] }
+tracing-appender = "0.2"
 
 # Errors
 thiserror = "2"
