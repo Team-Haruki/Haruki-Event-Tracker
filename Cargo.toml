@@ -88,6 +88,7 @@ thiserror = "2"
 anyhow = "1"
 
 # Utilities
+ahash = "0.8"
 bytes = "1"
 chrono = { version = "0.4", default-features = false, features = [
     "clock",

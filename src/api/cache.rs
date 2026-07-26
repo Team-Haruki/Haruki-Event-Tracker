@@ -12,7 +12,7 @@ use redis::AsyncCommands;
 use redis::aio::ConnectionManager;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
-use tokio::sync::{Mutex, Notify};
+use tokio::sync::Notify;
 use tokio::time;
 
 use crate::api::error::ApiError;
@@ -918,7 +918,7 @@ impl ApiCache {
     where
         Fut: Future<Output = Result<Bytes, ApiError>>,
     {
-        match self.singleflight.begin(flight_key.clone()).await {
+        match self.singleflight.begin(flight_key) {
             Flight::Waiter(entry) => {
                 incr(&CACHE_STATS.lookup_singleflight_wait);
                 if options.is_batch {
@@ -937,15 +937,10 @@ impl ApiCache {
                 );
                 lookup.await
             }
-            Flight::Owner(entry) => {
-                let guard = SingleFlightOwnerGuard::new(
-                    self.singleflight.clone(),
-                    flight_key.clone(),
-                    entry,
-                );
+            Flight::Owner(guard) => {
                 let result = lookup.await;
                 let shared = shared_fetch_bytes_result(&result);
-                guard.finish(shared).await;
+                guard.finish(shared);
                 result
             }
         }
@@ -961,7 +956,7 @@ impl ApiCache {
     where
         Fut: Future<Output = Result<Bytes, ApiError>>,
     {
-        match self.singleflight.begin(flight_key.clone()).await {
+        match self.singleflight.begin(flight_key) {
             Flight::Waiter(entry) => {
                 incr(&CACHE_STATS.singleflight_wait);
                 if options.is_batch {
@@ -980,17 +975,12 @@ impl ApiCache {
                 );
                 fetch.await
             }
-            Flight::Owner(entry) => {
-                let guard = SingleFlightOwnerGuard::new(
-                    self.singleflight.clone(),
-                    flight_key.clone(),
-                    entry,
-                );
+            Flight::Owner(guard) => {
                 let result = self
                     .fetch_and_maybe_cache_bytes(fetch, write_context, options)
                     .await;
                 let shared = shared_fetch_bytes_result(&result);
-                guard.finish(shared).await;
+                guard.finish(shared);
                 result
             }
         }
@@ -1005,7 +995,7 @@ impl ApiCache {
     where
         Fut: Future<Output = Result<CachedJson, ApiError>>,
     {
-        match self.singleflight.begin(flight_key.clone()).await {
+        match self.singleflight.begin(flight_key) {
             Flight::Waiter(entry) => {
                 incr(&CACHE_STATS.lookup_singleflight_wait);
                 if options.is_batch {
@@ -1024,15 +1014,10 @@ impl ApiCache {
                 );
                 lookup.await
             }
-            Flight::Owner(entry) => {
-                let guard = SingleFlightOwnerGuard::new(
-                    self.singleflight.clone(),
-                    flight_key.clone(),
-                    entry,
-                );
+            Flight::Owner(guard) => {
                 let result = lookup.await;
                 let shared = shared_cached_json_result(&result);
-                guard.finish(shared).await;
+                guard.finish(shared);
                 result
             }
         }
@@ -1048,7 +1033,7 @@ impl ApiCache {
     where
         Fut: Future<Output = Result<Bytes, ApiError>>,
     {
-        match self.singleflight.begin(flight_key.clone()).await {
+        match self.singleflight.begin(flight_key) {
             Flight::Waiter(entry) => {
                 incr(&CACHE_STATS.singleflight_wait);
                 if options.is_batch {
@@ -1067,17 +1052,12 @@ impl ApiCache {
                 );
                 self.encode_response(fetch.await?, None, options).await
             }
-            Flight::Owner(entry) => {
-                let guard = SingleFlightOwnerGuard::new(
-                    self.singleflight.clone(),
-                    flight_key.clone(),
-                    entry,
-                );
+            Flight::Owner(guard) => {
                 let result = self
                     .fetch_and_maybe_cache_encoded(fetch, write_context, options)
                     .await;
                 let shared = shared_cached_json_result(&result);
-                guard.finish(shared).await;
+                guard.finish(shared);
                 result
             }
         }
@@ -1457,10 +1437,14 @@ struct L1Cache {
 
 /// Shards use `std` mutexes: the critical sections never await, so the brief
 /// blocking lock is cheaper than an async mutex on the hot lookup path.
+/// Keys are 150-250 byte strings, so the maps use `ahash` instead of SipHash
+/// and the shard index derives from the same seeds (`RandomState` clones
+/// share them), off bits the map's bucket/control lookups don't use.
 struct L1Shards {
+    hasher: ahash::RandomState,
     max_per_shard: usize,
-    controls: Box<[StdMutex<HashMap<String, L1Control>>]>,
-    values: Box<[StdMutex<HashMap<String, L1Value>>]>,
+    controls: Box<[StdMutex<HashMap<String, L1Control, ahash::RandomState>>]>,
+    values: Box<[StdMutex<HashMap<String, L1Value, ahash::RandomState>>]>,
 }
 
 #[derive(Clone, Copy)]
@@ -1495,15 +1479,17 @@ trait Expiring {
 impl L1Cache {
     fn new(max_entries: usize) -> Self {
         let max_per_shard = max_entries.div_ceil(L1_SHARDS).max(1);
+        let hasher = ahash::RandomState::new();
         let controls = (0..L1_SHARDS)
-            .map(|_| StdMutex::new(HashMap::new()))
+            .map(|_| StdMutex::new(HashMap::with_hasher(hasher.clone())))
             .collect();
         let values = (0..L1_SHARDS)
-            .map(|_| StdMutex::new(HashMap::new()))
+            .map(|_| StdMutex::new(HashMap::with_hasher(hasher.clone())))
             .collect();
         Self {
             max_entries,
             inner: Arc::new(L1Shards {
+                hasher,
                 max_per_shard,
                 controls,
                 values,
@@ -1511,16 +1497,15 @@ impl L1Cache {
         }
     }
 
-    fn shard(key: &str) -> usize {
-        use std::hash::{Hash, Hasher};
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        key.hash(&mut hasher);
-        (hasher.finish() as usize) % L1_SHARDS
+    fn shard(&self, key: &str) -> usize {
+        // Bits 32..36: hashbrown's control bytes use the top 7 bits and the
+        // bucket index the low ones, so the shard constraint costs neither.
+        (self.inner.hasher.hash_one(key) >> 32) as usize % L1_SHARDS
     }
 
     fn get_control(&self, key: &str) -> Option<L1Control> {
         let now = Instant::now();
-        let mut shard = lock_ignore_poison(&self.inner.controls[Self::shard(key)]);
+        let mut shard = lock_ignore_poison(&self.inner.controls[self.shard(key)]);
         match shard.get(key).copied() {
             Some(control) if control.expires_at > now => Some(control),
             Some(_) => {
@@ -1535,14 +1520,14 @@ impl L1Cache {
         if self.max_entries == 0 {
             return;
         }
-        let mut shard = lock_ignore_poison(&self.inner.controls[Self::shard(&key)]);
+        let mut shard = lock_ignore_poison(&self.inner.controls[self.shard(&key)]);
         evict_if_full(self.inner.max_per_shard, &mut shard);
         shard.insert(key, value);
     }
 
     fn get_value(&self, key: &str) -> Option<Bytes> {
         let now = Instant::now();
-        let mut shard = lock_ignore_poison(&self.inner.values[Self::shard(key)]);
+        let mut shard = lock_ignore_poison(&self.inner.values[self.shard(key)]);
         match shard.get(key) {
             Some(value) if value.expires_at > now => Some(value.bytes.clone()),
             Some(_) => {
@@ -1557,7 +1542,7 @@ impl L1Cache {
         if self.max_entries == 0 {
             return;
         }
-        let mut shard = lock_ignore_poison(&self.inner.values[Self::shard(&key)]);
+        let mut shard = lock_ignore_poison(&self.inner.values[self.shard(&key)]);
         evict_if_full(self.inner.max_per_shard, &mut shard);
         shard.insert(key, value);
     }
@@ -1572,7 +1557,10 @@ fn lock_ignore_poison<T>(mutex: &StdMutex<T>) -> std::sync::MutexGuard<'_, T> {
 /// Make room in a full shard without the thundering-herd of clearing it whole:
 /// drop expired entries first, and if still full evict roughly the oldest
 /// quarter by expiry (≈ insertion order, since each entry type has a fixed TTL).
-fn evict_if_full<T: Expiring>(max_per_shard: usize, map: &mut HashMap<String, T>) {
+fn evict_if_full<T: Expiring, S: std::hash::BuildHasher>(
+    max_per_shard: usize,
+    map: &mut HashMap<String, T, S>,
+) {
     if map.len() < max_per_shard {
         return;
     }
@@ -1703,14 +1691,17 @@ fn gzip_bytes(bytes: &[u8], level: u32) -> Result<Bytes, ApiError> {
     })
 }
 
+/// Both the flight map and per-entry state use `std` mutexes: no critical
+/// section awaits, so the brief blocking lock beats an async mutex on a
+/// path taken by every non-L1-hit request.
 #[derive(Clone, Default)]
 struct SingleFlight {
-    inner: Arc<Mutex<HashMap<String, Arc<InFlightEntry>>>>,
+    inner: Arc<StdMutex<HashMap<String, Arc<InFlightEntry>>>>,
 }
 
 struct InFlightEntry {
     notify: Notify,
-    state: Mutex<InFlightState>,
+    state: StdMutex<InFlightState>,
 }
 
 #[derive(Default)]
@@ -1720,7 +1711,7 @@ struct InFlightState {
 }
 
 enum Flight {
-    Owner(Arc<InFlightEntry>),
+    Owner(SingleFlightOwnerGuard),
     Waiter(Arc<InFlightEntry>),
 }
 
@@ -1736,17 +1727,9 @@ struct SingleFlightOwnerGuard {
 }
 
 impl SingleFlightOwnerGuard {
-    fn new(singleflight: SingleFlight, key: String, entry: Arc<InFlightEntry>) -> Self {
-        Self {
-            singleflight,
-            key,
-            entry: Some(entry),
-        }
-    }
-
-    async fn finish(mut self, result: Option<SharedFetchResult>) {
+    fn finish(mut self, result: Option<SharedFetchResult>) {
         if let Some(entry) = self.entry.take() {
-            self.singleflight.finish(&self.key, entry, result).await;
+            self.singleflight.finish(&self.key, &entry, result);
         }
     }
 }
@@ -1754,48 +1737,49 @@ impl SingleFlightOwnerGuard {
 impl Drop for SingleFlightOwnerGuard {
     fn drop(&mut self) {
         if let Some(entry) = self.entry.take() {
-            let singleflight = self.singleflight.clone();
-            let key = self.key.clone();
-            tokio::spawn(async move {
-                singleflight.finish(&key, entry, None).await;
-            });
+            self.singleflight.finish(&self.key, &entry, None);
         }
     }
 }
 
 impl SingleFlight {
-    async fn begin(&self, key: String) -> Flight {
-        let mut inner = self.inner.lock().await;
-        if let Some(entry) = inner.get(&key) {
-            return Flight::Waiter(entry.clone());
-        }
-        let entry = Arc::new(InFlightEntry {
-            notify: Notify::new(),
-            state: Mutex::new(InFlightState::default()),
-        });
-        inner.insert(key, entry.clone());
-        Flight::Owner(entry)
+    /// The owner guard takes ownership of `key`, so a lookup costs one key
+    /// allocation total (the map's clone) instead of three.
+    fn begin(&self, key: String) -> Flight {
+        let entry = {
+            let mut inner = lock_ignore_poison(&self.inner);
+            if let Some(entry) = inner.get(&key) {
+                return Flight::Waiter(entry.clone());
+            }
+            let entry = Arc::new(InFlightEntry {
+                notify: Notify::new(),
+                state: StdMutex::new(InFlightState::default()),
+            });
+            inner.insert(key.clone(), entry.clone());
+            entry
+        };
+        Flight::Owner(SingleFlightOwnerGuard {
+            singleflight: self.clone(),
+            key,
+            entry: Some(entry),
+        })
     }
 
-    async fn finish(
-        &self,
-        key: &str,
-        entry: Arc<InFlightEntry>,
-        result: Option<SharedFetchResult>,
-    ) {
+    fn finish(&self, key: &str, entry: &Arc<InFlightEntry>, result: Option<SharedFetchResult>) {
         {
-            let mut state = entry.state.lock().await;
+            let mut state = lock_ignore_poison(&entry.state);
             state.done = true;
             state.result = result;
         }
-        let mut inner = self.inner.lock().await;
-        if inner
-            .get(key)
-            .is_some_and(|current| Arc::ptr_eq(current, &entry))
         {
-            inner.remove(key);
+            let mut inner = lock_ignore_poison(&self.inner);
+            if inner
+                .get(key)
+                .is_some_and(|current| Arc::ptr_eq(current, entry))
+            {
+                inner.remove(key);
+            }
         }
-        drop(inner);
         entry.notify.notify_waiters();
     }
 
@@ -1803,7 +1787,7 @@ impl SingleFlight {
         loop {
             let notified = entry.notify.notified();
             {
-                let state = entry.state.lock().await;
+                let state = lock_ignore_poison(&entry.state);
                 if state.done {
                     return match &state.result {
                         Some(SharedFetchResult::Value(value)) => Some(Ok(value.bytes.clone())),
@@ -1820,7 +1804,7 @@ impl SingleFlight {
         loop {
             let notified = entry.notify.notified();
             {
-                let state = entry.state.lock().await;
+                let state = lock_ignore_poison(&entry.state);
                 if state.done {
                     return match &state.result {
                         Some(SharedFetchResult::Value(value)) => Some(Ok(value.clone())),
@@ -1871,14 +1855,13 @@ pub async fn abort_event_update(
 }
 
 fn value_key(server: &str, event_id: i64, epoch: i64, suffix: &str) -> String {
-    format!(
-        "{base}:v{epoch}:{suffix}",
-        base = base_key(server, event_id)
-    )
+    let server = lower_server(server);
+    format!("haruki:tracker:{server}:{event_id}:api_cache:v{epoch}:{suffix}")
 }
 
 fn static_value_key(server: &str, event_id: i64, suffix: &str) -> String {
-    format!("{base}:static:{suffix}", base = base_key(server, event_id))
+    let server = lower_server(server);
+    format!("haruki:tracker:{server}:{event_id}:api_cache:static:{suffix}")
 }
 
 fn negative_key(server: &str, event_id: i64, epoch: i64, suffix: &str) -> String {
@@ -1890,55 +1873,59 @@ fn gzip_key(value_key: &str) -> String {
 }
 
 fn dirty_flight_key(server: &str, event_id: i64, epoch: i64, suffix: &str) -> String {
-    format!(
-        "{base}:dirty:v{epoch}:{suffix}",
-        base = base_key(server, event_id)
-    )
+    let server = lower_server(server);
+    format!("haruki:tracker:{server}:{event_id}:api_cache:dirty:v{epoch}:{suffix}")
 }
 
 fn lookup_flight_key(server: &str, event_id: i64, epoch: i64, suffix: &str) -> String {
-    format!(
-        "{base}:lookup:v{epoch}:{suffix}",
-        base = base_key(server, event_id)
-    )
+    let server = lower_server(server);
+    format!("haruki:tracker:{server}:{event_id}:api_cache:lookup:v{epoch}:{suffix}")
 }
 
 fn static_lookup_flight_key(server: &str, event_id: i64, suffix: &str) -> String {
-    format!(
-        "{base}:static_lookup:{suffix}",
-        base = base_key(server, event_id)
-    )
+    let server = lower_server(server);
+    format!("haruki:tracker:{server}:{event_id}:api_cache:static_lookup:{suffix}")
 }
 
 fn gzip_flight_key(server: &str, event_id: i64, epoch: i64, suffix: &str) -> String {
-    format!(
-        "{base}:gzip:v{epoch}:{suffix}",
-        base = base_key(server, event_id)
-    )
+    let server = lower_server(server);
+    format!("haruki:tracker:{server}:{event_id}:api_cache:gzip:v{epoch}:{suffix}")
 }
 
 fn gzip_lookup_flight_key(server: &str, event_id: i64, epoch: i64, suffix: &str) -> String {
-    format!(
-        "{base}:gzip_lookup:v{epoch}:{suffix}",
-        base = base_key(server, event_id)
-    )
+    let server = lower_server(server);
+    format!("haruki:tracker:{server}:{event_id}:api_cache:gzip_lookup:v{epoch}:{suffix}")
 }
 
 fn control_cache_key(server: &str, event_id: i64) -> String {
-    format!("{base}:control", base = base_key(server, event_id))
+    let server = lower_server(server);
+    format!("haruki:tracker:{server}:{event_id}:api_cache:control")
 }
 
 fn epoch_key(server: &str, event_id: i64) -> String {
-    format!("{base}:epoch", base = base_key(server, event_id))
+    let server = lower_server(server);
+    format!("haruki:tracker:{server}:{event_id}:api_cache:epoch")
 }
 
 fn dirty_key(server: &str, event_id: i64) -> String {
-    format!("{base}:dirty", base = base_key(server, event_id))
+    let server = lower_server(server);
+    format!("haruki:tracker:{server}:{event_id}:api_cache:dirty")
 }
 
 fn base_key(server: &str, event_id: i64) -> String {
-    let server = server.to_ascii_lowercase();
+    let server = lower_server(server);
     format!("haruki:tracker:{server}:{event_id}:api_cache")
+}
+
+/// Server strings are lowercase everywhere in practice (routes are parsed
+/// through `SekaiServerRegion`); allocate only for the odd caller that
+/// passes an uppercase form. Key bytes are unchanged either way.
+fn lower_server(server: &str) -> std::borrow::Cow<'_, str> {
+    if server.bytes().any(|b| b.is_ascii_uppercase()) {
+        std::borrow::Cow::Owned(server.to_ascii_lowercase())
+    } else {
+        std::borrow::Cow::Borrowed(server)
+    }
 }
 
 pub fn rank_suffix(kind: &str, rank: i64) -> String {
@@ -2146,26 +2133,20 @@ mod tests {
     async fn singleflight_shares_success_bytes() {
         let singleflight = SingleFlight::default();
         let key = "trace:rank:1".to_owned();
-        let owner = match singleflight.begin(key.clone()).await {
-            Flight::Owner(entry) => entry,
+        let owner = match singleflight.begin(key.clone()) {
+            Flight::Owner(guard) => guard,
             Flight::Waiter(_) => panic!("first caller should own the flight"),
         };
-        let waiter = match singleflight.begin(key.clone()).await {
+        let waiter = match singleflight.begin(key.clone()) {
             Flight::Waiter(entry) => entry,
             Flight::Owner(_) => panic!("second caller should wait on the flight"),
         };
 
         let task =
             tokio::spawn(async move { SingleFlight::wait_bytes(waiter).await.unwrap().unwrap() });
-        singleflight
-            .finish(
-                &key,
-                owner,
-                Some(SharedFetchResult::Value(CachedJson::identity(
-                    Bytes::from_static(b"{\"ok\":true}"),
-                ))),
-            )
-            .await;
+        owner.finish(Some(SharedFetchResult::Value(CachedJson::identity(
+            Bytes::from_static(b"{\"ok\":true}"),
+        ))));
 
         assert_eq!(task.await.unwrap(), Bytes::from_static(b"{\"ok\":true}"));
     }
@@ -2174,19 +2155,17 @@ mod tests {
     async fn singleflight_shares_not_found_result() {
         let singleflight = SingleFlight::default();
         let key = "trace:rank:40000".to_owned();
-        let owner = match singleflight.begin(key.clone()).await {
-            Flight::Owner(entry) => entry,
+        let owner = match singleflight.begin(key.clone()) {
+            Flight::Owner(guard) => guard,
             Flight::Waiter(_) => panic!("first caller should own the flight"),
         };
-        let waiter = match singleflight.begin(key.clone()).await {
+        let waiter = match singleflight.begin(key.clone()) {
             Flight::Waiter(entry) => entry,
             Flight::Owner(_) => panic!("second caller should wait on the flight"),
         };
 
         let task = tokio::spawn(async move { SingleFlight::wait_bytes(waiter).await.unwrap() });
-        singleflight
-            .finish(&key, owner, Some(SharedFetchResult::NotFound))
-            .await;
+        owner.finish(Some(SharedFetchResult::NotFound));
 
         assert!(matches!(task.await.unwrap(), Err(ApiError::NotFound)));
     }
@@ -2207,11 +2186,11 @@ mod tests {
     async fn singleflight_shares_gzip_cached_json() {
         let singleflight = SingleFlight::default();
         let key = "trace:rank:1:gzip".to_owned();
-        let owner = match singleflight.begin(key.clone()).await {
-            Flight::Owner(entry) => entry,
+        let owner = match singleflight.begin(key.clone()) {
+            Flight::Owner(guard) => guard,
             Flight::Waiter(_) => panic!("first caller should own the flight"),
         };
-        let waiter = match singleflight.begin(key.clone()).await {
+        let waiter = match singleflight.begin(key.clone()) {
             Flight::Waiter(entry) => entry,
             Flight::Owner(_) => panic!("second caller should wait on the flight"),
         };
@@ -2222,15 +2201,9 @@ mod tests {
                 .unwrap()
                 .unwrap()
         });
-        singleflight
-            .finish(
-                &key,
-                owner,
-                Some(SharedFetchResult::Value(CachedJson::gzip(
-                    Bytes::from_static(b"gzipped"),
-                ))),
-            )
-            .await;
+        owner.finish(Some(SharedFetchResult::Value(CachedJson::gzip(
+            Bytes::from_static(b"gzipped"),
+        ))));
 
         let shared = task.await.unwrap();
         assert_eq!(shared.encoding, CachedJsonEncoding::Gzip);
@@ -2241,12 +2214,11 @@ mod tests {
     async fn singleflight_owner_drop_releases_waiters_and_key() {
         let singleflight = SingleFlight::default();
         let key = "trace:ranks:1,2,3".to_owned();
-        let owner = match singleflight.begin(key.clone()).await {
-            Flight::Owner(entry) => entry,
+        let guard = match singleflight.begin(key.clone()) {
+            Flight::Owner(guard) => guard,
             Flight::Waiter(_) => panic!("first caller should own the flight"),
         };
-        let guard = SingleFlightOwnerGuard::new(singleflight.clone(), key.clone(), owner);
-        let waiter = match singleflight.begin(key.clone()).await {
+        let waiter = match singleflight.begin(key.clone()) {
             Flight::Waiter(entry) => entry,
             Flight::Owner(_) => panic!("second caller should wait on the flight"),
         };
@@ -2255,7 +2227,7 @@ mod tests {
         drop(guard);
 
         assert!(task.await.unwrap().is_none());
-        match singleflight.begin(key).await {
+        match singleflight.begin(key) {
             Flight::Owner(_) => {}
             Flight::Waiter(_) => panic!("dropped owner should remove in-flight key"),
         }

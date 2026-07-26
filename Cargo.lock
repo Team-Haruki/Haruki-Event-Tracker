@@ -1295,6 +1295,7 @@ dependencies = [
 name = "haruki-event-tracker"
 version = "3.0.0-dev"
 dependencies = [
+ "ahash",
  "anyhow",
  "async-trait",
  "axum",
