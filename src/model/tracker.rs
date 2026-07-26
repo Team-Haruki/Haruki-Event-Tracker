@@ -60,4 +60,8 @@ pub struct HandledRankingData {
     pub record_time: i64,
     pub rankings: Vec<PlayerRankingSchema>,
     pub world_bloom_rankings: HashMap<i64, Vec<PlayerRankingSchema>>,
+    /// `(redis key, border hash)` to commit once the merged border rows
+    /// have persisted; `None` when the border payload was unchanged and
+    /// the merge was skipped.
+    pub border_cache: Option<(String, [u8; 32])>,
 }
