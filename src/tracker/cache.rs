@@ -1,13 +1,16 @@
 //! Redis-backed border-payload deduplication.
 //!
-//! `detect_cache(key, hash)` returns `Ok(true)` when the new SHA-256 of
+//! `check_cache(key, hash)` returns `Ok(true)` when the new SHA-256 of
 //! the upstream border response equals what we last stored under `key`,
 //! letting the tracker tick short-circuit the merge step (see
-//! `tracker::diff::merge_rankings`). Mismatch (or first call) returns
-//! `Ok(false)` and refreshes the cache.
+//! `tracker::diff::merge_rankings`). The stored hash is only advanced by
+//! `store_cache` *after* the merged rows actually persisted — committing
+//! it at read time would permanently suppress the merge whenever the
+//! write that followed failed (or never ran, as in the post-end
+//! profile-refresh path).
 //!
 //! Mirrors `EventTrackerBase.detectCache` in `tracker/trackerbase.go:184`.
-//! No TTL — the key is overwritten every miss and naturally garbage
+//! No TTL — the key is overwritten on change and naturally garbage
 //! collected when the event ends and the tracker stops touching it.
 
 use std::fmt::Write as _;
@@ -27,25 +30,34 @@ fn hex_of(hash: &[u8; 32]) -> String {
 }
 
 #[tracing::instrument(skip(conn, hash), fields(key))]
-pub async fn detect_cache(
+pub async fn check_cache(
     conn: &mut ConnectionManager,
     key: &str,
     hash: &[u8; 32],
 ) -> Result<bool, redis::RedisError> {
     let new_hex = hex_of(hash);
-    // GETSET stores the new hash and returns the previous one in a single
-    // round trip; a hit rewrites the same bytes, which is harmless.
-    let cached: Option<String> = conn.getset(key, &new_hex).await?;
+    let cached: Option<String> = conn.get(key).await?;
     match cached {
         Some(prev) if prev == new_hex => {
             tracing::debug!("border cache hit");
             Ok(true)
         }
         _ => {
-            tracing::debug!("border cache miss, refreshed");
+            tracing::debug!("border cache miss");
             Ok(false)
         }
     }
+}
+
+/// Commit `hash` as the last-persisted border payload. Call only after the
+/// merged rows landed in the database.
+#[tracing::instrument(skip(conn, hash), fields(key))]
+pub async fn store_cache(
+    conn: &mut ConnectionManager,
+    key: &str,
+    hash: &[u8; 32],
+) -> Result<(), redis::RedisError> {
+    conn.set::<_, _, ()>(key, hex_of(hash)).await
 }
 
 #[cfg(test)]

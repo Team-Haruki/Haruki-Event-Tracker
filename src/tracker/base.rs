@@ -33,7 +33,7 @@ use crate::model::tracker::{
 use crate::privacy::UidAnonymizer;
 use crate::sekai_api::client::HarukiSekaiAPIClient;
 use crate::sekai_api::error::SekaiApiError;
-use crate::tracker::cache::detect_cache;
+use crate::tracker::cache::{check_cache, store_cache};
 use crate::tracker::diff::{
     build_event_records, build_world_bloom_rows, diff_rank_based, extract_world_bloom_rankings,
     merge_rankings,
@@ -207,20 +207,27 @@ impl EventTrackerBase {
         }
     }
 
+    /// Low-frequency post-end refresh. One upstream fetch feeds two steps:
+    /// the regular diff-based persist (so late corrections — banned-account
+    /// cleanups, final border settlement — land as new trace points for both
+    /// the top-100 and border ranks) and the user-dimension upsert (names /
+    /// profiles). Returns whether any ranking rows changed.
     #[tracing::instrument(skip(self), fields(server = %self.server, event_id = self.event_id))]
-    pub async fn refresh_user_profiles_after_end(&mut self) -> Result<(), TrackerError> {
+    pub async fn refresh_after_end(&mut self) -> Result<bool, TrackerError> {
         let now = Utc::now().timestamp();
         if !self.should_refresh_user_profiles_after_end(now) {
-            tracing::debug!("post-end user refresh interval not reached");
-            return Ok(());
+            tracing::debug!("post-end refresh interval not reached");
+            return Ok(false);
         }
 
-        tracing::info!("refreshing post-end user profiles");
+        tracing::info!("running post-end low-frequency refresh");
         let data = self.handle_ranking_data().await?;
+        let changed = self.persist_ranking_data(&data, false, false, now).await?;
+
         let records = collect_visible_user_records(data.record_time, &data);
         if records.is_empty() {
             self.last_post_end_user_refresh_at = Some(now);
-            return Ok(());
+            return Ok(changed);
         }
 
         if let Some(conn) = self.api_cache_redis.as_mut()
@@ -252,7 +259,7 @@ impl EventTrackerBase {
             tracing::warn!(%err, "failed to bump API cache epoch after user refresh");
         }
         self.last_post_end_user_refresh_at = Some(now);
-        Ok(())
+        Ok(changed)
     }
 
     fn should_refresh_user_profiles_after_end(&self, now: i64) -> bool {
@@ -288,6 +295,20 @@ impl EventTrackerBase {
             }
         };
 
+        self.persist_ranking_data(&data, only_world_bloom, true, now)
+            .await
+    }
+
+    /// Diff + persist an already-fetched payload. `write_idle_heartbeat`
+    /// controls the freshness row on no-change ticks: live tracking wants
+    /// it, the post-end refresh must not fake liveness with it.
+    async fn persist_ranking_data(
+        &mut self,
+        data: &HandledRankingData,
+        only_world_bloom: bool,
+        write_idle_heartbeat: bool,
+        now: i64,
+    ) -> Result<bool, TrackerError> {
         tracing::info!("recording ranking data");
         let mut batch_called = false;
         let mut changed_ranks: HashMap<i64, RankState> = HashMap::new();
@@ -389,11 +410,23 @@ impl EventTrackerBase {
         }
 
         if !batch_called {
-            write_heartbeat(&self.db, self.event_id, now, 0).await?;
+            if write_idle_heartbeat {
+                write_heartbeat(&self.db, self.event_id, now, 0).await?;
+            }
         } else if let Some(conn) = self.api_cache_redis.as_mut()
             && let Err(err) = finish_event_update(conn, self.server, self.event_id).await
         {
             tracing::warn!(%err, "failed to bump API cache epoch");
+        }
+
+        // Only advance the border hash once its merged rows have persisted;
+        // committing earlier would suppress the merge forever if this write
+        // had failed (or never ran, as the old post-end refresh did).
+        if !only_world_bloom
+            && let Some((cache_key, border_hash)) = &data.border_cache
+            && let Err(err) = store_cache(&mut self.redis, cache_key, border_hash).await
+        {
+            tracing::warn!(%err, "failed to store border cache hash");
         }
 
         if let Err(err) =
@@ -430,7 +463,7 @@ impl EventTrackerBase {
         };
 
         let cache_key = format!("{}-event-{}-main-border", self.server, self.event_id);
-        let is_cached = match detect_cache(&mut self.redis, &cache_key, &border_hash).await {
+        let is_cached = match check_cache(&mut self.redis, &cache_key, &border_hash).await {
             Ok(hit) => hit,
             Err(err) => {
                 tracing::warn!(%err, "border cache check failed; treating as miss");
@@ -438,16 +471,20 @@ impl EventTrackerBase {
             }
         };
 
-        let rankings = if is_cached {
-            main_top100
+        let (rankings, border_cache) = if is_cached {
+            (main_top100, None)
         } else {
-            merge_rankings(main_top100, main_border)
+            (
+                merge_rankings(main_top100, main_border),
+                Some((cache_key, border_hash)),
+            )
         };
 
         Ok(HandledRankingData {
             record_time,
             rankings,
             world_bloom_rankings,
+            border_cache,
         })
     }
 }
