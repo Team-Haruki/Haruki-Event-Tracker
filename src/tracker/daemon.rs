@@ -164,12 +164,16 @@ impl HarukiEventTracker {
             return false;
         };
         if base.is_event_ended() {
-            if let Err(err) = base.refresh_user_profiles_after_end().await {
-                tracing::error!(
-                    %err,
-                    event_id = event.event_id,
-                    "post-end user profile refresh failed"
-                );
+            match base.refresh_after_end().await {
+                Ok(true) => notify_realtime_update(&self.realtime, self.server, event.event_id),
+                Ok(false) => {}
+                Err(err) => {
+                    tracing::error!(
+                        %err,
+                        event_id = event.event_id,
+                        "post-end refresh failed"
+                    );
+                }
             }
             return true;
         }
