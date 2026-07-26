@@ -315,7 +315,7 @@ impl EventTrackerBase {
         let mut records = Vec::new();
 
         if !only_world_bloom && !data.rankings.is_empty() {
-            let (idx, changed) = diff_rank_based(&data.rankings, &mut self.prev_rank_state);
+            let (idx, changed) = diff_rank_based(&data.rankings, &self.prev_rank_state);
             changed_ranks = changed;
             let diffed: Vec<&PlayerRankingSchema> =
                 idx.iter().map(|&i| &data.rankings[i]).collect();
@@ -364,6 +364,13 @@ impl EventTrackerBase {
                 return Err(err.into());
             }
             batch_called = true;
+        }
+        // Commit the in-memory rank state only now that the rows landed —
+        // advancing it before the insert would drop the changed rows for
+        // good if the write had failed (they'd diff as unchanged next tick).
+        if !changed_ranks.is_empty() {
+            self.prev_rank_state
+                .extend(changed_ranks.iter().map(|(rank, s)| (*rank, s.clone())));
         }
 
         if !wl_rows.is_empty() {

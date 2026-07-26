@@ -44,15 +44,17 @@ pub fn extract_player_profile(r: &PlayerRankingSchema) -> PlayerProfileSchema {
 }
 
 /// Indices into `rankings` whose `(user_id, score)` differ from
-/// `prev_rank_state[rank]`. Mutates `prev_rank_state` in-place to reflect
-/// the new state, and returns the per-rank changes so the caller can
-/// persist them to Redis (key `haruki:tracker:<server>:<event>:rank_state`).
+/// `prev_rank_state[rank]`, plus the per-rank new states. The caller
+/// commits the changes into its state map (and to Redis, key
+/// `haruki:tracker:<server>:<event>:rank_state`) only after the rows have
+/// persisted — advancing the state before the write lands would silently
+/// drop those rows on a failed insert.
 ///
 /// Rows missing any of `rank` / `score` / `user_id` are silently skipped —
 /// matches Go's `if r.Rank == nil || r.Score == nil || r.UserID == nil`.
 pub fn diff_rank_based(
     rankings: &[PlayerRankingSchema],
-    prev_rank_state: &mut HashMap<i64, RankState>,
+    prev_rank_state: &HashMap<i64, RankState>,
 ) -> (Vec<usize>, HashMap<i64, RankState>) {
     let mut changed_idx = Vec::new();
     let mut changed_ranks = HashMap::new();
@@ -69,12 +71,13 @@ pub fn diff_rank_based(
         if unchanged {
             continue;
         }
-        let new_state = RankState {
-            user_id: uid.to_string(),
-            score,
-        };
-        prev_rank_state.insert(rank, new_state.clone());
-        changed_ranks.insert(rank, new_state);
+        changed_ranks.insert(
+            rank,
+            RankState {
+                user_id: uid.to_string(),
+                score,
+            },
+        );
         changed_idx.push(i);
     }
     (changed_idx, changed_ranks)
@@ -301,21 +304,24 @@ mod tests {
     #[test]
     fn diff_first_pass_marks_everything_changed() {
         let rows = vec![ranking(1, 100, 1000, "a"), ranking(2, 200, 900, "b")];
-        let mut state = HashMap::new();
-        let (changed, deltas) = diff_rank_based(&rows, &mut state);
+        let state = HashMap::new();
+        let (changed, deltas) = diff_rank_based(&rows, &state);
         assert_eq!(changed, vec![0, 1]);
         assert_eq!(deltas.len(), 2);
-        assert_eq!(state.len(), 2);
-        assert_eq!(state[&1].user_id, "100");
-        assert_eq!(state[&1].score, 1000);
+        // The input state is untouched; callers commit `deltas` only after
+        // the rows persisted.
+        assert!(state.is_empty());
+        assert_eq!(deltas[&1].user_id, "100");
+        assert_eq!(deltas[&1].score, 1000);
     }
 
     #[test]
     fn diff_second_pass_no_changes_yields_empty() {
         let rows = vec![ranking(1, 100, 1000, "a")];
         let mut state = HashMap::new();
-        diff_rank_based(&rows, &mut state);
-        let (changed, deltas) = diff_rank_based(&rows, &mut state);
+        let (_, deltas) = diff_rank_based(&rows, &state);
+        state.extend(deltas);
+        let (changed, deltas) = diff_rank_based(&rows, &state);
         assert!(changed.is_empty());
         assert!(deltas.is_empty());
     }
@@ -324,13 +330,15 @@ mod tests {
     fn diff_score_change_only_marks_that_rank() {
         let initial = vec![ranking(1, 100, 1000, "a"), ranking(2, 200, 900, "b")];
         let mut state = HashMap::new();
-        diff_rank_based(&initial, &mut state);
+        let (_, deltas) = diff_rank_based(&initial, &state);
+        state.extend(deltas);
 
         let updated = vec![ranking(1, 100, 1100, "a"), ranking(2, 200, 900, "b")];
-        let (changed, deltas) = diff_rank_based(&updated, &mut state);
+        let (changed, deltas) = diff_rank_based(&updated, &state);
         assert_eq!(changed, vec![0]);
         assert_eq!(deltas.len(), 1);
         assert_eq!(deltas[&1].score, 1100);
+        state.extend(deltas);
         assert_eq!(state[&1].score, 1100);
         assert_eq!(state[&2].score, 900);
     }
@@ -338,10 +346,11 @@ mod tests {
     #[test]
     fn diff_user_change_at_same_rank_is_a_change() {
         let mut state = HashMap::new();
-        diff_rank_based(&[ranking(1, 100, 1000, "a")], &mut state);
-        let (changed, _) = diff_rank_based(&[ranking(1, 999, 1000, "x")], &mut state);
+        let (_, deltas) = diff_rank_based(&[ranking(1, 100, 1000, "a")], &state);
+        state.extend(deltas);
+        let (changed, deltas) = diff_rank_based(&[ranking(1, 999, 1000, "x")], &state);
         assert_eq!(changed, vec![0]);
-        assert_eq!(state[&1].user_id, "999");
+        assert_eq!(deltas[&1].user_id, "999");
     }
 
     #[test]
@@ -359,11 +368,10 @@ mod tests {
             user_honor_missions: Vec::new(),
             user_player_frames: Vec::new(),
         }];
-        let mut state = HashMap::new();
-        let (changed, deltas) = diff_rank_based(&rows, &mut state);
+        let state = HashMap::new();
+        let (changed, deltas) = diff_rank_based(&rows, &state);
         assert!(changed.is_empty());
         assert!(deltas.is_empty());
-        assert!(state.is_empty());
     }
 
     #[test]
