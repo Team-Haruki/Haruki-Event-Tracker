@@ -3,7 +3,8 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use axum_server::Handle;
-use axum_server::tls_rustls::RustlsConfig;
+use axum_server::accept::NoDelayAcceptor;
+use axum_server::tls_rustls::{RustlsAcceptor, RustlsConfig};
 
 use haruki_event_tracker::{api, app, config, logger, shutdown};
 
@@ -113,13 +114,15 @@ async fn main() -> ExitCode {
                 }
             };
         tracing::info!(addr = %addr, cert = %cfg.backend.ssl_cert, "HTTPS server listening");
-        axum_server::bind_rustls(addr, tls)
+        axum_server::bind(addr)
+            .acceptor(RustlsAcceptor::new(tls).acceptor(NoDelayAcceptor::new()))
             .handle(handle)
             .serve(make_service)
             .await
     } else {
         tracing::info!(addr = %addr, "HTTP server listening");
         axum_server::bind(addr)
+            .acceptor(NoDelayAcceptor::new())
             .handle(handle)
             .serve(make_service)
             .await

@@ -8,9 +8,7 @@ use crate::api::handler::leaderboard::service::{
 use crate::api::handler::web::UserSearchQuery;
 use crate::api::json::{Json, RawJson};
 use crate::api::state::AppState;
-use crate::model::api::{
-    WebRankDetailResponseSchema, WebUserDetailResponseSchema, WebUserSearchPageSchema,
-};
+use crate::model::api::{WebRankDetailResponseSchema, WebUserDetailResponseSchema};
 
 #[tracing::instrument(skip(state, query), fields(server, event_id))]
 pub async fn total_overview(
@@ -97,6 +95,6 @@ pub async fn world_bloom_users(
     State(state): State<AppState>,
     Path((server, event_id, _character_id)): Path<(String, i64, i64)>,
     Query(query): Query<UserSearchQuery>,
-) -> Result<Json<WebUserSearchPageSchema>, ApiError> {
+) -> Result<RawJson, ApiError> {
     crate::api::handler::web::users(State(state), Path((server, event_id)), Query(query)).await
 }

@@ -361,16 +361,12 @@ impl ApiCache {
             return fetch.await;
         }
         let key = static_value_key(server, event_id, &suffix);
+        // L1 entries are validated on the way in (fresh encode or checked L2
+        // read), so hits skip re-validation — it would re-parse the payload.
         if let Some(bytes) = self.l1.get_value(&key) {
-            if cached_bytes_are_valid(options, &bytes) {
-                incr(&CACHE_STATS.l1_hit);
-                tracing::debug!(cache_status = "static_l1_hit", "api static cache L1 hit");
-                return Ok(bytes);
-            }
-            tracing::warn!(
-                cache_status = "static_l1_invalid",
-                "api static cache L1 invalid"
-            );
+            incr(&CACHE_STATS.l1_hit);
+            tracing::debug!(cache_status = "static_l1_hit", "api static cache L1 hit");
+            return Ok(bytes);
         }
 
         self.lookup_with_singleflight(
@@ -445,19 +441,19 @@ impl ApiCache {
                     .await;
             }
             let key = value_key(server, event_id, control.epoch, &suffix);
+            // L1 entries are validated on the way in (fresh encode or checked
+            // L2 read), so hits skip re-validation — it would re-parse the
+            // payload on the warmest path.
             if let Some(bytes) = self.l1.get_value(&key) {
-                if cached_bytes_are_valid(options, &bytes) {
-                    incr(&CACHE_STATS.l1_hit);
-                    if options.is_batch {
-                        incr(&CACHE_STATS.batch_l1_hit);
-                    }
-                    tracing::debug!(
-                        cache_status = cache_status(options, "l1_hit"),
-                        "api cache L1 hit"
-                    );
-                    return Ok(bytes);
+                incr(&CACHE_STATS.l1_hit);
+                if options.is_batch {
+                    incr(&CACHE_STATS.batch_l1_hit);
                 }
-                tracing::warn!(cache_status = "l1_invalid", "api cache L1 invalid");
+                tracing::debug!(
+                    cache_status = cache_status(options, "l1_hit"),
+                    "api cache L1 hit"
+                );
+                return Ok(bytes);
             }
             return self
                 .lookup_with_singleflight(

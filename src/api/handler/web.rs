@@ -6,7 +6,7 @@ use serde::Deserialize;
 use crate::api::cache::CacheTtl;
 use crate::api::error::ApiError;
 use crate::api::extract::resolve_region_engine;
-use crate::api::json::{Json, RawJson};
+use crate::api::json::RawJson;
 use crate::api::state::AppState;
 use crate::db::engine::DatabaseEngine;
 use crate::db::query::growth::{
@@ -99,7 +99,7 @@ pub async fn rankings(
     State(state): State<AppState>,
     Path((server, event_id)): Path<(String, i64)>,
     Query(query): Query<RankingSearchQuery>,
-) -> Result<Json<WebRankingPageSchema>, ApiError> {
+) -> Result<RawJson, ApiError> {
     let (region, engine) = resolve_region_engine(&state, &server)?;
     let filter = query.into_filter()?;
     let suffix = format!("web:v2:rankings:{}", filter.cache_key());
@@ -112,7 +112,7 @@ pub async fn rankings(
         })
     };
     let response = cached(&state, &server, event_id, suffix, fetch).await?;
-    Ok(Json(response))
+    Ok(RawJson(response))
 }
 
 #[tracing::instrument(skip(state, query), fields(server, event_id))]
@@ -139,7 +139,7 @@ pub async fn world_bloom_rankings(
     State(state): State<AppState>,
     Path((server, event_id, character_id)): Path<(String, i64, i64)>,
     Query(query): Query<RankingSearchQuery>,
-) -> Result<Json<WebRankingPageSchema>, ApiError> {
+) -> Result<RawJson, ApiError> {
     let (region, engine) = resolve_region_engine(&state, &server)?;
     let filter = query.into_filter()?;
     let suffix = format!("web:v2:wb:{character_id}:rankings:{}", filter.cache_key());
@@ -153,7 +153,7 @@ pub async fn world_bloom_rankings(
         })
     };
     let response = cached(&state, &server, event_id, suffix, fetch).await?;
-    Ok(Json(response))
+    Ok(RawJson(response))
 }
 
 #[tracing::instrument(skip(state, query), fields(server, event_id, character_id))]
@@ -180,7 +180,7 @@ pub async fn user_trace(
     State(state): State<AppState>,
     Path((server, event_id, user_id)): Path<(String, i64, String)>,
     Query(query): Query<UserTraceQuery>,
-) -> Result<Json<UserAllRankingDataQueryResponseSchema>, ApiError> {
+) -> Result<RawJson, ApiError> {
     let (region, engine) = resolve_region_engine(&state, &server)?;
     let filter = query.into_filter()?;
     let suffix = format!("web:trace:user:{user_id}:{}", filter.cache_key());
@@ -196,8 +196,8 @@ pub async fn user_trace(
             user_data: None,
         })
     };
-    let response = cached_trace(&state, &server, event_id, suffix, fetch).await?;
-    Ok(Json(response))
+    let response = cached_trace_bytes(&state, &server, event_id, suffix, fetch).await?;
+    Ok(RawJson(response))
 }
 
 #[tracing::instrument(skip(state, query), fields(server, event_id, character_id, user_id))]
@@ -205,7 +205,7 @@ pub async fn world_bloom_user_trace(
     State(state): State<AppState>,
     Path((server, event_id, character_id, user_id)): Path<(String, i64, i64, String)>,
     Query(query): Query<UserTraceQuery>,
-) -> Result<Json<UserAllRankingDataQueryResponseSchema>, ApiError> {
+) -> Result<RawJson, ApiError> {
     let (region, engine) = resolve_region_engine(&state, &server)?;
     let filter = query.into_filter()?;
     let suffix = format!(
@@ -226,8 +226,8 @@ pub async fn world_bloom_user_trace(
             user_data: None,
         })
     };
-    let response = cached_trace(&state, &server, event_id, suffix, fetch).await?;
-    Ok(Json(response))
+    let response = cached_trace_bytes(&state, &server, event_id, suffix, fetch).await?;
+    Ok(RawJson(response))
 }
 
 #[tracing::instrument(skip(state, query), fields(server, event_id))]
@@ -235,7 +235,7 @@ pub async fn users(
     State(state): State<AppState>,
     Path((server, event_id)): Path<(String, i64)>,
     Query(query): Query<UserSearchQuery>,
-) -> Result<Json<WebUserSearchPageSchema>, ApiError> {
+) -> Result<RawJson, ApiError> {
     let (region, engine) = resolve_region_engine(&state, &server)?;
     let filter = query.into_filter()?;
     let suffix = format!("web:users:{}", filter.cache_key());
@@ -248,7 +248,7 @@ pub async fn users(
         })
     };
     let response = cached(&state, &server, event_id, suffix, fetch).await?;
-    Ok(Json(response))
+    Ok(RawJson(response))
 }
 
 pub async fn build_overview(
@@ -581,20 +581,22 @@ impl WebUserSearchFilter {
     }
 }
 
+/// The handlers below return the cached type verbatim, so they take the raw
+/// cached bytes instead of decode + re-encode round-tripping the payload.
 async fn cached<T, Fut>(
     state: &AppState,
     server: &str,
     event_id: i64,
     suffix: String,
     fetch: Fut,
-) -> Result<T, ApiError>
+) -> Result<Bytes, ApiError>
 where
-    T: serde::Serialize + serde::de::DeserializeOwned,
+    T: serde::Serialize,
     Fut: std::future::Future<Output = Result<T, ApiError>>,
 {
     if let Some(cache) = state.cache() {
         cache
-            .get_or_fetch(
+            .get_or_fetch_json_bytes(
                 server,
                 event_id,
                 suffix,
@@ -603,8 +605,47 @@ where
             )
             .await
     } else {
-        fetch.await
+        encode_fetched(fetch).await
     }
+}
+
+async fn cached_trace_bytes<T, Fut>(
+    state: &AppState,
+    server: &str,
+    event_id: i64,
+    suffix: String,
+    fetch: Fut,
+) -> Result<Bytes, ApiError>
+where
+    T: serde::Serialize,
+    Fut: std::future::Future<Output = Result<T, ApiError>>,
+{
+    if let Some(cache) = state.cache() {
+        cache
+            .get_or_fetch_json_bytes(
+                server,
+                event_id,
+                suffix,
+                cache.ttl(CacheTtl::TraceRank),
+                fetch,
+            )
+            .await
+    } else {
+        encode_fetched(fetch).await
+    }
+}
+
+async fn encode_fetched<T, Fut>(fetch: Fut) -> Result<Bytes, ApiError>
+where
+    T: serde::Serialize,
+    Fut: std::future::Future<Output = Result<T, ApiError>>,
+{
+    fetch.await.and_then(|value| {
+        sonic_rs::to_vec(&value).map(Bytes::from).map_err(|err| {
+            tracing::error!(?err, "json encode error");
+            ApiError::ServiceUnavailable("json encode error".into())
+        })
+    })
 }
 
 pub async fn cached_overview_bytes<T, Fut>(
@@ -642,12 +683,7 @@ where
                 .await
         }
     } else {
-        fetch.await.and_then(|value| {
-            sonic_rs::to_vec(&value).map(Bytes::from).map_err(|err| {
-                tracing::error!(?err, "json encode error");
-                ApiError::ServiceUnavailable("json encode error".into())
-            })
-        })
+        encode_fetched(fetch).await
     }
 }
 
