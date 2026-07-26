@@ -218,9 +218,14 @@ pub fn build_event_records(
     seen.into_values().collect()
 }
 
+/// `skip_unchanged(character_id, uid, score, rank)` is consulted *before*
+/// the row's profile is deep-cloned and stringified, so callers that track
+/// per-user state can drop steady-state rows at near-zero cost. Returning
+/// `false` for everything reproduces the unfiltered behaviour.
 pub fn build_world_bloom_rows(
     record_time: i64,
     per_char: &HashMap<i64, Vec<PlayerRankingSchema>>,
+    mut skip_unchanged: impl FnMut(i64, i64, i64, i64) -> bool,
 ) -> Vec<PlayerWorldBloomRankingRecordSchema> {
     let mut out = Vec::new();
     for (&character_id, rankings) in per_char {
@@ -228,6 +233,9 @@ pub fn build_world_bloom_rows(
             let (Some(rank), Some(score), Some(uid)) = (r.rank, r.score, r.user_id) else {
                 continue;
             };
+            if skip_unchanged(character_id, uid, score, rank) {
+                continue;
+            }
             let Some(name) = r.name.clone() else {
                 continue;
             };

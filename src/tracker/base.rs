@@ -68,6 +68,10 @@ pub struct EventTrackerBase {
     last_post_end_user_refresh_at: Option<i64>,
     prev_rank_state: HashMap<i64, RankState>,
     prev_world_bloom_state: HashMap<WorldBloomKey, PlayerState>,
+    /// `uid -> user_id_key` learned from earlier ticks. Lets the World Bloom
+    /// pre-diff drop unchanged rows before their profiles are deep-cloned
+    /// and serialized; misses just mean the row is treated as changed.
+    wl_user_keys: HashMap<i64, i64>,
 }
 
 impl EventTrackerBase {
@@ -107,6 +111,7 @@ impl EventTrackerBase {
             last_post_end_user_refresh_at: None,
             prev_rank_state: HashMap::new(),
             prev_world_bloom_state: HashMap::new(),
+            wl_user_keys: HashMap::new(),
         }
     }
 
@@ -296,7 +301,21 @@ impl EventTrackerBase {
             records = build_event_records(data.record_time, &diffed);
         }
 
-        let wl_rows = build_world_bloom_rows(data.record_time, &data.world_bloom_rankings);
+        let wl_rows = build_world_bloom_rows(
+            data.record_time,
+            &data.world_bloom_rankings,
+            |character_id, uid, score, rank| {
+                let Some(&user_id_key) = self.wl_user_keys.get(&uid) else {
+                    return false;
+                };
+                self.prev_world_bloom_state
+                    .get(&WorldBloomKey {
+                        user_id_key,
+                        character_id,
+                    })
+                    .is_some_and(|p| p.score == score && p.rank == rank)
+            },
+        );
         let will_write = !records.is_empty() || !wl_rows.is_empty();
         if will_write
             && let Some(conn) = self.api_cache_redis.as_mut()
@@ -334,6 +353,7 @@ impl EventTrackerBase {
                 &self.anonymizer,
                 &wl_rows,
                 &mut self.prev_world_bloom_state,
+                &mut self.wl_user_keys,
             )
             .await
             {
@@ -439,7 +459,7 @@ fn collect_visible_user_records(
     let refs: Vec<&PlayerRankingSchema> = data.rankings.iter().collect();
     let mut out = build_event_records(record_time, &refs);
     out.extend(
-        build_world_bloom_rows(record_time, &data.world_bloom_rankings)
+        build_world_bloom_rows(record_time, &data.world_bloom_rankings, |_, _, _, _| false)
             .into_iter()
             .map(|row| row.base),
     );

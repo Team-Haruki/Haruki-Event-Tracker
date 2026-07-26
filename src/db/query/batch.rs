@@ -525,6 +525,7 @@ pub async fn batch_insert_world_bloom_rankings(
     anonymizer: &UidAnonymizer,
     records: &[PlayerWorldBloomRankingRecordSchema],
     prev_state: &mut HashMap<WorldBloomKey, PlayerState>,
+    user_key_cache: &mut HashMap<i64, i64>,
 ) -> Result<usize, DbErr> {
     if records.is_empty() {
         return Ok(0);
@@ -542,6 +543,13 @@ pub async fn batch_insert_world_bloom_rankings(
     );
     let user_lookup =
         batch_get_or_create_user_id_keys(engine.conn(), backend, users_tbl, &users).await?;
+    // Feed the tracker's uid -> key memo so future ticks can pre-diff these
+    // users before materializing their rows at all.
+    for (user_id, key) in &user_lookup {
+        if let Ok(uid) = user_id.parse::<i64>() {
+            user_key_cache.insert(uid, *key);
+        }
+    }
 
     // Diff against the previous state outside the transaction: a no-change
     // tick never opens one, and the state map is only updated after the
@@ -743,6 +751,7 @@ mod tests {
             .unwrap();
 
         let mut prev_state = HashMap::new();
+        let mut user_keys = HashMap::new();
         let mut record = PlayerWorldBloomRankingRecordSchema {
             base: PlayerEventRankingRecordSchema {
                 timestamp: 1_710_000_000,
@@ -763,6 +772,7 @@ mod tests {
             &UidAnonymizer::disabled(),
             &[record.clone()],
             &mut prev_state,
+            &mut user_keys,
         )
         .await
         .unwrap();
@@ -776,6 +786,7 @@ mod tests {
             &UidAnonymizer::disabled(),
             &[record.clone()],
             &mut prev_state,
+            &mut user_keys,
         )
         .await
         .unwrap();
@@ -790,6 +801,7 @@ mod tests {
             &UidAnonymizer::disabled(),
             &[record],
             &mut prev_state,
+            &mut user_keys,
         )
         .await
         .unwrap();
