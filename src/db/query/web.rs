@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use sea_orm::sea_query::{
     Alias, Expr, IntoCondition, JoinType, Order, Query, SelectStatement, SimpleExpr,
 };
@@ -776,7 +778,10 @@ pub async fn search_ranking_rows(
             Expr::col((users_tbl, event_users::Column::UserIdKey)),
             filter,
         );
-        stmt.order_by((time_tbl, time_id::Column::Timestamp), Order::Desc)
+        // `time_id` is monotone with `timestamp`, so ordering by the ranking
+        // table's own column lets the `(time_id, rank)` index provide the
+        // order without a join-then-sort (see the note in `ranking.rs`).
+        stmt.order_by((event_tbl.clone(), event::Column::TimeId), Order::Desc)
             .order_by((event_tbl.clone(), event::Column::Rank), Order::Asc)
             .order_by((event_tbl, event::Column::UserIdKey), Order::Asc)
             .limit(filter.limit + 1)
@@ -839,7 +844,7 @@ pub async fn search_world_bloom_ranking_rows(
             Expr::col((users_tbl, event_users::Column::UserIdKey)),
             filter,
         );
-        stmt.order_by((time_tbl, time_id::Column::Timestamp), Order::Desc)
+        stmt.order_by((wl_tbl.clone(), world_bloom::Column::TimeId), Order::Desc)
             .order_by((wl_tbl.clone(), world_bloom::Column::Rank), Order::Asc)
             .order_by((wl_tbl, world_bloom::Column::UserIdKey), Order::Asc)
             .limit(filter.limit + 1)
@@ -1131,17 +1136,17 @@ fn build_top_player_growths(
     rows: Vec<PlayerGrowthRow>,
     character_id: Option<i64>,
 ) -> Vec<TopRankingPlayerGrowthSchema> {
+    let earliest = earliest_rows_by_user(&rows);
     top_rows
         .iter()
         .filter_map(|top| {
             build_top_player_growth(
-                top.user_id_key(),
                 top.user_id(),
                 top.rank(),
                 top.score(),
                 top.timestamp(),
                 character_id,
-                &rows,
+                earliest.get(&top.user_id_key()).copied(),
             )
         })
         .collect()
@@ -1152,43 +1157,42 @@ fn build_wb_top_player_growths(
     rows: Vec<PlayerGrowthRow>,
     character_id: Option<i64>,
 ) -> Vec<TopRankingPlayerGrowthSchema> {
+    let earliest = earliest_rows_by_user(&rows);
     top_rows
         .iter()
         .filter_map(|top| {
             build_top_player_growth(
-                top.user_id_key(),
                 top.user_id(),
                 top.rank(),
                 top.score(),
                 top.timestamp(),
                 character_id.or_else(|| top.character_id()),
-                &rows,
+                earliest.get(&top.user_id_key()).copied(),
             )
         })
         .collect()
 }
 
+/// Rows arrive ordered `(user_id_key ASC, timestamp ASC)`, so the first row
+/// seen per user is that user's earliest in the window. Indexing once keeps
+/// the per-top-row lookup O(1) instead of rescanning the whole window.
+fn earliest_rows_by_user(rows: &[PlayerGrowthRow]) -> HashMap<i64, &PlayerGrowthRow> {
+    let mut earliest: HashMap<i64, &PlayerGrowthRow> = HashMap::with_capacity(rows.len().min(128));
+    for row in rows {
+        earliest.entry(row.user_id_key).or_insert(row);
+    }
+    earliest
+}
+
 fn build_top_player_growth(
-    user_id_key: i64,
     user_id: &str,
     latest_rank: i64,
     latest_score: i64,
     latest_timestamp: i64,
     character_id: Option<i64>,
-    rows: &[PlayerGrowthRow],
+    earliest: Option<&PlayerGrowthRow>,
 ) -> Option<TopRankingPlayerGrowthSchema> {
-    let mut earlier: Option<&PlayerGrowthRow> = None;
-    let mut has_distinct_latest = false;
-    for row in rows.iter().filter(|row| row.user_id_key == user_id_key) {
-        if row.timestamp < latest_timestamp {
-            earlier.get_or_insert(row);
-            has_distinct_latest = true;
-        }
-    }
-    let earlier = earlier?;
-    if !has_distinct_latest || earlier.timestamp == latest_timestamp {
-        return None;
-    }
+    let earlier = earliest.filter(|row| row.timestamp < latest_timestamp)?;
     Some(TopRankingPlayerGrowthSchema {
         rank: latest_rank,
         user_id: user_id.to_owned(),

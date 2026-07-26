@@ -60,19 +60,22 @@ pub fn diff_rank_based(
         let (Some(rank), Some(score), Some(uid)) = (r.rank, r.score, r.user_id) else {
             continue;
         };
-        let user_id = uid.to_string();
+        // Compare before allocating: in steady state most ranks are
+        // unchanged, and stored ids are canonical decimal (ours and Go's),
+        // so parsing back is an exact equality check.
+        let unchanged = prev_rank_state
+            .get(&rank)
+            .is_some_and(|prev| prev.score == score && prev.user_id.parse() == Ok(uid));
+        if unchanged {
+            continue;
+        }
         let new_state = RankState {
-            user_id: user_id.clone(),
+            user_id: uid.to_string(),
             score,
         };
-        match prev_rank_state.get(&rank) {
-            Some(prev) if prev.score == score && prev.user_id == user_id => {}
-            _ => {
-                prev_rank_state.insert(rank, new_state.clone());
-                changed_ranks.insert(rank, new_state);
-                changed_idx.push(i);
-            }
-        }
+        prev_rank_state.insert(rank, new_state.clone());
+        changed_ranks.insert(rank, new_state);
+        changed_idx.push(i);
     }
     (changed_idx, changed_ranks)
 }

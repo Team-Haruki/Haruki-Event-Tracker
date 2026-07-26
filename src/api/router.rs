@@ -6,8 +6,10 @@ use std::sync::Arc;
 use axum::Router;
 use axum::middleware;
 use axum::routing::get;
+use tower_http::CompressionLevel;
 use tower_http::catch_panic::CatchPanicLayer;
 use tower_http::compression::CompressionLayer;
+use tower_http::compression::predicate::{DefaultPredicate, Predicate, SizeAbove};
 
 use crate::api::access_log::{self, ProxyTrust};
 use crate::api::handler::{health, leaderboard, private, status, web};
@@ -29,7 +31,16 @@ pub fn build_router(state: AppState, trust: Arc<ProxyTrust>) -> Router {
         .merge(web_v2_routes(trust.clone()))
         .with_state(state)
         .layer(axum::middleware::from_fn_with_state(trust, access_log::log))
-        .layer(CompressionLayer::new().gzip(true).br(true))
+        // Without an explicit quality tower-http hands brotli its library
+        // default (quality 11, ~1 MB/s); browsers prefer br over gzip, so
+        // every large response would eat that cost inline on a worker.
+        .layer(
+            CompressionLayer::new()
+                .gzip(true)
+                .br(true)
+                .quality(CompressionLevel::Precise(4))
+                .compress_when(SizeAbove::new(1024).and(DefaultPredicate::new())),
+        )
         .layer(CatchPanicLayer::new())
 }
 

@@ -114,6 +114,7 @@ fn take(counter: &AtomicU64) -> u64 {
 }
 
 fn log_snapshot() {
+    let (main_log_dropped, access_log_dropped) = crate::logger::file_sink_dropped_lines();
     tracing::info!(
         target: "api_stats",
         l1_hit = take(&CACHE_STATS.l1_hit),
@@ -134,6 +135,9 @@ fn log_snapshot() {
         access_sampled = take(&ACCESS_STATS.sampled),
         access_dropped = take(&ACCESS_STATS.dropped),
         service_unavailable = take(&API_STATS.service_unavailable),
+        // Cumulative, not per-interval: `ErrorCounter` has no reset API.
+        main_log_dropped_total = main_log_dropped,
+        access_log_dropped_total = access_log_dropped,
         "api aggregate stats"
     );
 }

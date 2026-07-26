@@ -1,19 +1,18 @@
-//! Parallel per-rank "score growth over time window" lookups for the
+//! Per-rank "score growth over time window" lookups for the
 //! `/score-growths` endpoint (Go: `FetchRankingScoreGrowths`,
 //! `FetchWorldBloomRankingScoreGrowths`).
 //!
-//! For each rank we only need the earliest and latest row in the window, so
-//! we issue two `LIMIT 1` index seeks (ASC + DESC) instead of streaming the
-//! whole window. Ranks with fewer than two rows are skipped. Errors are
-//! silently dropped to mirror the Go goroutines.
+//! Each rank only needs the earliest and latest row in the window. Both
+//! edges are resolved for all ranks at once — one `MIN(time_id)` and one
+//! `MAX(time_id)` grouped subquery joined back to the ranking table — so
+//! the whole endpoint costs two round trips instead of two per rank.
+//! Ranks with fewer than two rows are skipped. Errors are silently
+//! dropped to mirror the Go goroutines.
 
-use futures::StreamExt;
-use futures::stream;
-use sea_orm::sea_query::{Alias, Expr, Order, Query, SelectStatement};
-use sea_orm::{DbErr, ExprTrait, FromQueryResult};
+use sea_orm::DbErr;
 
 use crate::db::engine::DatabaseEngine;
-use crate::db::entity::{event, time_id, world_bloom};
+use crate::db::query::lines::{RankEdge, RankEdgeSpec, fetch_rank_edge_rows, rank_edge_select};
 use crate::db::table_name::{TableKind, intern};
 use crate::model::api::{RankingLineScoreSchema, RankingScoreGrowthSchema};
 
@@ -40,40 +39,28 @@ fn build_growth(
     })
 }
 
-const GROWTH_CONCURRENCY: usize = 8;
-
-async fn fetch_window_edges(
+async fn fetch_growths(
     engine: &DatabaseEngine,
-    rank_tbl: &'static str,
-    base: SelectStatement,
-) -> Result<
-    (
-        Option<RankingLineScoreSchema>,
-        Option<RankingLineScoreSchema>,
-    ),
-    DbErr,
-> {
-    let backend = engine.backend();
-    // Order by the ranking table's own `time_id` (monotone with
-    // `timestamp`) so the `(rank, time_id)` index serves each edge as a
-    // single seek — see the note in `ranking.rs`.
-    let earliest = base
-        .clone()
-        .order_by((Alias::new(rank_tbl), Alias::new("time_id")), Order::Asc)
-        .limit(1)
-        .to_owned();
-    let latest = base
-        .clone()
-        .order_by((Alias::new(rank_tbl), Alias::new("time_id")), Order::Desc)
-        .limit(1)
-        .to_owned();
-    let earliest = RankingLineScoreSchema::find_by_statement(backend.build(&earliest))
-        .one(engine.conn())
-        .await?;
-    let latest = RankingLineScoreSchema::find_by_statement(backend.build(&latest))
-        .one(engine.conn())
-        .await?;
-    Ok((earliest, latest))
+    spec: RankEdgeSpec,
+    ranks: &[i64],
+    start_time: i64,
+    end_time: Option<i64>,
+) -> Result<Vec<RankingScoreGrowthSchema>, DbErr> {
+    let earliest_stmt =
+        rank_edge_select(&spec, ranks, RankEdge::Earliest, Some(start_time), end_time);
+    let latest_stmt = rank_edge_select(&spec, ranks, RankEdge::Latest, Some(start_time), end_time);
+    let (mut earliest, mut latest) = tokio::join!(
+        fetch_rank_edge_rows(engine, &earliest_stmt),
+        fetch_rank_edge_rows(engine, &latest_stmt),
+    );
+    Ok(ranks
+        .iter()
+        .filter_map(|rank| {
+            let earlier = earliest.remove(rank)?;
+            let latest = latest.remove(rank)?;
+            build_growth(*rank, earlier, latest)
+        })
+        .collect())
 }
 
 #[tracing::instrument(skip(engine, ranks), fields(event_id, ranks_len = ranks.len(), start_time))]
@@ -84,54 +71,12 @@ pub async fn fetch_ranking_score_growths(
     start_time: i64,
     end_time: Option<i64>,
 ) -> Result<Vec<RankingScoreGrowthSchema>, DbErr> {
-    let event_tbl = intern(TableKind::Event, event_id);
-    let time_tbl = intern(TableKind::TimeId, event_id);
-
-    let futs = ranks.iter().copied().map(|rank| {
-        let mut base = Query::select()
-            .expr_as(
-                Expr::col((Alias::new(time_tbl), time_id::Column::Timestamp)),
-                Alias::new("timestamp"),
-            )
-            .expr_as(
-                Expr::col((Alias::new(event_tbl), event::Column::Score)),
-                Alias::new("score"),
-            )
-            .expr_as(
-                Expr::col((Alias::new(event_tbl), event::Column::Rank)),
-                Alias::new("rank"),
-            )
-            .from(Alias::new(event_tbl))
-            .inner_join(
-                Alias::new(time_tbl),
-                Expr::col((Alias::new(event_tbl), event::Column::TimeId))
-                    .equals((Alias::new(time_tbl), time_id::Column::TimeId)),
-            )
-            .and_where(Expr::col((Alias::new(event_tbl), event::Column::Rank)).eq(rank))
-            .and_where(
-                Expr::col((Alias::new(time_tbl), time_id::Column::Timestamp)).gte(start_time),
-            )
-            .to_owned();
-        if let Some(end_time) = end_time {
-            base.and_where(
-                Expr::col((Alias::new(time_tbl), time_id::Column::Timestamp)).lte(end_time),
-            );
-        }
-
-        async move { (rank, fetch_window_edges(engine, event_tbl, base).await) }
-    });
-
-    let results: Vec<_> = stream::iter(futs)
-        .buffered(GROWTH_CONCURRENCY)
-        .collect()
-        .await;
-    Ok(results
-        .into_iter()
-        .filter_map(|(rank, res)| {
-            let (earliest, latest) = res.ok()?;
-            build_growth(rank, earliest?, latest?)
-        })
-        .collect())
+    let spec = RankEdgeSpec {
+        tbl: intern(TableKind::Event, event_id),
+        time_tbl: intern(TableKind::TimeId, event_id),
+        character_id: None,
+    };
+    fetch_growths(engine, spec, ranks, start_time, end_time).await
 }
 
 #[tracing::instrument(skip(engine, ranks), fields(event_id, character_id, ranks_len = ranks.len(), start_time))]
@@ -143,55 +88,10 @@ pub async fn fetch_world_bloom_ranking_score_growths(
     start_time: i64,
     end_time: Option<i64>,
 ) -> Result<Vec<RankingScoreGrowthSchema>, DbErr> {
-    let wl_tbl = intern(TableKind::WorldBloom, event_id);
-    let time_tbl = intern(TableKind::TimeId, event_id);
-
-    let futs = ranks.iter().copied().map(|rank| {
-        let mut base = Query::select()
-            .expr_as(
-                Expr::col((Alias::new(time_tbl), time_id::Column::Timestamp)),
-                Alias::new("timestamp"),
-            )
-            .expr_as(
-                Expr::col((Alias::new(wl_tbl), world_bloom::Column::Score)),
-                Alias::new("score"),
-            )
-            .expr_as(
-                Expr::col((Alias::new(wl_tbl), world_bloom::Column::Rank)),
-                Alias::new("rank"),
-            )
-            .from(Alias::new(wl_tbl))
-            .inner_join(
-                Alias::new(time_tbl),
-                Expr::col((Alias::new(wl_tbl), world_bloom::Column::TimeId))
-                    .equals((Alias::new(time_tbl), time_id::Column::TimeId)),
-            )
-            .and_where(Expr::col((Alias::new(wl_tbl), world_bloom::Column::Rank)).eq(rank))
-            .and_where(
-                Expr::col((Alias::new(wl_tbl), world_bloom::Column::CharacterId)).eq(character_id),
-            )
-            .and_where(
-                Expr::col((Alias::new(time_tbl), time_id::Column::Timestamp)).gte(start_time),
-            )
-            .to_owned();
-        if let Some(end_time) = end_time {
-            base.and_where(
-                Expr::col((Alias::new(time_tbl), time_id::Column::Timestamp)).lte(end_time),
-            );
-        }
-
-        async move { (rank, fetch_window_edges(engine, wl_tbl, base).await) }
-    });
-
-    let results: Vec<_> = stream::iter(futs)
-        .buffered(GROWTH_CONCURRENCY)
-        .collect()
-        .await;
-    Ok(results
-        .into_iter()
-        .filter_map(|(rank, res)| {
-            let (earliest, latest) = res.ok()?;
-            build_growth(rank, earliest?, latest?)
-        })
-        .collect())
+    let spec = RankEdgeSpec {
+        tbl: intern(TableKind::WorldBloom, event_id),
+        time_tbl: intern(TableKind::TimeId, event_id),
+        character_id: Some(character_id),
+    };
+    fetch_growths(engine, spec, ranks, start_time, end_time).await
 }

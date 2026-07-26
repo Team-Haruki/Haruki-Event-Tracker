@@ -33,15 +33,16 @@ pub async fn detect_cache(
     hash: &[u8; 32],
 ) -> Result<bool, redis::RedisError> {
     let new_hex = hex_of(hash);
-    let cached: Option<String> = conn.get(key).await?;
+    // GETSET stores the new hash and returns the previous one in a single
+    // round trip; a hit rewrites the same bytes, which is harmless.
+    let cached: Option<String> = conn.getset(key, &new_hex).await?;
     match cached {
         Some(prev) if prev == new_hex => {
             tracing::debug!("border cache hit");
             Ok(true)
         }
         _ => {
-            tracing::debug!("border cache miss, refreshing");
-            conn.set::<_, _, ()>(key, new_hex).await?;
+            tracing::debug!("border cache miss, refreshed");
             Ok(false)
         }
     }

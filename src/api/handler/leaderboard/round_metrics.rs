@@ -1,4 +1,6 @@
 use chrono::{DateTime, Utc};
+use futures::StreamExt;
+use futures::stream;
 
 use crate::api::extract::{prepare_user_id_mode, resolve_region_engine};
 use crate::api::state::AppState;
@@ -39,9 +41,10 @@ pub(super) async fn enrich_cloud_rank_infos_with_trace_metrics(
     if jobs.is_empty() {
         return;
     }
-    // Per-rank fetches are independent; run them concurrently and let the
-    // trace limiter bound how many actually hit the DB at once.
-    let traces = futures::future::join_all(jobs.into_iter().map(|(idx, user_id, timestamp)| {
+    // Per-rank fetches are independent; run them concurrently but bounded, so
+    // one 100-rank batch can't park 100 waiters on the trace-permit queue
+    // ahead of every other request.
+    let traces: Vec<_> = stream::iter(jobs.into_iter().map(|(idx, user_id, timestamp)| {
         let engine = engine.clone();
         async move {
             let Ok(_permit) = state.query_limiter().acquire_trace(region).await else {
@@ -65,6 +68,8 @@ pub(super) async fn enrich_cloud_rank_infos_with_trace_metrics(
             (idx, trace.ok())
         }
     }))
+    .buffer_unordered(state.query_limiter().batch_trace_fill_concurrency())
+    .collect()
     .await;
     let now = Utc::now();
     for (idx, trace) in traces {
