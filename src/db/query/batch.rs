@@ -2,9 +2,11 @@
 //! (Go: `BatchInsertEventRankings`, `BatchInsertWorldBloomRankings`,
 //! `batchGetOrCreateTimeIDs`, `batchGetOrCreateUserIDKeys`).
 //!
-//! `batch_get_or_create_time_ids` and `batch_get_or_create_user_id_keys`
-//! both execute inside the caller's transaction so the time-id /
-//! user-id-key dimension rows and the ranking rows commit atomically.
+//! `batch_get_or_create_time_ids` executes inside the caller's transaction
+//! so the time-id row and the ranking rows commit atomically. The user
+//! dimension upsert is idempotent and independently useful, so it runs
+//! *before* the transaction — keeping the write transaction (and its row
+//! locks on `event_<id>_users`) as short as possible.
 
 use std::collections::{HashMap, HashSet};
 
@@ -28,6 +30,10 @@ struct TimeIdRow {
     time_id: i64,
 }
 
+/// Lean per-user dimension state: everything needed to decide whether the
+/// stored row differs from the incoming payload. Profile columns (three of
+/// them multi-KB JSON blobs) are folded into `profile_hash` so the per-tick
+/// read-back never transfers them.
 #[derive(FromQueryResult)]
 struct UserKeyRow {
     user_id: String,
@@ -35,15 +41,13 @@ struct UserKeyRow {
     unique_id: Option<String>,
     name: String,
     cheerful_team_id: Option<i64>,
-    card_id: Option<i64>,
-    card_level: Option<i64>,
-    card_master_rank: Option<i64>,
-    card_special_training_status: Option<String>,
-    card_default_image: Option<String>,
-    profile_word: Option<String>,
-    profile_honors_json: Option<String>,
-    honor_missions_json: Option<String>,
-    player_frames_json: Option<String>,
+    profile_hash: Option<i64>,
+}
+
+#[derive(FromQueryResult)]
+struct UserKeyOnlyRow {
+    user_id: String,
+    user_id_key: i64,
 }
 
 /// Look up `time_id` per timestamp, inserting a new row with `status` when
@@ -144,11 +148,54 @@ where
     }
 }
 
+/// Deterministic digest of the profile columns, stored in `profile_hash` so
+/// change detection never reads the JSON blobs back. SHA-256-based (not the
+/// std hasher) because the value is persisted: it must stay stable across
+/// process restarts and toolchain upgrades. A hash mismatch merely re-writes
+/// the row, so rows predating the column (NULL) converge on first sight.
+fn profile_hash(u: &UserDimRow) -> i64 {
+    use sha2::{Digest, Sha256};
+    fn int(h: &mut Sha256, v: Option<i64>) {
+        match v {
+            Some(v) => {
+                h.update([1]);
+                h.update(v.to_le_bytes());
+            }
+            None => h.update([0]),
+        }
+    }
+    fn text(h: &mut Sha256, v: Option<&str>) {
+        match v {
+            Some(v) => {
+                h.update([1]);
+                h.update((v.len() as u64).to_le_bytes());
+                h.update(v.as_bytes());
+            }
+            None => h.update([0]),
+        }
+    }
+    let mut h = Sha256::new();
+    int(&mut h, u.card_id);
+    int(&mut h, u.card_level);
+    int(&mut h, u.card_master_rank);
+    text(&mut h, u.card_special_training_status.as_deref());
+    text(&mut h, u.card_default_image.as_deref());
+    text(&mut h, u.profile_word.as_deref());
+    text(&mut h, u.profile_honors_json.as_deref());
+    text(&mut h, u.honor_missions_json.as_deref());
+    text(&mut h, u.player_frames_json.as_deref());
+    let digest = h.finalize();
+    i64::from_le_bytes(digest[..8].try_into().expect("digest is 32 bytes"))
+}
+
 /// Look up `user_id_key` per `user_id`, inserting a new row when missing.
-/// Updates `name` and/or `cheerful_team_id` in place when the upstream
-/// payload disagrees with the stored row — matches Go's `Save` semantics.
-pub(crate) async fn batch_get_or_create_user_id_keys(
-    tx: &DatabaseTransaction,
+/// Refreshes stored dimension columns when the upstream payload disagrees
+/// with the stored row — matches Go's `Save` semantics. Changed and missing
+/// rows go through one chunked multi-row upsert instead of per-user
+/// round trips; a stored `cheerful_team_id` is never overwritten with NULL
+/// (resolved in Rust before the upsert, so no dialect-specific COALESCE).
+pub(crate) async fn batch_get_or_create_user_id_keys<C: ConnectionTrait>(
+    conn: &C,
     backend: DatabaseBackend,
     table_name: &str,
     users: &HashMap<String, UserDimRow>,
@@ -156,9 +203,16 @@ pub(crate) async fn batch_get_or_create_user_id_keys(
     let mut out = HashMap::with_capacity(users.len());
     let use_unique_ids = users.values().any(|u| u.unique_id.is_some());
     let all_ids: Vec<&str> = users.keys().map(String::as_str).collect();
+    let hashes: HashMap<&str, i64> = users
+        .iter()
+        .map(|(id, u)| (id.as_str(), profile_hash(u)))
+        .collect();
 
-    for row in select_user_rows(tx, backend, table_name, &all_ids, use_unique_ids).await? {
-        let Some(info) = users.get(&row.user_id) else {
+    // `(user_id, effective cheerful_team_id)` rows that need writing.
+    let mut dirty: Vec<(&str, Option<i64>)> = Vec::new();
+
+    for row in select_user_rows(conn, backend, table_name, &all_ids, use_unique_ids).await? {
+        let Some((user_id, info)) = users.get_key_value(&row.user_id) else {
             continue;
         };
         let name_changed = row.name != info.name;
@@ -168,56 +222,13 @@ pub(crate) async fn batch_get_or_create_user_id_keys(
             (None, Some(_)) => true,
         };
         let unique_changed = use_unique_ids && row.unique_id != info.unique_id;
-        let profile_changed = row.card_id != info.card_id
-            || row.card_level != info.card_level
-            || row.card_master_rank != info.card_master_rank
-            || row.card_special_training_status != info.card_special_training_status
-            || row.card_default_image != info.card_default_image
-            || row.profile_word != info.profile_word
-            || row.profile_honors_json != info.profile_honors_json
-            || row.honor_missions_json != info.honor_missions_json
-            || row.player_frames_json != info.player_frames_json;
+        let profile_changed = row.profile_hash != Some(hashes[user_id.as_str()]);
 
         if name_changed || cheerful_changed || unique_changed || profile_changed {
-            let mut upd = Query::update();
-            upd.table(Alias::new(table_name))
-                .and_where(Expr::col(event_users::Column::UserIdKey).eq(row.user_id_key));
-            if name_changed || cheerful_changed {
-                upd.value(event_users::Column::Name, info.name.clone());
-                if let Some(ct) = info.cheerful_team_id {
-                    upd.value(event_users::Column::CheerfulTeamId, ct);
-                }
-            }
-            if unique_changed {
-                upd.value(event_users::Column::UniqueId, info.unique_id.clone());
-            }
-            if profile_changed {
-                upd.value(event_users::Column::CardId, info.card_id)
-                    .value(event_users::Column::CardLevel, info.card_level)
-                    .value(event_users::Column::CardMasterRank, info.card_master_rank)
-                    .value(
-                        event_users::Column::CardSpecialTrainingStatus,
-                        info.card_special_training_status.clone(),
-                    )
-                    .value(
-                        event_users::Column::CardDefaultImage,
-                        info.card_default_image.clone(),
-                    )
-                    .value(event_users::Column::ProfileWord, info.profile_word.clone())
-                    .value(
-                        event_users::Column::ProfileHonorsJson,
-                        info.profile_honors_json.clone(),
-                    )
-                    .value(
-                        event_users::Column::HonorMissionsJson,
-                        info.honor_missions_json.clone(),
-                    )
-                    .value(
-                        event_users::Column::PlayerFramesJson,
-                        info.player_frames_json.clone(),
-                    );
-            }
-            tx.execute(&upd).await?;
+            dirty.push((
+                user_id.as_str(),
+                info.cheerful_team_id.or(row.cheerful_team_id),
+            ));
         }
         out.insert(row.user_id, row.user_id_key);
     }
@@ -227,85 +238,86 @@ pub(crate) async fn batch_get_or_create_user_id_keys(
         .filter(|k| !out.contains_key(*k))
         .map(String::as_str)
         .collect();
-    if missing.is_empty() {
+    let mut upserts = dirty;
+    upserts.extend(missing.iter().map(|id| (*id, users[*id].cheerful_team_id)));
+    if upserts.is_empty() {
         return Ok(out);
     }
 
-    for chunk in missing.chunks(INSERT_CHUNK) {
+    for chunk in upserts.chunks(INSERT_CHUNK) {
         let mut ins = Query::insert();
         ins.into_table(Alias::new(table_name));
+        let mut columns = vec![
+            event_users::Column::UserId,
+            event_users::Column::Name,
+            event_users::Column::CheerfulTeamId,
+            event_users::Column::CardId,
+            event_users::Column::CardLevel,
+            event_users::Column::CardMasterRank,
+            event_users::Column::CardSpecialTrainingStatus,
+            event_users::Column::CardDefaultImage,
+            event_users::Column::ProfileWord,
+            event_users::Column::ProfileHonorsJson,
+            event_users::Column::HonorMissionsJson,
+            event_users::Column::PlayerFramesJson,
+            event_users::Column::ProfileHash,
+        ];
         if use_unique_ids {
-            ins.columns([
-                event_users::Column::UserId,
-                event_users::Column::UniqueId,
-                event_users::Column::Name,
-                event_users::Column::CheerfulTeamId,
-                event_users::Column::CardId,
-                event_users::Column::CardLevel,
-                event_users::Column::CardMasterRank,
-                event_users::Column::CardSpecialTrainingStatus,
-                event_users::Column::CardDefaultImage,
-                event_users::Column::ProfileWord,
-                event_users::Column::ProfileHonorsJson,
-                event_users::Column::HonorMissionsJson,
-                event_users::Column::PlayerFramesJson,
-            ]);
-            for user_id in chunk {
-                let info = &users[*user_id];
-                ins.values_panic([
-                    (*user_id).into(),
-                    info.unique_id.clone().into(),
-                    info.name.clone().into(),
-                    info.cheerful_team_id.into(),
-                    info.card_id.into(),
-                    info.card_level.into(),
-                    info.card_master_rank.into(),
-                    info.card_special_training_status.clone().into(),
-                    info.card_default_image.clone().into(),
-                    info.profile_word.clone().into(),
-                    info.profile_honors_json.clone().into(),
-                    info.honor_missions_json.clone().into(),
-                    info.player_frames_json.clone().into(),
-                ]);
-            }
-        } else {
-            ins.columns([
-                event_users::Column::UserId,
-                event_users::Column::Name,
-                event_users::Column::CheerfulTeamId,
-                event_users::Column::CardId,
-                event_users::Column::CardLevel,
-                event_users::Column::CardMasterRank,
-                event_users::Column::CardSpecialTrainingStatus,
-                event_users::Column::CardDefaultImage,
-                event_users::Column::ProfileWord,
-                event_users::Column::ProfileHonorsJson,
-                event_users::Column::HonorMissionsJson,
-                event_users::Column::PlayerFramesJson,
-            ]);
-            for user_id in chunk {
-                let info = &users[*user_id];
-                ins.values_panic([
-                    (*user_id).into(),
-                    info.name.clone().into(),
-                    info.cheerful_team_id.into(),
-                    info.card_id.into(),
-                    info.card_level.into(),
-                    info.card_master_rank.into(),
-                    info.card_special_training_status.clone().into(),
-                    info.card_default_image.clone().into(),
-                    info.profile_word.clone().into(),
-                    info.profile_honors_json.clone().into(),
-                    info.honor_missions_json.clone().into(),
-                    info.player_frames_json.clone().into(),
-                ]);
-            }
+            columns.push(event_users::Column::UniqueId);
         }
-        tx.execute(&ins).await?;
+        ins.columns(columns.clone());
+        for (user_id, cheerful_team_id) in chunk {
+            let info = &users[*user_id];
+            let mut values = vec![
+                (*user_id).into(),
+                info.name.clone().into(),
+                (*cheerful_team_id).into(),
+                info.card_id.into(),
+                info.card_level.into(),
+                info.card_master_rank.into(),
+                info.card_special_training_status.clone().into(),
+                info.card_default_image.clone().into(),
+                info.profile_word.clone().into(),
+                info.profile_honors_json.clone().into(),
+                info.honor_missions_json.clone().into(),
+                info.player_frames_json.clone().into(),
+                hashes[user_id].into(),
+            ];
+            if use_unique_ids {
+                values.push(info.unique_id.clone().into());
+            }
+            ins.values_panic(values);
+        }
+        // Rows only reach this statement when they genuinely changed (or are
+        // new), so the conflict action can overwrite unconditionally.
+        let mut conflict = OnConflict::column(event_users::Column::UserId);
+        conflict.update_columns(columns.into_iter().skip(1));
+        ins.on_conflict(conflict);
+        conn.execute(&ins).await?;
     }
 
-    for row in select_user_rows(tx, backend, table_name, &missing, use_unique_ids).await? {
-        out.insert(row.user_id, row.user_id_key);
+    if missing.is_empty() {
+        return Ok(out);
+    }
+    for chunk in missing.chunks(INSERT_CHUNK) {
+        let sel = Query::select()
+            .expr_as(
+                Expr::col(event_users::Column::UserId),
+                Alias::new("user_id"),
+            )
+            .expr_as(
+                Expr::col(event_users::Column::UserIdKey),
+                Alias::new("user_id_key"),
+            )
+            .from(Alias::new(table_name))
+            .and_where(Expr::col(event_users::Column::UserId).is_in(chunk.iter().copied()))
+            .to_owned();
+        for row in UserKeyOnlyRow::find_by_statement(backend.build(&sel))
+            .all(conn)
+            .await?
+        {
+            out.insert(row.user_id, row.user_id_key);
+        }
     }
     if out.len() != users.len() {
         return Err(DbErr::Custom(format!(
@@ -321,8 +333,8 @@ pub(crate) async fn batch_get_or_create_user_id_keys(
 /// (13 columns × 500 rows = 6 500 params; Postgres allows 65 535).
 const INSERT_CHUNK: usize = 500;
 
-async fn select_user_rows(
-    tx: &DatabaseTransaction,
+async fn select_user_rows<C: ConnectionTrait>(
+    conn: &C,
     backend: DatabaseBackend,
     table_name: &str,
     user_ids: &[&str],
@@ -353,46 +365,14 @@ async fn select_user_rows(
             Alias::new("cheerful_team_id"),
         )
         .expr_as(
-            Expr::col(event_users::Column::CardId),
-            Alias::new("card_id"),
-        )
-        .expr_as(
-            Expr::col(event_users::Column::CardLevel),
-            Alias::new("card_level"),
-        )
-        .expr_as(
-            Expr::col(event_users::Column::CardMasterRank),
-            Alias::new("card_master_rank"),
-        )
-        .expr_as(
-            Expr::col(event_users::Column::CardSpecialTrainingStatus),
-            Alias::new("card_special_training_status"),
-        )
-        .expr_as(
-            Expr::col(event_users::Column::CardDefaultImage),
-            Alias::new("card_default_image"),
-        )
-        .expr_as(
-            Expr::col(event_users::Column::ProfileWord),
-            Alias::new("profile_word"),
-        )
-        .expr_as(
-            Expr::col(event_users::Column::ProfileHonorsJson),
-            Alias::new("profile_honors_json"),
-        )
-        .expr_as(
-            Expr::col(event_users::Column::HonorMissionsJson),
-            Alias::new("honor_missions_json"),
-        )
-        .expr_as(
-            Expr::col(event_users::Column::PlayerFramesJson),
-            Alias::new("player_frames_json"),
+            Expr::col(event_users::Column::ProfileHash),
+            Alias::new("profile_hash"),
         )
         .from(Alias::new(table_name))
         .and_where(Expr::col(event_users::Column::UserId).is_in(chunk.iter().copied()));
         rows.extend(
             UserKeyRow::find_by_statement(backend.build(&sel))
-                .all(tx)
+                .all(conn)
                 .await?,
         );
     }
@@ -405,14 +385,6 @@ async fn select_user_rows(
 struct OwnedRecord {
     timestamp: i64,
     user_id: String,
-    score: i64,
-    rank: i64,
-}
-
-struct OwnedWlRecord {
-    timestamp: i64,
-    user_id: String,
-    character_id: i64,
     score: i64,
     rank: i64,
 }
@@ -470,16 +442,8 @@ pub async fn batch_upsert_event_users(
     let users_tbl = intern(TableKind::EventUsers, event_id);
     let users = collect_users(server, event_id, anonymizer, records.iter());
 
-    engine
-        .conn()
-        .transaction::<_, (), DbErr>(move |tx| {
-            Box::pin(async move {
-                batch_get_or_create_user_id_keys(tx, backend, users_tbl, &users).await?;
-                Ok(())
-            })
-        })
-        .await
-        .map_err(unwrap_tx_err)
+    batch_get_or_create_user_id_keys(engine.conn(), backend, users_tbl, &users).await?;
+    Ok(())
 }
 
 #[tracing::instrument(skip(engine, records), fields(event_id, n = records.len()))]
@@ -509,14 +473,15 @@ pub async fn batch_insert_event_rankings(
         })
         .collect();
 
+    let user_lookup =
+        batch_get_or_create_user_id_keys(engine.conn(), backend, users_tbl, &users).await?;
+
     engine
         .conn()
         .transaction::<_, (), DbErr>(move |tx| {
             Box::pin(async move {
                 let time_lookup =
                     batch_get_or_create_time_ids(tx, backend, time_tbl, &timestamps, 0).await?;
-                let user_lookup =
-                    batch_get_or_create_user_id_keys(tx, backend, users_tbl, &users).await?;
 
                 let mut ins = Query::insert();
                 ins.into_table(Alias::new(event_tbl)).columns([
@@ -575,57 +540,52 @@ pub async fn batch_insert_world_bloom_rankings(
         anonymizer,
         records.iter().map(|r| &r.base),
     );
-    let owned: Vec<OwnedWlRecord> = records
-        .iter()
-        .map(|r| OwnedWlRecord {
-            timestamp: r.base.timestamp,
-            user_id: r.base.user_id.clone(),
-            character_id: r.character_id,
-            score: r.base.score,
-            rank: r.base.rank,
-        })
-        .collect();
-    let owned_state = std::mem::take(prev_state);
+    let user_lookup =
+        batch_get_or_create_user_id_keys(engine.conn(), backend, users_tbl, &users).await?;
 
-    let (updated_state, changed_len) = engine
+    // Diff against the previous state outside the transaction: a no-change
+    // tick never opens one, and the state map is only updated after the
+    // rows actually committed (a failed tick retries the same diff; the
+    // ranking insert's DO NOTHING dedups any partially-landed rows).
+    let mut changed: Vec<(i64, i64, i64, i64, i64)> = Vec::new();
+    let mut new_state: Vec<(WorldBloomKey, PlayerState)> = Vec::new();
+    for r in records {
+        let user_key = *user_lookup
+            .get(&r.base.user_id)
+            .ok_or_else(|| DbErr::Custom("missing user_id_key lookup".into()))?;
+        let key = WorldBloomKey {
+            user_id_key: user_key,
+            character_id: r.character_id,
+        };
+        let last = prev_state.get(&key).copied();
+        if last.is_none_or(|p| p.score != r.base.score || p.rank != r.base.rank) {
+            changed.push((
+                r.base.timestamp,
+                user_key,
+                r.character_id,
+                r.base.score,
+                r.base.rank,
+            ));
+            new_state.push((
+                key,
+                PlayerState {
+                    score: r.base.score,
+                    rank: r.base.rank,
+                },
+            ));
+        }
+    }
+    if changed.is_empty() {
+        return Ok(0);
+    }
+    let changed_len = changed.len();
+
+    engine
         .conn()
-        .transaction::<_, (HashMap<WorldBloomKey, PlayerState>, usize), DbErr>(move |tx| {
+        .transaction::<_, (), DbErr>(move |tx| {
             Box::pin(async move {
-                let mut state = owned_state;
                 let time_lookup =
                     batch_get_or_create_time_ids(tx, backend, time_tbl, &timestamps, 0).await?;
-                let user_lookup =
-                    batch_get_or_create_user_id_keys(tx, backend, users_tbl, &users).await?;
-
-                let mut changed: Vec<(i64, i64, i64, i64, i64)> = Vec::new();
-                for r in &owned {
-                    let user_key = *user_lookup
-                        .get(&r.user_id)
-                        .ok_or_else(|| DbErr::Custom("missing user_id_key lookup".into()))?;
-                    let key = WorldBloomKey {
-                        user_id_key: user_key,
-                        character_id: r.character_id,
-                    };
-                    let last = state.get(&key).copied();
-                    if last.is_none_or(|p| p.score != r.score || p.rank != r.rank) {
-                        let time_id_v = *time_lookup
-                            .get(&r.timestamp)
-                            .ok_or_else(|| DbErr::Custom("missing time_id lookup".into()))?;
-                        changed.push((time_id_v, user_key, r.character_id, r.score, r.rank));
-                        state.insert(
-                            key,
-                            PlayerState {
-                                score: r.score,
-                                rank: r.rank,
-                            },
-                        );
-                    }
-                }
-
-                if changed.is_empty() {
-                    return Ok((state, 0));
-                }
-                let changed_len = changed.len();
 
                 let mut ins = Query::insert();
                 ins.into_table(Alias::new(wl_tbl)).columns([
@@ -635,9 +595,12 @@ pub async fn batch_insert_world_bloom_rankings(
                     world_bloom::Column::Score,
                     world_bloom::Column::Rank,
                 ]);
-                for (t, u, c, s, rk) in &changed {
+                for (ts, u, c, s, rk) in &changed {
+                    let time_id_v = *time_lookup
+                        .get(ts)
+                        .ok_or_else(|| DbErr::Custom("missing time_id lookup".into()))?;
                     ins.values_panic([
-                        (*t).into(),
+                        time_id_v.into(),
                         (*u).into(),
                         (*c).into(),
                         (*s).into(),
@@ -658,13 +621,13 @@ pub async fn batch_insert_world_bloom_rankings(
                     .to_owned(),
                 );
                 tx.execute(&ins).await?;
-                Ok((state, changed_len))
+                Ok(())
             })
         })
         .await
         .map_err(unwrap_tx_err)?;
 
-    *prev_state = updated_state;
+    prev_state.extend(new_state);
     Ok(changed_len)
 }
 
