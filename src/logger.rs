@@ -3,9 +3,11 @@ use std::io;
 use std::path::Path;
 
 use chrono::Local;
+use std::sync::OnceLock;
 use tracing::field::{Field, Visit};
 use tracing::{Event, Level, Subscriber};
-use tracing_appender::non_blocking::{NonBlockingBuilder, WorkerGuard};
+
+use tracing_appender::non_blocking::{ErrorCounter, NonBlockingBuilder, WorkerGuard};
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::filter::{LevelFilter, Targets};
 use tracing_subscriber::fmt::format::Writer;
@@ -261,9 +263,26 @@ fn open_log_file(path: &Path) -> Result<std::fs::File, LoggerError> {
 ///   file when no access path is configured) so dev runs don't lose them.
 ///
 /// File sinks write through `tracing_appender`'s non-blocking worker thread
-/// (non-lossy), so request-path log calls never perform the file syscall
-/// inline. The returned `WorkerGuard`s must stay alive for the process
-/// lifetime or buffered lines are dropped on exit.
+/// in lossy mode: if slow file I/O ever fills the bounded queue, lines are
+/// dropped instead of back-pressuring (and thereby stalling) request-path
+/// log calls. Drops are counted per sink — see [`file_sink_dropped_lines`],
+/// surfaced by the periodic `api_stats` snapshot. The returned
+/// `WorkerGuard`s must stay alive for the process lifetime or buffered
+/// lines are dropped on exit.
+static ACCESS_SINK_ERRORS: OnceLock<ErrorCounter> = OnceLock::new();
+static MAIN_SINK_ERRORS: OnceLock<ErrorCounter> = OnceLock::new();
+
+/// Cumulative `(main, access)` file-sink dropped-line counts. Zero when the
+/// corresponding sink is disabled or has never saturated.
+pub fn file_sink_dropped_lines() -> (u64, u64) {
+    let count = |c: &OnceLock<ErrorCounter>| {
+        c.get()
+            .map(|c| c.dropped_lines() as u64)
+            .unwrap_or_default()
+    };
+    (count(&MAIN_SINK_ERRORS), count(&ACCESS_SINK_ERRORS))
+}
+
 pub fn init<P: AsRef<Path>>(
     level: &str,
     main_log_file: Option<P>,
@@ -288,7 +307,8 @@ pub fn init<P: AsRef<Path>>(
     let access_layer = match access_path {
         Some(path) => {
             let f = open_log_file(path)?;
-            let (writer, guard) = NonBlockingBuilder::default().lossy(false).finish(f);
+            let (writer, guard) = NonBlockingBuilder::default().lossy(true).finish(f);
+            let _ = ACCESS_SINK_ERRORS.set(writer.error_counter());
             guards.push(guard);
             Some(
                 fmt::layer()
@@ -308,7 +328,8 @@ pub fn init<P: AsRef<Path>>(
     let main_file_layer = match main_path {
         Some(path) => {
             let f = open_log_file(path)?;
-            let (writer, guard) = NonBlockingBuilder::default().lossy(false).finish(f);
+            let (writer, guard) = NonBlockingBuilder::default().lossy(true).finish(f);
+            let _ = MAIN_SINK_ERRORS.set(writer.error_counter());
             guards.push(guard);
             // When access goes to its own file we exclude it from the main
             // file; otherwise keep it in the main file so a single
