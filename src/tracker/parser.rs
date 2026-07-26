@@ -3,11 +3,16 @@
 //! current real-world wallclock. Direct port of `tracker/eventparser.go`.
 //!
 //! The Go version exposed a generic hash-cached `LoadData(path) interface{}`
-//! that turned out to be dead code (no caller); we drop it. Master data
-//! files are small (low MB) and only read on each tracker tick, so a fresh
-//! read each call is fine.
+//! that turned out to be dead code (no caller); we drop it.
+//!
+//! Parsed documents are cached against a storage fingerprint (stat/HEAD:
+//! last-modified + size + etag): the per-tick cost is one metadata probe
+//! instead of a full read + multi-MB JSON parse — which matters double when
+//! `master_data_dir` is a remote (S3/HTTP) location. Status computation is
+//! pure wallclock math and still runs on every call.
 
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 use chrono::Utc;
 use thiserror::Error;
@@ -42,10 +47,20 @@ impl From<StorageError> for ParseError {
     }
 }
 
+type Fingerprint = (Option<i64>, u64, Option<String>);
+
+#[derive(Debug)]
+struct CachedDoc<T> {
+    fingerprint: Fingerprint,
+    value: Arc<T>,
+}
+
 #[derive(Debug, Clone)]
 pub struct EventDataParser {
     server: SekaiServerRegion,
     master_data: StorageRoot,
+    events_cache: Arc<Mutex<Option<CachedDoc<Vec<Event>>>>>,
+    chapters_cache: Arc<Mutex<Option<CachedDoc<Vec<WorldBloom>>>>>,
 }
 
 impl EventDataParser {
@@ -53,6 +68,8 @@ impl EventDataParser {
         Ok(Self {
             server,
             master_data: StorageRoot::from_dir_location(master_dir.as_ref())?,
+            events_cache: Arc::default(),
+            chapters_cache: Arc::default(),
         })
     }
 
@@ -60,12 +77,14 @@ impl EventDataParser {
         self.server
     }
 
-    pub async fn load_event_data(&self) -> Result<Vec<Event>, ParseError> {
-        self.load_json("events.json").await
+    pub async fn load_event_data(&self) -> Result<Arc<Vec<Event>>, ParseError> {
+        self.load_json_cached("events.json", &self.events_cache)
+            .await
     }
 
-    pub async fn load_world_bloom_chapter_data(&self) -> Result<Vec<WorldBloom>, ParseError> {
-        self.load_json("worldBlooms.json").await
+    pub async fn load_world_bloom_chapter_data(&self) -> Result<Arc<Vec<WorldBloom>>, ParseError> {
+        self.load_json_cached("worldBlooms.json", &self.chapters_cache)
+            .await
     }
 
     /// Returns one `WorldBloomChapterStatus` per `game_character_id` for
@@ -79,7 +98,7 @@ impl EventDataParser {
         let chapters = self.load_world_bloom_chapter_data().await?;
         let now = Utc::now().timestamp_millis();
         let mut out = HashMap::new();
-        for chapter in chapters {
+        for chapter in chapters.iter() {
             if chapter.event_id != event_id {
                 continue;
             }
@@ -116,7 +135,7 @@ impl EventDataParser {
     pub async fn get_current_event_status(&self) -> Result<Option<EventStatus>, ParseError> {
         let events = self.load_event_data().await?;
         let now = Utc::now().timestamp_millis();
-        for event in events {
+        for event in events.iter() {
             if !(event.start_at < now && now < event.closed_at) {
                 continue;
             }
@@ -143,10 +162,48 @@ impl EventDataParser {
                 remain,
                 assetbundle_name: event.assetbundle_name.clone(),
                 chapter_statuses,
-                detail: event,
+                detail: event.clone(),
             }));
         }
         Ok(None)
+    }
+
+    /// Serve the parsed document from cache while the storage fingerprint
+    /// is unchanged. A backend that reports neither last-modified nor etag
+    /// (or a failing stat) degrades to reading every call.
+    async fn load_json_cached<T: for<'de> serde::Deserialize<'de>>(
+        &self,
+        path: &str,
+        cache: &Mutex<Option<CachedDoc<T>>>,
+    ) -> Result<Arc<T>, ParseError> {
+        let fingerprint = match self.master_data.fingerprint(path).await {
+            Ok(fp @ ((Some(_), _, _) | (_, _, Some(_)))) => Some(fp),
+            Ok(_) => None,
+            Err(err) => {
+                tracing::debug!(%err, path, "master data stat failed; reading directly");
+                None
+            }
+        };
+        if let Some(fingerprint) = &fingerprint {
+            let cached = cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(doc) = cached.as_ref()
+                && &doc.fingerprint == fingerprint
+            {
+                return Ok(doc.value.clone());
+            }
+        }
+        let value: Arc<T> = Arc::new(self.load_json(path).await?);
+        if let Some(fingerprint) = fingerprint {
+            *cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(CachedDoc {
+                fingerprint,
+                value: value.clone(),
+            });
+        }
+        Ok(value)
     }
 
     async fn load_json<T: for<'de> serde::Deserialize<'de>>(
