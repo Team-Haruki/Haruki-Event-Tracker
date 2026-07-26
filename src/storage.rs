@@ -84,6 +84,30 @@ impl StorageRoot {
         Ok(bytes.to_vec())
     }
 
+    /// Cheap change fingerprint for `path`: `(last-modified millis, size,
+    /// etag)` from a stat/HEAD, without transferring the object body.
+    pub async fn fingerprint(
+        &self,
+        path: &str,
+    ) -> Result<(Option<i64>, u64, Option<String>), StorageError> {
+        let normalized = normalize_object_path(path)?;
+        let meta =
+            self.op
+                .stat(normalized.as_str())
+                .await
+                .map_err(|source| StorageError::Read {
+                    location: self.location.clone(),
+                    path: normalized.clone(),
+                    source: Box::new(source),
+                })?;
+        Ok((
+            meta.last_modified()
+                .map(|t| t.into_inner().as_millisecond()),
+            meta.content_length(),
+            meta.etag().map(str::to_owned),
+        ))
+    }
+
     pub async fn read_to_string(&self, path: &str) -> Result<String, StorageError> {
         let bytes = self.read(path).await?;
         String::from_utf8(bytes).map_err(|source| StorageError::Utf8 {

@@ -3,7 +3,7 @@ use serde::Deserialize;
 use crate::api::error::ApiError;
 use crate::api::extract::{prepare_user_id_mode, resolve_region_engine};
 use crate::api::handler::web::{build_overview, build_world_bloom_overview, cached_overview_bytes};
-use crate::api::json::{Json, RawJson};
+use crate::api::json::{EncodedJson, Json};
 use crate::api::state::AppState;
 use crate::model::api::{
     LeaderboardOverviewSchema, WebRankDetailResponseSchema, WebUserDetailResponseSchema,
@@ -38,7 +38,8 @@ pub(crate) async fn web_overview_for_scope(
     character_id: Option<i64>,
     query: OverviewQuery,
     cache_prefix: &str,
-) -> Result<RawJson, ApiError> {
+    prefer_gzip: bool,
+) -> Result<EncodedJson, ApiError> {
     let interval = interval_seconds(query.interval);
     let at = positive_timestamp(query.at);
     let end_time = at.unwrap_or_else(|| chrono::Utc::now().timestamp());
@@ -66,9 +67,16 @@ pub(crate) async fn web_overview_for_scope(
             window_end: end_time,
         })
     };
-    let response =
-        cached_overview_bytes(&state, &cache_server, event_id, suffix, at.is_some(), fetch).await?;
-    Ok(RawJson(response))
+    cached_overview_bytes(
+        &state,
+        &cache_server,
+        event_id,
+        suffix,
+        at.is_some(),
+        prefer_gzip,
+        fetch,
+    )
+    .await
 }
 
 pub(crate) async fn web_rank_detail_for_scope(

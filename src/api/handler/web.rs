@@ -1,12 +1,13 @@
 use axum::extract::{Path, Query, State};
+use axum::http::HeaderMap;
 use bytes::Bytes;
 use chrono::Utc;
 use serde::Deserialize;
 
-use crate::api::cache::CacheTtl;
+use crate::api::cache::{CacheTtl, CachedJsonEncoding};
 use crate::api::error::ApiError;
 use crate::api::extract::resolve_region_engine;
-use crate::api::json::RawJson;
+use crate::api::json::{EncodedJson, RawJson, accepts_gzip};
 use crate::api::state::AppState;
 use crate::db::engine::DatabaseEngine;
 use crate::db::query::growth::{
@@ -115,12 +116,13 @@ pub async fn rankings(
     Ok(RawJson(response))
 }
 
-#[tracing::instrument(skip(state, query), fields(server, event_id))]
+#[tracing::instrument(skip(state, query, headers), fields(server, event_id))]
 pub async fn overview(
     State(state): State<AppState>,
     Path((server, event_id)): Path<(String, i64)>,
     Query(query): Query<OverviewQuery>,
-) -> Result<RawJson, ApiError> {
+    headers: HeaderMap,
+) -> Result<EncodedJson, ApiError> {
     let interval = query.interval_seconds();
     let at = query.playback_at();
     let suffix = format!("web:overview:v2:interval={interval}:at={at:?}");
@@ -129,9 +131,16 @@ pub async fn overview(
         let mode = prepare_web_user_id_mode(&state, &engine, region, event_id).await?;
         build_overview(&engine, event_id, mode, interval, at).await
     };
-    let response =
-        cached_overview_bytes(&state, &server, event_id, suffix, at.is_some(), fetch).await?;
-    Ok(RawJson(response))
+    cached_overview_bytes(
+        &state,
+        &server,
+        event_id,
+        suffix,
+        at.is_some(),
+        accepts_gzip(&headers),
+        fetch,
+    )
+    .await
 }
 
 #[tracing::instrument(skip(state, query), fields(server, event_id, character_id))]
@@ -156,12 +165,13 @@ pub async fn world_bloom_rankings(
     Ok(RawJson(response))
 }
 
-#[tracing::instrument(skip(state, query), fields(server, event_id, character_id))]
+#[tracing::instrument(skip(state, query, headers), fields(server, event_id, character_id))]
 pub async fn world_bloom_overview(
     State(state): State<AppState>,
     Path((server, event_id, character_id)): Path<(String, i64, i64)>,
     Query(query): Query<OverviewQuery>,
-) -> Result<RawJson, ApiError> {
+    headers: HeaderMap,
+) -> Result<EncodedJson, ApiError> {
     let interval = query.interval_seconds();
     let at = query.playback_at();
     let suffix = format!("web:overview:v2:wb:{character_id}:interval={interval}:at={at:?}");
@@ -170,9 +180,16 @@ pub async fn world_bloom_overview(
         let mode = prepare_web_user_id_mode(&state, &engine, region, event_id).await?;
         build_world_bloom_overview(&engine, event_id, character_id, mode, interval, at).await
     };
-    let response =
-        cached_overview_bytes(&state, &server, event_id, suffix, at.is_some(), fetch).await?;
-    Ok(RawJson(response))
+    cached_overview_bytes(
+        &state,
+        &server,
+        event_id,
+        suffix,
+        at.is_some(),
+        accepts_gzip(&headers),
+        fetch,
+    )
+    .await
 }
 
 #[tracing::instrument(skip(state, query), fields(server, event_id, user_id))]
@@ -648,14 +665,20 @@ where
     })
 }
 
+/// Overview payloads are the largest responses in the service, so the live
+/// (non-replay) path serves the precompressed cache variant: gzip happens
+/// once per cache generation instead of once per request, and the response
+/// carries its own `Content-Encoding` (the compression layer skips
+/// already-encoded bodies).
 pub async fn cached_overview_bytes<T, Fut>(
     state: &AppState,
     server: &str,
     event_id: i64,
     suffix: String,
     replay: bool,
+    prefer_gzip: bool,
     fetch: Fut,
-) -> Result<Bytes, ApiError>
+) -> Result<EncodedJson, ApiError>
 where
     T: serde::Serialize,
     Fut: std::future::Future<Output = Result<T, ApiError>>,
@@ -671,19 +694,25 @@ where
                     fetch,
                 )
                 .await
+                .map(EncodedJson::identity)
         } else {
-            cache
-                .get_or_fetch_json_bytes(
+            let encoded = cache
+                .get_or_fetch_encoded_json(
                     server,
                     event_id,
                     suffix,
                     cache.ttl(CacheTtl::LatestRank),
+                    prefer_gzip,
                     fetch,
                 )
-                .await
+                .await?;
+            Ok(match encoded.encoding {
+                CachedJsonEncoding::Gzip => EncodedJson::gzip(encoded.bytes),
+                CachedJsonEncoding::Identity => EncodedJson::identity(encoded.bytes),
+            })
         }
     } else {
-        encode_fetched(fetch).await
+        encode_fetched(fetch).await.map(EncodedJson::identity)
     }
 }
 

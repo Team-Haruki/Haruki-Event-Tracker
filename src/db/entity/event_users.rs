@@ -39,6 +39,7 @@ pub struct Model {
     pub profile_honors_json: Option<String>,
     pub honor_missions_json: Option<String>,
     pub player_frames_json: Option<String>,
+    pub profile_hash: Option<i64>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveColumn)]
@@ -57,6 +58,7 @@ pub enum Column {
     ProfileHonorsJson,
     HonorMissionsJson,
     PlayerFramesJson,
+    ProfileHash,
 }
 
 impl ColumnTrait for Column {
@@ -71,7 +73,7 @@ impl ColumnTrait for Column {
                 .nullable(),
             Self::Name => ColumnType::String(StringLen::N(300)).def(),
             Self::CheerfulTeamId => ColumnType::BigInteger.def().nullable(),
-            Self::CardId | Self::CardLevel | Self::CardMasterRank => {
+            Self::CardId | Self::CardLevel | Self::CardMasterRank | Self::ProfileHash => {
                 ColumnType::BigInteger.def().nullable()
             }
             Self::CardSpecialTrainingStatus | Self::CardDefaultImage => {

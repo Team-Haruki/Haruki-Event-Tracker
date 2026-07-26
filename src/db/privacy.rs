@@ -58,6 +58,7 @@ pub async fn ensure_profile_columns(
         ("card_special_training_status", "VARCHAR(64)"),
         ("card_default_image", "VARCHAR(64)"),
         ("profile_word", "VARCHAR(300)"),
+        ("profile_hash", "BIGINT"),
     ] {
         ensure_column(engine, table, column, ty).await?;
     }

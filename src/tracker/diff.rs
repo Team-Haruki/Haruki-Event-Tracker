@@ -218,9 +218,14 @@ pub fn build_event_records(
     seen.into_values().collect()
 }
 
+/// `skip_unchanged(character_id, uid, score, rank)` is consulted *before*
+/// the row's profile is deep-cloned and stringified, so callers that track
+/// per-user state can drop steady-state rows at near-zero cost. Returning
+/// `false` for everything reproduces the unfiltered behaviour.
 pub fn build_world_bloom_rows(
     record_time: i64,
     per_char: &HashMap<i64, Vec<PlayerRankingSchema>>,
+    mut skip_unchanged: impl FnMut(i64, i64, i64, i64) -> bool,
 ) -> Vec<PlayerWorldBloomRankingRecordSchema> {
     let mut out = Vec::new();
     for (&character_id, rankings) in per_char {
@@ -228,6 +233,9 @@ pub fn build_world_bloom_rows(
             let (Some(rank), Some(score), Some(uid)) = (r.rank, r.score, r.user_id) else {
                 continue;
             };
+            if skip_unchanged(character_id, uid, score, rank) {
+                continue;
+            }
             let Some(name) = r.name.clone() else {
                 continue;
             };
@@ -267,6 +275,27 @@ mod tests {
             user_honor_missions: Vec::new(),
             user_player_frames: Vec::new(),
         }
+    }
+
+    #[test]
+    fn build_world_bloom_rows_skip_callback_filters_rows() {
+        let per_char: HashMap<i64, Vec<PlayerRankingSchema>> =
+            HashMap::from([(19, vec![ranking(2, 100, 555, "Miku")])]);
+
+        let mut seen_args = Vec::new();
+        let rows = build_world_bloom_rows(1_710_000_000, &per_char, |c, u, s, r| {
+            seen_args.push((c, u, s, r));
+            true
+        });
+        assert_eq!(seen_args, vec![(19, 100, 555, 2)]);
+        assert!(rows.is_empty());
+
+        let rows = build_world_bloom_rows(1_710_000_000, &per_char, |_, _, _, _| false);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].character_id, 19);
+        assert_eq!(rows[0].base.user_id, "100");
+        assert_eq!(rows[0].base.score, 555);
+        assert_eq!(rows[0].base.rank, 2);
     }
 
     #[test]
