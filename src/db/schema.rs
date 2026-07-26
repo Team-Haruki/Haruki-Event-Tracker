@@ -1,9 +1,8 @@
 use sea_orm::sea_query::{Alias, Index, IndexCreateStatement};
-use sea_orm::{ConnectionTrait, DatabaseBackend, DbErr, Schema};
+use sea_orm::{ConnectionTrait, DatabaseBackend, DbErr, Schema, Statement};
 
 use crate::db::engine::DatabaseEngine;
 use crate::db::entity::{event, event_users, time_id, world_bloom};
-use crate::db::privacy::ensure_profile_columns;
 use crate::db::table_name::{TableKind, intern};
 use crate::model::enums::SekaiServerRegion;
 
@@ -48,7 +47,9 @@ pub async fn create_event_tables(
         stmt.if_not_exists();
         conn.execute(&stmt).await?;
     }
-    ensure_profile_columns(engine, intern(TableKind::EventUsers, event_id)).await?;
+    // Fresh tables get every column from `create_table_from_entity`;
+    // migrating older tables is `ensure_user_table_extensions`' job (run
+    // from tracker init), so no per-column ALTER probing here.
     create_query_indexes(engine, event_id, is_world_bloom).await?;
     Ok(())
 }
@@ -78,15 +79,17 @@ pub async fn create_query_indexes(
     ];
 
     let users_tbl = intern(TableKind::EventUsers, event_id);
+    // Equality column first, `user_id_key` second: `/users` filters paginate
+    // with `ORDER BY user_id_key` + keyset cursor, so these serve filter and
+    // order in one scan.
     indexes.extend([
-        event_index(event_id, users_tbl, "users_name", |idx| {
-            idx.col(event_users::Column::Name);
+        event_index(event_id, users_tbl, "users_card_user", |idx| {
+            idx.col(event_users::Column::CardId)
+                .col(event_users::Column::UserIdKey);
         }),
-        event_index(event_id, users_tbl, "users_card_id", |idx| {
-            idx.col(event_users::Column::CardId);
-        }),
-        event_index(event_id, users_tbl, "users_cheerful_team", |idx| {
-            idx.col(event_users::Column::CheerfulTeamId);
+        event_index(event_id, users_tbl, "users_team_user", |idx| {
+            idx.col(event_users::Column::CheerfulTeamId)
+                .col(event_users::Column::UserIdKey);
         }),
     ]);
 
@@ -121,7 +124,44 @@ pub async fn create_query_indexes(
             return Err(err);
         }
     }
+    drop_legacy_user_indexes(engine, event_id, users_tbl).await?;
     Ok(())
+}
+
+/// Indexes retired from the bootstrap set, dropped so existing tables shed
+/// their write amplification: `users_name` can never serve the
+/// leading-wildcard LIKE that queries names, and the single-column card/team
+/// indexes are superseded by the composite keyset-pagination ones.
+async fn drop_legacy_user_indexes(
+    engine: &DatabaseEngine,
+    event_id: i64,
+    users_tbl: &'static str,
+) -> Result<(), DbErr> {
+    let backend = engine.backend();
+    for suffix in ["users_name", "users_card_id", "users_cheerful_team"] {
+        let name = format!("idx_{event_id}_{suffix}");
+        let sql = match backend {
+            DatabaseBackend::MySql => format!("DROP INDEX `{name}` ON `{users_tbl}`"),
+            _ => format!("DROP INDEX IF EXISTS \"{name}\""),
+        };
+        if let Err(err) = engine
+            .conn()
+            .execute_raw(Statement::from_string(backend, sql))
+            .await
+            && !is_missing_index_error(&err)
+        {
+            return Err(err);
+        }
+    }
+    Ok(())
+}
+
+fn is_missing_index_error(err: &DbErr) -> bool {
+    let msg = err.to_string().to_ascii_lowercase();
+    msg.contains("check that column/key exists")
+        || msg.contains("does not exist")
+        || msg.contains("no such index")
+        || msg.contains("1091")
 }
 
 fn event_index(
