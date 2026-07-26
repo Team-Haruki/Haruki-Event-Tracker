@@ -187,3 +187,41 @@ fn is_duplicate_index_error(err: &DbErr) -> bool {
         || msg.contains("already exists")
         || (msg.contains("duplicate") && msg.contains("index"))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::is_missing_index_error;
+    use sea_orm::DbErr;
+
+    #[test]
+    fn missing_index_errors_are_ignorable() {
+        for msg in [
+            // MySQL 1091
+            "Can't DROP 'idx_1_users_name'; check that column/key exists",
+            "error 1091 (42000)",
+            // Postgres
+            "index \"idx_1_users_name\" does not exist",
+            // SQLite
+            "no such index: idx_1_users_name",
+        ] {
+            assert!(
+                is_missing_index_error(&DbErr::Custom(msg.to_owned())),
+                "should be ignorable: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn other_errors_are_not_ignorable() {
+        for msg in [
+            "connection refused",
+            "syntax error at or near \"DROP\"",
+            "permission denied for table event_1_users",
+        ] {
+            assert!(
+                !is_missing_index_error(&DbErr::Custom(msg.to_owned())),
+                "should not be ignorable: {msg}"
+            );
+        }
+    }
+}

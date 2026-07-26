@@ -278,6 +278,27 @@ mod tests {
     }
 
     #[test]
+    fn build_world_bloom_rows_skip_callback_filters_rows() {
+        let per_char: HashMap<i64, Vec<PlayerRankingSchema>> =
+            HashMap::from([(19, vec![ranking(2, 100, 555, "Miku")])]);
+
+        let mut seen_args = Vec::new();
+        let rows = build_world_bloom_rows(1_710_000_000, &per_char, |c, u, s, r| {
+            seen_args.push((c, u, s, r));
+            true
+        });
+        assert_eq!(seen_args, vec![(19, 100, 555, 2)]);
+        assert!(rows.is_empty());
+
+        let rows = build_world_bloom_rows(1_710_000_000, &per_char, |_, _, _, _| false);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].character_id, 19);
+        assert_eq!(rows[0].base.user_id, "100");
+        assert_eq!(rows[0].base.score, 555);
+        assert_eq!(rows[0].base.rank, 2);
+    }
+
+    #[test]
     fn diff_first_pass_marks_everything_changed() {
         let rows = vec![ranking(1, 100, 1000, "a"), ranking(2, 200, 900, "b")];
         let mut state = HashMap::new();

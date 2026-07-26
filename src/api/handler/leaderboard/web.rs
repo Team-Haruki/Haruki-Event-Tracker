@@ -11,7 +11,7 @@ use crate::api::json::{EncodedJson, Json, RawJson, accepts_gzip};
 use crate::api::state::AppState;
 use crate::model::api::{WebRankDetailResponseSchema, WebUserDetailResponseSchema};
 
-#[tracing::instrument(skip(state, query), fields(server, event_id))]
+#[tracing::instrument(skip(state, query, headers), fields(server, event_id))]
 pub async fn total_overview(
     State(state): State<AppState>,
     Path((server, event_id)): Path<(String, i64)>,
@@ -22,7 +22,7 @@ pub async fn total_overview(
     web_overview_for_scope(state, server, event_id, None, query, "web:v2", prefer_gzip).await
 }
 
-#[tracing::instrument(skip(state, query), fields(server, event_id, character_id))]
+#[tracing::instrument(skip(state, query, headers), fields(server, event_id, character_id))]
 pub async fn world_bloom_overview(
     State(state): State<AppState>,
     Path((server, event_id, character_id)): Path<(String, i64, i64)>,
@@ -42,7 +42,7 @@ pub async fn world_bloom_overview(
     .await
 }
 
-#[tracing::instrument(skip(state, query), fields(server, event_id))]
+#[tracing::instrument(skip(state, query, headers), fields(server, event_id))]
 pub async fn total_replay_overview(
     State(state): State<AppState>,
     Path((server, event_id)): Path<(String, i64)>,
@@ -62,7 +62,7 @@ pub async fn total_replay_overview(
     .await
 }
 
-#[tracing::instrument(skip(state, query), fields(server, event_id, character_id))]
+#[tracing::instrument(skip(state, query, headers), fields(server, event_id, character_id))]
 pub async fn world_bloom_replay_overview(
     State(state): State<AppState>,
     Path((server, event_id, character_id)): Path<(String, i64, i64)>,

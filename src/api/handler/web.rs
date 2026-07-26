@@ -116,7 +116,7 @@ pub async fn rankings(
     Ok(RawJson(response))
 }
 
-#[tracing::instrument(skip(state, query), fields(server, event_id))]
+#[tracing::instrument(skip(state, query, headers), fields(server, event_id))]
 pub async fn overview(
     State(state): State<AppState>,
     Path((server, event_id)): Path<(String, i64)>,
@@ -165,7 +165,7 @@ pub async fn world_bloom_rankings(
     Ok(RawJson(response))
 }
 
-#[tracing::instrument(skip(state, query), fields(server, event_id, character_id))]
+#[tracing::instrument(skip(state, query, headers), fields(server, event_id, character_id))]
 pub async fn world_bloom_overview(
     State(state): State<AppState>,
     Path((server, event_id, character_id)): Path<(String, i64, i64)>,
