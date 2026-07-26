@@ -6,7 +6,7 @@
 
 use axum::http::HeaderValue;
 use axum::http::StatusCode;
-use axum::http::header::{CONTENT_ENCODING, CONTENT_TYPE, VARY};
+use axum::http::header::{ACCEPT_ENCODING, CONTENT_ENCODING, CONTENT_TYPE, VARY};
 use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
 use serde::Serialize;
@@ -38,6 +38,28 @@ impl EncodedJson {
             encoding: JsonEncoding::Gzip,
         }
     }
+}
+
+/// Whether the request's `Accept-Encoding` admits gzip (`gzip` or `*`,
+/// not disabled with `q=0`). Used to pick the precompressed cache variant.
+pub fn accepts_gzip(headers: &axum::http::HeaderMap) -> bool {
+    let Some(value) = headers.get(ACCEPT_ENCODING).and_then(|v| v.to_str().ok()) else {
+        return false;
+    };
+    value.split(',').any(|part| {
+        let mut params = part.trim().split(';');
+        let coding = params.next().unwrap_or("").trim();
+        if !coding.eq_ignore_ascii_case("gzip") && coding != "*" {
+            return false;
+        }
+        !params.any(|p| {
+            let p = p.trim();
+            p.eq_ignore_ascii_case("q=0")
+                || p.eq_ignore_ascii_case("q=0.0")
+                || p.eq_ignore_ascii_case("q=0.00")
+                || p.eq_ignore_ascii_case("q=0.000")
+        })
+    })
 }
 
 impl<T: Serialize> IntoResponse for Json<T> {
