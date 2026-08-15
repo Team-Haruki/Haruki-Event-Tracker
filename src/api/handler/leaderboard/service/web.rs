@@ -28,6 +28,7 @@ pub struct WebDetailQuery {
     include_trace: Option<bool>,
     include_player_trace: Option<bool>,
     include_profile: Option<bool>,
+    cursor: Option<i64>,
     limit: Option<u64>,
 }
 
@@ -120,14 +121,7 @@ pub(crate) async fn web_rank_detail_for_scope(
             event_id,
             character_id,
             rank.to_string(),
-            SubjectTraceQuery {
-                subject_type: Some("rank".to_owned()),
-                include_current: Some(true),
-                start_time: None,
-                end_time: None,
-                cursor: None,
-                limit: query.limit,
-            },
+            detail_trace_query(&query, "rank"),
             "web:v2",
         )
         .await?
@@ -144,14 +138,7 @@ pub(crate) async fn web_rank_detail_for_scope(
             event_id,
             character_id,
             user_id,
-            SubjectTraceQuery {
-                subject_type: Some("user".to_owned()),
-                include_current: Some(true),
-                start_time: None,
-                end_time: None,
-                cursor: None,
-                limit: query.limit,
-            },
+            detail_trace_query(&query, "user"),
             "web:v2",
         )
         .await?
@@ -228,14 +215,7 @@ pub(crate) async fn web_user_detail_for_scope(
             event_id,
             character_id,
             user_id,
-            SubjectTraceQuery {
-                subject_type: Some("user".to_owned()),
-                include_current: Some(true),
-                start_time: None,
-                end_time: None,
-                cursor: None,
-                limit: query.limit,
-            },
+            detail_trace_query(&query, "user"),
             "web:v2",
         )
         .await?
@@ -255,4 +235,39 @@ pub(crate) async fn web_user_detail_for_scope(
             .then_some(trace.user_data)
             .flatten(),
     }))
+}
+
+fn detail_trace_query(query: &WebDetailQuery, subject_type: &str) -> SubjectTraceQuery {
+    SubjectTraceQuery {
+        subject_type: Some(subject_type.to_owned()),
+        include_current: Some(true),
+        start_time: None,
+        end_time: None,
+        cursor: query.cursor,
+        limit: query.limit,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn detail_trace_query_forwards_cursor_and_limit() {
+        let query = WebDetailQuery {
+            interval: None,
+            at: None,
+            include_trace: Some(true),
+            include_player_trace: None,
+            include_profile: None,
+            cursor: Some(1_786_726_540),
+            limit: Some(5_000),
+        };
+
+        let trace_query = detail_trace_query(&query, "user");
+
+        assert_eq!(trace_query.subject_type.as_deref(), Some("user"));
+        assert_eq!(trace_query.cursor, Some(1_786_726_540));
+        assert_eq!(trace_query.limit, Some(5_000));
+    }
 }
