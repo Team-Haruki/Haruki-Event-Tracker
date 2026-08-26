@@ -1,65 +1,64 @@
 # Web API Capabilities
 
-This document tracks the web-facing API surface on top of the existing Bot-compatible event API.
+This document tracks the web-facing API surface on top of the existing Bot-compatible (cloud) event API.
 
 ## Current Web Capabilities
 
 The web API is mounted under:
 
 ```text
-GET /event/{server}/{event_id}/web/...
+GET /api/v2/web/events/{server}/{event_id}/leaderboards/...
 ```
 
 It is designed for public website usage. It requires `privacy.uid_anonymization.enabled = true`; public responses and lookups use `unique_id` as `userId` and never expose raw upstream UID.
 
-### Ranking Search
+The v1-era standalone search endpoints (`/event/.../web/rankings`, `/web/trace-ranking/...`) are no longer mounted; their query capabilities (cursor-paginated ranking search and user/rank traces, implemented in `db::query::web`) are served through the leaderboard overview/detail endpoints below.
+
+### Leaderboard Overview And Replay
 
 ```text
-GET /event/{server}/{event_id}/web/rankings
-GET /event/{server}/{event_id}/web/world-bloom-rankings/character/{character_id}
+GET .../leaderboards/total/overview
+GET .../leaderboards/total/replay/overview
+GET .../leaderboards/world-bloom/{character_id}/overview
+GET .../leaderboards/world-bloom/{character_id}/replay/overview
 ```
 
-Supported filters:
+Query params: `interval` (trace sampling window in seconds, default 3600, clamped to 1–86400) and `at` (unix timestamp for timeline scrubbing / replay playback). Overview responses are served from the two-tier API cache, optionally as precompressed gzip.
 
-- `rankMin`, `rankMax`
-- `scoreMin`, `scoreMax`
-- `startTime`, `endTime`
-- `before`, `after`
-- `timestamp`
-- `limit`
-- `cursor`
-
-Responses use:
-
-```json
-{
-  "items": [],
-  "nextCursor": "timestamp:rank:user_id_key"
-}
-```
-
-Normal ranking rows return `timestamp`, `userId`, `score`, and `rank`. World Bloom rows also include `characterId`.
-
-### User Trace Search
+### Rank / User Details
 
 ```text
-GET /event/{server}/{event_id}/web/trace-ranking/user/{unique_id}
-GET /event/{server}/{event_id}/web/trace-world-bloom-ranking/character/{character_id}/user/{unique_id}
+GET .../leaderboards/total/details/rank/{rank}
+GET .../leaderboards/total/details/user/{user_id}
+GET .../leaderboards/world-bloom/{character_id}/details/rank/{rank}
+GET .../leaderboards/world-bloom/{character_id}/details/user/{user_id}
 ```
 
-Supported filters:
+`{user_id}` is the public `unique_id`. Query params: `interval`, `at`, `includeTrace`, `includePlayerTrace`, `includeProfile`, `cursor`, `limit` (trace pages are cursor-paginated).
 
-- `startTime`
-- `endTime`
-- `cursor`
-- `limit`
+### Private Details (raw UID)
 
-These endpoints are intended for charting a single public user over a bounded time window.
+```text
+GET .../leaderboards/total/private/details/user/{user_id}
+GET .../leaderboards/world-bloom/{character_id}/private/details/user/{user_id}
+```
+
+Guarded by `private::require_subject`: the subject comes from the WebSocket proxy extension or trusted-proxy (Oathkeeper) headers, and ownership of `(server, user_id)` is verified against the Toolbox backend (`toolbox` config). 401 without a subject.
+
+### Realtime (WebSocket)
+
+```text
+GET /ws-ticket
+GET /ws?ticket=...
+```
+
+`/ws-ticket` issues a single-use 45-second ticket to subjects resolved from trusted-proxy headers. The socket accepts `subscribe` / `unsubscribe` / `ping` frames plus proxied requests for any `/api/v2/web/...` path, and pushes `ready` / `updated` / `online` events for subscribed `(server, event_id)` topics. Tracker writes trigger the `updated` broadcasts.
 
 ### User Profile Search
 
 ```text
-GET /event/{server}/{event_id}/web/users
+GET .../leaderboards/total/users/search
+GET .../leaderboards/world-bloom/{character_id}/users/search
 ```
 
 Supported filters:
@@ -107,15 +106,11 @@ Existing historical tables receive user/profile column lazy migration through th
 - Event list and event detail APIs:
   - filter by server, event id, event status, event type, unit, time range, World Bloom chapter, and character.
   - persist historical event metadata instead of relying only on current tracker state.
-- Nearest snapshot query:
-  - fetch the latest ranking snapshot at or before a requested timestamp.
-  - better for timeline scrubbing than strict `timestamp`.
+- ~~Nearest snapshot query~~ — shipped: overview/replay-overview `at` param resolves the latest snapshot at or before the requested timestamp.
 - Rank-range leaderboard pages:
   - stable browsing for ranges such as T1-T100, T1000-T5000.
   - consider cursor plus jump-to-rank support.
-- Trace downsampling:
-  - support chart-friendly sampling windows such as 5m, 15m, 1h.
-  - cap maximum returned points.
+- ~~Trace downsampling~~ — shipped: `interval` sampling param (1s–24h) on overview and detail endpoints.
 - User/rank comparison:
   - compare multiple `unique_id` values or rank lines over the same time window.
 
@@ -146,8 +141,8 @@ Existing historical tables receive user/profile column lazy migration through th
   - popular ranking lines, growth windows, score distributions, and final results.
   - reduce online query load for website dashboards.
 - Cache and rate-limit policy:
-  - query-hash cache for flexible web filters.
-  - stricter limits for fuzzy profile search.
+  - query-hash cache shipped (`api/cache.rs`, epoch-versioned L1 + Redis L2); trace-query concurrency limiting shipped (`api/limiter.rs`).
+  - still open: per-IP rate limiting and stricter limits for fuzzy profile search.
 - Public API v2 documentation:
   - document Bot-compatible legacy endpoints separately from web endpoints.
   - make privacy behavior explicit.

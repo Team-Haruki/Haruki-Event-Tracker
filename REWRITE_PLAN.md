@@ -215,3 +215,5 @@ src/
 - 回滚命令:`cd /data/HarukiServices && cp compose.yml.bak.20260427-170146 compose.yml && docker compose up -d event-tracker`(Go 镜像仍在本地缓存,~2s downtime)
 - 资源占用:CPU 0.02% / RSS 6.7 MiB(Go 版 50 MiB+),0 重启 / 0 OOM / 0 panic
 - 后续运营 follow-up:(1) 24h 观察 (2) 打 `v2.0.0` tag 推 GHCR 把 compose 换回官方镜像 (3) 旧 `haruki-tracker-configs.yaml` 稳定后清理
+
+> **归档说明(2026-08-26)**:上述 follow-up 已全部完成(`v2.0.0` 已发布,项目现处于 v3 线,最新 tag `v3.3.0`;配置已全面迁移到 sqlx URL 形式)。本文档仅作为 Go→Rust 重写的历史记录保留,当前架构以 `CLAUDE.md` / `AGENTS.md` 为准。

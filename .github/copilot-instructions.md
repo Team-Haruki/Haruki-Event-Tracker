@@ -4,20 +4,21 @@ GitHub Copilot guidance for Haruki Event Tracker. Read this before suggesting ed
 
 ## What this is
 
-Rust service that scrapes ranking data from the Haruki Sekai API for *Project Sekai* (プロジェクトセカイ), persists it to a per-server SQL database, and exposes a query API (latest rank, trace, ranking lines, score growth, heartbeat) for downstream clients such as HarukiBot.
+Rust service that scrapes ranking data from the Haruki Sekai API for *Project Sekai* (プロジェクトセカイ), persists it to a per-server SQL database, and exposes query APIs (cloud/bot leaderboard queries under `/api/v2/cloud/...`, public web leaderboard APIs under `/api/v2/web/...`, WebSocket realtime updates, heartbeat status) for downstream clients such as HarukiBot and the public website.
 
 ## Project state
 
-The repo was rewritten from Go on `rewrite/rust`. The Rust port has been live in production since **2026-04-28 05:01:54Z** (5 servers — jp / en / tw / kr / cn — cut over simultaneously, Redis state read-through verified). Per-phase decisions and the cutover record live in `REWRITE_PLAN.md`. Companion docs: `CLAUDE.md` (Claude Code), `AGENTS.md` (cross-agent overview).
+The repo was rewritten from Go on `rewrite/rust`. The Rust port has been live in production since **2026-04-28 05:01:54Z** (5 servers — jp / en / tw / kr / cn). The project is now on the v3 line (latest tag `v3.3.0`): `/api/v2/{cloud,web}` routes, two-tier API cache, WebSocket realtime push, UID anonymization for public web APIs, private raw-UID endpoints behind Toolbox ownership checks. The rewrite record lives in `REWRITE_PLAN.md` (historical). Companion docs: `CLAUDE.md` (Claude Code, most detailed), `AGENTS.md` (cross-agent overview), `WEB_API_CAPABILITIES.md` (web API surface).
 
 ## Stack
 
 - Rust 1.88, edition 2024.
-- HTTP: `axum` 0.8 + `tower-http` + `axum-server` (HTTP/HTTPS via the same handle, `aws_lc_rs` rustls provider).
-- DB: `sea-orm` 1.1 + `sea-query` 0.32 (MySQL / PostgreSQL / SQLite).
+- HTTP: `axum` 0.8 (with `ws`) + `tower-http` + `axum-server` (HTTP/HTTPS via the same handle, `aws_lc_rs` rustls provider).
+- DB: `sea-orm` 2.0.0-rc + pinned `sea-query` 1.0.0-rc (MySQL / PostgreSQL / SQLite).
 - JSON: **sonic-rs everywhere** (`api::json::Json<T>` wraps it for handlers).
 - Async runtime: `tokio` 1.x with `tokio-cron-scheduler` for tracker ticks.
-- Cache / state: `redis` 0.27 with `ConnectionManager`.
+- Cache / state: `redis` 1.x with `ConnectionManager`; two-tier API cache (in-process L1 + Redis L2) in `api/cache.rs`.
+- Storage: `opendal` for config / master-data locations (`file://`, `http(s)://`, `s3://`).
 - Logging: `tracing` + a custom `GoStyleFormat` (`[YYYY-MM-DD HH:MM:SS.mmm][LEVEL][target] message`).
 
 ## Conventions
@@ -38,7 +39,7 @@ The repo was rewritten from Go on `rewrite/rust`. The Rust port has been live in
 - Build release: `cargo build --release --bin haruki-event-tracker`
 - Unit tests: `cargo test --lib`
 - Lint: `cargo clippy --all-targets -- -D warnings` (warnings treated as errors)
-- Cross-version API parity sweep: `bash scripts/diff_go_vs_rust.sh` (needs the live Go and Rust endpoints reachable)
+- Cross-version API parity sweep (historical, used during the Go cutover): `bash scripts/diff_go_vs_rust.sh`
 
 ## Git commits
 
@@ -64,7 +65,7 @@ Rules:
 - No trailing period.
 - Keep the subject at or below roughly 70 characters.
 - **Agent attribution uses the standard Git `Co-authored-by:` trailer in the commit body, not a free-form `Agent:` line.** This makes GitHub render the co-author avatar on the commit page. The trailer must be on its own line, separated from the subject by a blank line, in the form `Co-authored-by: <Display Name> <email>`. Suggested values per agent:
-  - Claude (any 4.x): `Co-authored-by: Claude Opus 4.7 <noreply@anthropic.com>` (substitute the actual model, e.g. `Claude Sonnet 4.6`, `Claude Haiku 4.5`)
+  - Claude (any model): `Co-authored-by: Claude Fable 5 <noreply@anthropic.com>` (substitute the actual model, e.g. `Claude Opus 4.7`, `Claude Sonnet 4.6`)
   - Codex: `Co-authored-by: Codex <noreply@openai.com>`
   - Copilot: `Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>`
 
@@ -89,7 +90,7 @@ Use the standardized workflow layout in `.github/workflows`:
 Workflow maintenance rules:
 
 - Keep workflow filenames and top-level names aligned: `CI`, `Release`, `Docker`, and optional package-specific names.
-- Use `actions/checkout@v6`, `actions/setup-go@v6`, `actions/upload-artifact@v7`, `actions/download-artifact@v8`, `softprops/action-gh-release@v3`, and current Docker actions (`setup-buildx@v4`, `login@v4`, `metadata@v6`, `build-push@v7`).
+- Use `actions/checkout@v7`, `actions/upload-artifact@v7`, `actions/download-artifact@v8`, `softprops/action-gh-release@v3`, and current Docker actions (`setup-buildx@v4`, `login@v4`, `metadata@v6`, `build-push@v7`).
 - Keep `permissions` minimal: `contents: read` for CI/Docker build-only work, `contents: write` for release publishing, and `packages: write` only when pushing container images.
 - Use workflow `concurrency` keyed by workflow name and ref, with release jobs using `release-${{ github.ref_name }}` and `cancel-in-progress: false`.
 - Do not reintroduce legacy workflow names such as `rust-ci.yml`, `build.yml`, `release-build.yml`, `docker-build.yml`, or `docker-release.yml` unless a package-specific workflow already exists and is intentionally preserved.
