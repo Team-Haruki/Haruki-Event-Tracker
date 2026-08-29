@@ -421,219 +421,24 @@ impl ApiCache {
     where
         Fut: Future<Output = Result<Bytes, ApiError>>,
     {
-        let control_key = control_cache_key(server, event_id);
         if ttl_secs == 0 {
             return fetch.await;
         }
-
+        let request = CacheRequest {
+            server,
+            event_id,
+            suffix: &suffix,
+            ttl_secs,
+            options,
+        };
+        let control_key = control_cache_key(server, event_id);
         if let Some(control) = self.l1.get_control(&control_key) {
-            incr(&CACHE_STATS.l1_control_hit);
-            if control.dirty {
-                incr(&CACHE_STATS.dirty_bypass);
-                tracing::debug!(cache_status = "dirty_bypass", "api cache dirty bypass");
-                return self
-                    .fetch_bytes_with_singleflight(
-                        dirty_flight_key(server, event_id, control.epoch, &suffix),
-                        fetch,
-                        None,
-                        options,
-                    )
-                    .await;
-            }
-            let key = value_key(server, event_id, control.epoch, &suffix);
-            // L1 entries are validated on the way in (fresh encode or checked
-            // L2 read), so hits skip re-validation — it would re-parse the
-            // payload on the warmest path.
-            if let Some(bytes) = self.l1.get_value(&key) {
-                incr(&CACHE_STATS.l1_hit);
-                if options.is_batch {
-                    incr(&CACHE_STATS.batch_l1_hit);
-                }
-                tracing::debug!(
-                    cache_status = cache_status(options, "l1_hit"),
-                    "api cache L1 hit"
-                );
-                return Ok(bytes);
-            }
             return self
-                .lookup_with_singleflight(
-                    lookup_flight_key(server, event_id, control.epoch, &suffix),
-                    options,
-                    async {
-                        match self.read_l2_value(&key).await {
-                            Ok(L2ValueRead::Hit(bytes)) => {
-                                if cached_bytes_are_valid(options, &bytes) {
-                                    incr(&CACHE_STATS.l2_hit);
-                                    if options.is_batch {
-                                        incr(&CACHE_STATS.batch_l2_hit);
-                                    }
-                                    tracing::debug!(
-                                        cache_status = cache_status(options, "l2_hit"),
-                                        "api cache L2 hit"
-                                    );
-                                    self.store_l1_value(key, bytes.clone());
-                                    Ok(bytes)
-                                } else {
-                                    tracing::warn!(
-                                        cache_status = "l2_invalid",
-                                        "api cache L2 invalid, refetching"
-                                    );
-                                    self.fetch_and_maybe_cache_bytes(
-                                        fetch,
-                                        Some(CacheWriteContext {
-                                            server: server.to_owned(),
-                                            event_id,
-                                            epoch: control.epoch,
-                                            value_key: key,
-                                            negative_key: negative_key(
-                                                server,
-                                                event_id,
-                                                control.epoch,
-                                                &suffix,
-                                            ),
-                                            ttl_secs,
-                                        }),
-                                        options,
-                                    )
-                                    .await
-                                }
-                            }
-                            Ok(L2ValueRead::NotFound) => {
-                                incr(&CACHE_STATS.l2_not_found);
-                                tracing::debug!(
-                                    cache_status = "l2_not_found",
-                                    "api cache negative hit"
-                                );
-                                Err(ApiError::NotFound)
-                            }
-                            Ok(L2ValueRead::Miss) => {
-                                incr(&CACHE_STATS.l2_miss);
-                                if options.is_batch {
-                                    incr(&CACHE_STATS.batch_miss);
-                                }
-                                tracing::debug!(
-                                    cache_status = cache_status(options, "l2_miss"),
-                                    "api cache miss"
-                                );
-                                self.fetch_and_maybe_cache_bytes(
-                                    fetch,
-                                    Some(CacheWriteContext {
-                                        server: server.to_owned(),
-                                        event_id,
-                                        epoch: control.epoch,
-                                        value_key: key,
-                                        negative_key: negative_key(
-                                            server,
-                                            event_id,
-                                            control.epoch,
-                                            &suffix,
-                                        ),
-                                        ttl_secs,
-                                    }),
-                                    options,
-                                )
-                                .await
-                            }
-                            Err(err) => {
-                                incr(&CACHE_STATS.l2_timeout);
-                                tracing::warn!(%err, "api cache value read failed");
-                                fetch.await
-                            }
-                        }
-                    },
-                )
+                .get_bytes_with_l1_control(request, control, fetch)
                 .await;
         }
-
-        self.lookup_with_singleflight(
-            lookup_flight_key(server, event_id, -1, &suffix),
-            options,
-            async {
-                match self.read_l2_combined(server, event_id, &suffix).await {
-                    Ok(L2CombinedRead::Dirty { epoch }) => {
-                        self.store_l1_control(control_key, epoch, true);
-                        incr(&CACHE_STATS.dirty_bypass);
-                        tracing::debug!(cache_status = "dirty_bypass", "api cache dirty bypass");
-                        self.fetch_bytes_with_singleflight(
-                            dirty_flight_key(server, event_id, epoch, &suffix),
-                            fetch,
-                            None,
-                            options,
-                        )
-                        .await
-                    }
-                    Ok(L2CombinedRead::Hit { epoch, key, bytes }) => {
-                        self.store_l1_control(control_key, epoch, false);
-                        if cached_bytes_are_valid(options, &bytes) {
-                            self.store_l1_value(key, bytes.clone());
-                            incr(&CACHE_STATS.l2_hit);
-                            if options.is_batch {
-                                incr(&CACHE_STATS.batch_l2_hit);
-                            }
-                            tracing::debug!(
-                                cache_status = cache_status(options, "l2_hit"),
-                                "api cache L2 hit"
-                            );
-                            Ok(bytes)
-                        } else {
-                            tracing::warn!(
-                                cache_status = "l2_invalid",
-                                "api cache L2 invalid, refetching"
-                            );
-                            self.fetch_and_maybe_cache_bytes(
-                                fetch,
-                                Some(CacheWriteContext {
-                                    server: server.to_owned(),
-                                    event_id,
-                                    epoch,
-                                    value_key: key,
-                                    negative_key: negative_key(server, event_id, epoch, &suffix),
-                                    ttl_secs,
-                                }),
-                                options,
-                            )
-                            .await
-                        }
-                    }
-                    Ok(L2CombinedRead::NotFound { epoch }) => {
-                        self.store_l1_control(control_key, epoch, false);
-                        incr(&CACHE_STATS.l2_not_found);
-                        tracing::debug!(cache_status = "l2_not_found", "api cache negative hit");
-                        Err(ApiError::NotFound)
-                    }
-                    Ok(L2CombinedRead::Miss { epoch, key }) => {
-                        self.store_l1_control(control_key, epoch, false);
-                        incr(&CACHE_STATS.l2_miss);
-                        if options.is_batch {
-                            incr(&CACHE_STATS.batch_miss);
-                        }
-                        tracing::debug!(
-                            cache_status = cache_status(options, "l2_miss"),
-                            "api cache miss"
-                        );
-                        self.fetch_and_maybe_cache_bytes(
-                            fetch,
-                            Some(CacheWriteContext {
-                                server: server.to_owned(),
-                                event_id,
-                                epoch,
-                                value_key: key,
-                                negative_key: negative_key(server, event_id, epoch, &suffix),
-                                ttl_secs,
-                            }),
-                            options,
-                        )
-                        .await
-                    }
-                    Err(err) => {
-                        incr(&CACHE_STATS.l2_timeout);
-                        tracing::warn!(%err, "api cache combined read failed");
-                        fetch.await
-                    }
-                }
-            },
-        )
-        .await
+        self.get_bytes_without_l1_control(request, control_key, fetch)
+            .await
     }
 
     async fn get_or_fetch_precompressed_bytes<Fut>(
@@ -674,239 +479,434 @@ impl ApiCache {
     where
         Fut: Future<Output = Result<Bytes, ApiError>>,
     {
-        let control_key = control_cache_key(server, event_id);
         if ttl_secs == 0 {
             return self.encode_response(fetch.await?, None, options).await;
         }
-
+        let request = CacheRequest {
+            server,
+            event_id,
+            suffix: &suffix,
+            ttl_secs,
+            options,
+        };
+        let control_key = control_cache_key(server, event_id);
         if let Some(control) = self.l1.get_control(&control_key) {
-            incr(&CACHE_STATS.l1_control_hit);
-            if control.dirty {
-                incr(&CACHE_STATS.dirty_bypass);
-                tracing::debug!(cache_status = "dirty_bypass", "api cache dirty bypass");
-                return self
-                    .fetch_encoded_with_singleflight(
-                        gzip_flight_key(server, event_id, control.epoch, &suffix),
-                        fetch,
-                        None,
-                        options,
-                    )
-                    .await;
-            }
-
-            let key = value_key(server, event_id, control.epoch, &suffix);
-            let gzip = gzip_key(&key);
-            if let Some(bytes) = self.l1.get_value(&gzip) {
-                incr(&CACHE_STATS.l1_hit);
-                if options.is_batch {
-                    incr(&CACHE_STATS.batch_l1_hit);
-                }
-                tracing::debug!(
-                    cache_status = cache_status(options, "l1_gzip_hit"),
-                    "api cache L1 gzip hit"
-                );
-                return Ok(CachedJson::gzip(bytes));
-            }
-            if let Some(bytes) = self.l1.get_value(&key) {
-                incr(&CACHE_STATS.l1_hit);
-                if options.is_batch {
-                    incr(&CACHE_STATS.batch_l1_hit);
-                }
-                tracing::debug!(
-                    cache_status = cache_status(options, "l1_hit"),
-                    "api cache L1 hit, building gzip"
-                );
-                return self
-                    .encode_response(
-                        bytes,
-                        Some(CacheWriteContext {
-                            server: server.to_owned(),
-                            event_id,
-                            epoch: control.epoch,
-                            value_key: key,
-                            negative_key: negative_key(server, event_id, control.epoch, &suffix),
-                            ttl_secs,
-                        }),
-                        options,
-                    )
-                    .await;
-            }
-
             return self
-                .lookup_encoded_with_singleflight(
-                    gzip_lookup_flight_key(server, event_id, control.epoch, &suffix),
-                    options,
-                    async {
-                        match self.read_l2_encoded(&key, &gzip).await {
-                            Ok(L2EncodedRead::Gzip(bytes)) => {
-                                incr(&CACHE_STATS.l2_hit);
-                                if options.is_batch {
-                                    incr(&CACHE_STATS.batch_l2_hit);
-                                }
-                                tracing::debug!(
-                                    cache_status = cache_status(options, "l2_gzip_hit"),
-                                    "api cache L2 gzip hit"
-                                );
-                                self.store_l1_value(gzip, bytes.clone());
-                                Ok(CachedJson::gzip(bytes))
-                            }
-                            Ok(L2EncodedRead::Identity(bytes)) => {
-                                incr(&CACHE_STATS.l2_hit);
-                                if options.is_batch {
-                                    incr(&CACHE_STATS.batch_l2_hit);
-                                }
-                                tracing::debug!(
-                                    cache_status = cache_status(options, "l2_hit"),
-                                    "api cache L2 hit, building gzip"
-                                );
-                                self.store_l1_value(key.clone(), bytes.clone());
-                                self.encode_response(
-                                    bytes,
-                                    Some(CacheWriteContext {
-                                        server: server.to_owned(),
-                                        event_id,
-                                        epoch: control.epoch,
-                                        value_key: key,
-                                        negative_key: negative_key(
-                                            server,
-                                            event_id,
-                                            control.epoch,
-                                            &suffix,
-                                        ),
-                                        ttl_secs,
-                                    }),
-                                    options,
-                                )
-                                .await
-                            }
-                            Ok(L2EncodedRead::NotFound) => {
-                                incr(&CACHE_STATS.l2_not_found);
-                                tracing::debug!(
-                                    cache_status = "l2_not_found",
-                                    "api cache negative hit"
-                                );
-                                Err(ApiError::NotFound)
-                            }
-                            Ok(L2EncodedRead::Miss) => {
-                                incr(&CACHE_STATS.l2_miss);
-                                if options.is_batch {
-                                    incr(&CACHE_STATS.batch_miss);
-                                }
-                                tracing::debug!(
-                                    cache_status = cache_status(options, "l2_miss"),
-                                    "api cache miss"
-                                );
-                                self.fetch_and_maybe_cache_encoded(
-                                    fetch,
-                                    Some(CacheWriteContext {
-                                        server: server.to_owned(),
-                                        event_id,
-                                        epoch: control.epoch,
-                                        value_key: key,
-                                        negative_key: negative_key(
-                                            server,
-                                            event_id,
-                                            control.epoch,
-                                            &suffix,
-                                        ),
-                                        ttl_secs,
-                                    }),
-                                    options,
-                                )
-                                .await
-                            }
-                            Err(err) => {
-                                incr(&CACHE_STATS.l2_timeout);
-                                tracing::warn!(%err, "api cache encoded read failed");
-                                self.encode_response(fetch.await?, None, options).await
-                            }
-                        }
-                    },
+                .get_encoded_with_l1_control(request, control, fetch)
+                .await;
+        }
+        self.get_encoded_without_l1_control(request, control_key, fetch)
+            .await
+    }
+
+    async fn get_bytes_with_l1_control<Fut>(
+        &self,
+        request: CacheRequest<'_>,
+        control: L1Control,
+        fetch: Fut,
+    ) -> Result<Bytes, ApiError>
+    where
+        Fut: Future<Output = Result<Bytes, ApiError>>,
+    {
+        record_control_hit();
+        if control.dirty {
+            record_dirty_bypass();
+            return self
+                .fetch_bytes_with_singleflight(
+                    dirty_flight_key(
+                        request.server,
+                        request.event_id,
+                        control.epoch,
+                        request.suffix,
+                    ),
+                    fetch,
+                    None,
+                    request.options,
                 )
                 .await;
         }
 
-        self.lookup_encoded_with_singleflight(
-            gzip_lookup_flight_key(server, event_id, -1, &suffix),
-            options,
+        let key = request.value_key(control.epoch);
+        if let Some(bytes) = self.l1.get_value(&key) {
+            record_l1_hit(request.options);
+            tracing::debug!(
+                cache_status = cache_status(request.options, "l1_hit"),
+                "api cache L1 hit"
+            );
+            return Ok(bytes);
+        }
+        self.lookup_with_singleflight(
+            lookup_flight_key(
+                request.server,
+                request.event_id,
+                control.epoch,
+                request.suffix,
+            ),
+            request.options,
             async {
-                match self.read_l2_combined(server, event_id, &suffix).await {
-                    Ok(L2CombinedRead::Dirty { epoch }) => {
-                        self.store_l1_control(control_key, epoch, true);
-                        incr(&CACHE_STATS.dirty_bypass);
-                        tracing::debug!(cache_status = "dirty_bypass", "api cache dirty bypass");
-                        self.fetch_encoded_with_singleflight(
-                            gzip_flight_key(server, event_id, epoch, &suffix),
-                            fetch,
-                            None,
-                            options,
-                        )
-                        .await
-                    }
-                    Ok(L2CombinedRead::Hit { epoch, key, bytes }) => {
-                        self.store_l1_control(control_key, epoch, false);
-                        self.store_l1_value(key.clone(), bytes.clone());
-                        incr(&CACHE_STATS.l2_hit);
-                        if options.is_batch {
-                            incr(&CACHE_STATS.batch_l2_hit);
-                        }
-                        tracing::debug!(
-                            cache_status = cache_status(options, "l2_hit"),
-                            "api cache L2 hit"
-                        );
-                        self.encode_response(
-                            bytes,
-                            Some(CacheWriteContext {
-                                server: server.to_owned(),
-                                event_id,
-                                epoch,
-                                value_key: key,
-                                negative_key: negative_key(server, event_id, epoch, &suffix),
-                                ttl_secs,
-                            }),
-                            options,
-                        )
-                        .await
-                    }
-                    Ok(L2CombinedRead::NotFound { epoch }) => {
-                        self.store_l1_control(control_key, epoch, false);
-                        incr(&CACHE_STATS.l2_not_found);
-                        tracing::debug!(cache_status = "l2_not_found", "api cache negative hit");
-                        Err(ApiError::NotFound)
-                    }
-                    Ok(L2CombinedRead::Miss { epoch, key }) => {
-                        self.store_l1_control(control_key, epoch, false);
-                        incr(&CACHE_STATS.l2_miss);
-                        if options.is_batch {
-                            incr(&CACHE_STATS.batch_miss);
-                        }
-                        tracing::debug!(
-                            cache_status = cache_status(options, "l2_miss"),
-                            "api cache miss"
-                        );
-                        self.fetch_and_maybe_cache_encoded(
-                            fetch,
-                            Some(CacheWriteContext {
-                                server: server.to_owned(),
-                                event_id,
-                                epoch,
-                                value_key: key,
-                                negative_key: negative_key(server, event_id, epoch, &suffix),
-                                ttl_secs,
-                            }),
-                            options,
-                        )
-                        .await
-                    }
-                    Err(err) => {
-                        incr(&CACHE_STATS.l2_timeout);
-                        tracing::warn!(%err, "api cache combined read failed");
-                        self.encode_response(fetch.await?, None, options).await
-                    }
-                }
+                let read = self.read_l2_value(&key).await;
+                self.resolve_l2_value(request, control.epoch, key, read, fetch)
+                    .await
             },
         )
         .await
+    }
+
+    async fn resolve_l2_value<Fut>(
+        &self,
+        request: CacheRequest<'_>,
+        epoch: i64,
+        key: String,
+        read: Result<L2ValueRead, redis::RedisError>,
+        fetch: Fut,
+    ) -> Result<Bytes, ApiError>
+    where
+        Fut: Future<Output = Result<Bytes, ApiError>>,
+    {
+        match read {
+            Ok(L2ValueRead::Hit(bytes)) if cached_bytes_are_valid(request.options, &bytes) => {
+                record_l2_hit(request.options);
+                tracing::debug!(
+                    cache_status = cache_status(request.options, "l2_hit"),
+                    "api cache L2 hit"
+                );
+                self.store_l1_value(key, bytes.clone());
+                Ok(bytes)
+            }
+            Ok(L2ValueRead::Hit(_)) => {
+                tracing::warn!(
+                    cache_status = "l2_invalid",
+                    "api cache L2 invalid, refetching"
+                );
+                self.fetch_and_maybe_cache_bytes(
+                    fetch,
+                    Some(request.write_context(epoch, key)),
+                    request.options,
+                )
+                .await
+            }
+            Ok(L2ValueRead::NotFound) => {
+                record_l2_not_found();
+                Err(ApiError::NotFound)
+            }
+            Ok(L2ValueRead::Miss) => {
+                record_l2_miss(request.options);
+                self.fetch_and_maybe_cache_bytes(
+                    fetch,
+                    Some(request.write_context(epoch, key)),
+                    request.options,
+                )
+                .await
+            }
+            Err(err) => {
+                incr(&CACHE_STATS.l2_timeout);
+                tracing::warn!(%err, "api cache value read failed");
+                fetch.await
+            }
+        }
+    }
+
+    async fn get_bytes_without_l1_control<Fut>(
+        &self,
+        request: CacheRequest<'_>,
+        control_key: String,
+        fetch: Fut,
+    ) -> Result<Bytes, ApiError>
+    where
+        Fut: Future<Output = Result<Bytes, ApiError>>,
+    {
+        self.lookup_with_singleflight(
+            lookup_flight_key(request.server, request.event_id, -1, request.suffix),
+            request.options,
+            async {
+                let read = self
+                    .read_l2_combined(request.server, request.event_id, request.suffix)
+                    .await;
+                self.resolve_l2_combined_bytes(request, control_key, read, fetch)
+                    .await
+            },
+        )
+        .await
+    }
+
+    async fn resolve_l2_combined_bytes<Fut>(
+        &self,
+        request: CacheRequest<'_>,
+        control_key: String,
+        read: Result<L2CombinedRead, redis::RedisError>,
+        fetch: Fut,
+    ) -> Result<Bytes, ApiError>
+    where
+        Fut: Future<Output = Result<Bytes, ApiError>>,
+    {
+        match read {
+            Ok(L2CombinedRead::Dirty { epoch }) => {
+                self.store_l1_control(control_key, epoch, true);
+                record_dirty_bypass();
+                self.fetch_bytes_with_singleflight(
+                    dirty_flight_key(request.server, request.event_id, epoch, request.suffix),
+                    fetch,
+                    None,
+                    request.options,
+                )
+                .await
+            }
+            Ok(L2CombinedRead::Hit { epoch, key, bytes })
+                if cached_bytes_are_valid(request.options, &bytes) =>
+            {
+                self.store_l1_control(control_key, epoch, false);
+                self.store_l1_value(key, bytes.clone());
+                record_l2_hit(request.options);
+                tracing::debug!(
+                    cache_status = cache_status(request.options, "l2_hit"),
+                    "api cache L2 hit"
+                );
+                Ok(bytes)
+            }
+            Ok(L2CombinedRead::Hit { epoch, key, .. }) => {
+                self.store_l1_control(control_key, epoch, false);
+                tracing::warn!(
+                    cache_status = "l2_invalid",
+                    "api cache L2 invalid, refetching"
+                );
+                self.fetch_and_maybe_cache_bytes(
+                    fetch,
+                    Some(request.write_context(epoch, key)),
+                    request.options,
+                )
+                .await
+            }
+            Ok(L2CombinedRead::NotFound { epoch }) => {
+                self.store_l1_control(control_key, epoch, false);
+                record_l2_not_found();
+                Err(ApiError::NotFound)
+            }
+            Ok(L2CombinedRead::Miss { epoch, key }) => {
+                self.store_l1_control(control_key, epoch, false);
+                record_l2_miss(request.options);
+                self.fetch_and_maybe_cache_bytes(
+                    fetch,
+                    Some(request.write_context(epoch, key)),
+                    request.options,
+                )
+                .await
+            }
+            Err(err) => {
+                incr(&CACHE_STATS.l2_timeout);
+                tracing::warn!(%err, "api cache combined read failed");
+                fetch.await
+            }
+        }
+    }
+
+    async fn get_encoded_with_l1_control<Fut>(
+        &self,
+        request: CacheRequest<'_>,
+        control: L1Control,
+        fetch: Fut,
+    ) -> Result<CachedJson, ApiError>
+    where
+        Fut: Future<Output = Result<Bytes, ApiError>>,
+    {
+        record_control_hit();
+        if control.dirty {
+            record_dirty_bypass();
+            return self
+                .fetch_encoded_with_singleflight(
+                    gzip_flight_key(
+                        request.server,
+                        request.event_id,
+                        control.epoch,
+                        request.suffix,
+                    ),
+                    fetch,
+                    None,
+                    request.options,
+                )
+                .await;
+        }
+
+        let key = request.value_key(control.epoch);
+        let gzip = gzip_key(&key);
+        if let Some(bytes) = self.l1.get_value(&gzip) {
+            record_l1_hit(request.options);
+            tracing::debug!(
+                cache_status = cache_status(request.options, "l1_gzip_hit"),
+                "api cache L1 gzip hit"
+            );
+            return Ok(CachedJson::gzip(bytes));
+        }
+        if let Some(bytes) = self.l1.get_value(&key) {
+            record_l1_hit(request.options);
+            tracing::debug!(
+                cache_status = cache_status(request.options, "l1_hit"),
+                "api cache L1 hit, building gzip"
+            );
+            return self
+                .encode_response(
+                    bytes,
+                    Some(request.write_context(control.epoch, key)),
+                    request.options,
+                )
+                .await;
+        }
+        self.lookup_encoded_with_singleflight(
+            gzip_lookup_flight_key(
+                request.server,
+                request.event_id,
+                control.epoch,
+                request.suffix,
+            ),
+            request.options,
+            async {
+                let read = self.read_l2_encoded(&key, &gzip).await;
+                self.resolve_l2_encoded(request, control.epoch, key, gzip, read, fetch)
+                    .await
+            },
+        )
+        .await
+    }
+
+    async fn resolve_l2_encoded<Fut>(
+        &self,
+        request: CacheRequest<'_>,
+        epoch: i64,
+        key: String,
+        gzip: String,
+        read: Result<L2EncodedRead, redis::RedisError>,
+        fetch: Fut,
+    ) -> Result<CachedJson, ApiError>
+    where
+        Fut: Future<Output = Result<Bytes, ApiError>>,
+    {
+        match read {
+            Ok(L2EncodedRead::Gzip(bytes)) => {
+                record_l2_hit(request.options);
+                tracing::debug!(
+                    cache_status = cache_status(request.options, "l2_gzip_hit"),
+                    "api cache L2 gzip hit"
+                );
+                self.store_l1_value(gzip, bytes.clone());
+                Ok(CachedJson::gzip(bytes))
+            }
+            Ok(L2EncodedRead::Identity(bytes)) => {
+                record_l2_hit(request.options);
+                tracing::debug!(
+                    cache_status = cache_status(request.options, "l2_hit"),
+                    "api cache L2 hit, building gzip"
+                );
+                self.store_l1_value(key.clone(), bytes.clone());
+                self.encode_response(
+                    bytes,
+                    Some(request.write_context(epoch, key)),
+                    request.options,
+                )
+                .await
+            }
+            Ok(L2EncodedRead::NotFound) => {
+                record_l2_not_found();
+                Err(ApiError::NotFound)
+            }
+            Ok(L2EncodedRead::Miss) => {
+                record_l2_miss(request.options);
+                self.fetch_and_maybe_cache_encoded(
+                    fetch,
+                    Some(request.write_context(epoch, key)),
+                    request.options,
+                )
+                .await
+            }
+            Err(err) => {
+                incr(&CACHE_STATS.l2_timeout);
+                tracing::warn!(%err, "api cache encoded read failed");
+                self.encode_response(fetch.await?, None, request.options)
+                    .await
+            }
+        }
+    }
+
+    async fn get_encoded_without_l1_control<Fut>(
+        &self,
+        request: CacheRequest<'_>,
+        control_key: String,
+        fetch: Fut,
+    ) -> Result<CachedJson, ApiError>
+    where
+        Fut: Future<Output = Result<Bytes, ApiError>>,
+    {
+        self.lookup_encoded_with_singleflight(
+            gzip_lookup_flight_key(request.server, request.event_id, -1, request.suffix),
+            request.options,
+            async {
+                let read = self
+                    .read_l2_combined(request.server, request.event_id, request.suffix)
+                    .await;
+                self.resolve_l2_combined_encoded(request, control_key, read, fetch)
+                    .await
+            },
+        )
+        .await
+    }
+
+    async fn resolve_l2_combined_encoded<Fut>(
+        &self,
+        request: CacheRequest<'_>,
+        control_key: String,
+        read: Result<L2CombinedRead, redis::RedisError>,
+        fetch: Fut,
+    ) -> Result<CachedJson, ApiError>
+    where
+        Fut: Future<Output = Result<Bytes, ApiError>>,
+    {
+        match read {
+            Ok(L2CombinedRead::Dirty { epoch }) => {
+                self.store_l1_control(control_key, epoch, true);
+                record_dirty_bypass();
+                self.fetch_encoded_with_singleflight(
+                    gzip_flight_key(request.server, request.event_id, epoch, request.suffix),
+                    fetch,
+                    None,
+                    request.options,
+                )
+                .await
+            }
+            Ok(L2CombinedRead::Hit { epoch, key, bytes }) => {
+                self.store_l1_control(control_key, epoch, false);
+                self.store_l1_value(key.clone(), bytes.clone());
+                record_l2_hit(request.options);
+                tracing::debug!(
+                    cache_status = cache_status(request.options, "l2_hit"),
+                    "api cache L2 hit"
+                );
+                self.encode_response(
+                    bytes,
+                    Some(request.write_context(epoch, key)),
+                    request.options,
+                )
+                .await
+            }
+            Ok(L2CombinedRead::NotFound { epoch }) => {
+                self.store_l1_control(control_key, epoch, false);
+                record_l2_not_found();
+                Err(ApiError::NotFound)
+            }
+            Ok(L2CombinedRead::Miss { epoch, key }) => {
+                self.store_l1_control(control_key, epoch, false);
+                record_l2_miss(request.options);
+                self.fetch_and_maybe_cache_encoded(
+                    fetch,
+                    Some(request.write_context(epoch, key)),
+                    request.options,
+                )
+                .await
+            }
+            Err(err) => {
+                incr(&CACHE_STATS.l2_timeout);
+                tracing::warn!(%err, "api cache combined read failed");
+                self.encode_response(fetch.await?, None, request.options)
+                    .await
+            }
+        }
     }
 
     async fn lookup_with_singleflight<Fut>(
@@ -1618,10 +1618,75 @@ struct CacheWriteContext {
 }
 
 #[derive(Clone, Copy)]
+struct CacheRequest<'a> {
+    server: &'a str,
+    event_id: i64,
+    suffix: &'a str,
+    ttl_secs: u64,
+    options: CacheOptions,
+}
+
+impl CacheRequest<'_> {
+    fn value_key(self, epoch: i64) -> String {
+        value_key(self.server, self.event_id, epoch, self.suffix)
+    }
+
+    fn write_context(self, epoch: i64, value_key: String) -> CacheWriteContext {
+        CacheWriteContext {
+            server: self.server.to_owned(),
+            event_id: self.event_id,
+            epoch,
+            negative_key: negative_key(self.server, self.event_id, epoch, self.suffix),
+            value_key,
+            ttl_secs: self.ttl_secs,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
 struct CacheOptions {
     max_value_bytes: usize,
     is_batch: bool,
     validate_cached_bytes: Option<fn(&Bytes) -> bool>,
+}
+
+fn record_control_hit() {
+    incr(&CACHE_STATS.l1_control_hit);
+}
+
+fn record_dirty_bypass() {
+    incr(&CACHE_STATS.dirty_bypass);
+    tracing::debug!(cache_status = "dirty_bypass", "api cache dirty bypass");
+}
+
+fn record_l1_hit(options: CacheOptions) {
+    incr(&CACHE_STATS.l1_hit);
+    if options.is_batch {
+        incr(&CACHE_STATS.batch_l1_hit);
+    }
+}
+
+fn record_l2_hit(options: CacheOptions) {
+    incr(&CACHE_STATS.l2_hit);
+    if options.is_batch {
+        incr(&CACHE_STATS.batch_l2_hit);
+    }
+}
+
+fn record_l2_miss(options: CacheOptions) {
+    incr(&CACHE_STATS.l2_miss);
+    if options.is_batch {
+        incr(&CACHE_STATS.batch_miss);
+    }
+    tracing::debug!(
+        cache_status = cache_status(options, "l2_miss"),
+        "api cache miss"
+    );
+}
+
+fn record_l2_not_found() {
+    incr(&CACHE_STATS.l2_not_found);
+    tracing::debug!(cache_status = "l2_not_found", "api cache negative hit");
 }
 
 fn cache_status(options: CacheOptions, status: &'static str) -> &'static str {

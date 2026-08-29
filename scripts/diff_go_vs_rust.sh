@@ -43,11 +43,11 @@ resolve_dynamic() {
   case "$raw" in
     __DYNAMIC_LATEST_USER__)
       uid=$(curl -sS --max-time 5 "$base/event/jp/202/latest-ranking/rank/1" | jq -r '.rankData.userId // empty' 2>/dev/null)
-      [ -n "$uid" ] && echo "/event/jp/202/latest-ranking/user/$uid"
+      [[ -n "$uid" ]] && echo "/event/jp/202/latest-ranking/user/$uid"
       ;;
     __DYNAMIC_USER_DATA__)
       uid=$(curl -sS --max-time 5 "$base/event/jp/202/latest-ranking/rank/1" | jq -r '.rankData.userId // empty' 2>/dev/null)
-      [ -n "$uid" ] && echo "/event/jp/202/user-data/$uid"
+      [[ -n "$uid" ]] && echo "/event/jp/202/user-data/$uid"
       ;;
     *) echo "$raw" ;;
   esac
@@ -57,11 +57,11 @@ GREEN='\033[32m'; RED='\033[31m'; YELLOW='\033[33m'; NC='\033[0m'
 PASS=0; FAIL=0; SKIP=0
 
 while IFS=$'\t' read -r label path shape_filter value_filter; do
-  [ -z "${label:-}" ] && continue
+  [[ -z "${label:-}" ]] && continue
 
   go_path=$(resolve_dynamic "$path" "$GO")
   rs_path=$(resolve_dynamic "$path" "$RS")
-  if [ -z "$go_path" ] || [ -z "$rs_path" ]; then
+  if [[ -z "$go_path" ]] || [[ -z "$rs_path" ]]; then
     printf "%b%-32s%b SKIP  (could not resolve dynamic path)\n" "$YELLOW" "$label" "$NC"
     SKIP=$((SKIP+1))
     continue
@@ -72,7 +72,7 @@ while IFS=$'\t' read -r label path shape_filter value_filter; do
   go_status=$(echo "$go_body" | tail -1); go_body=$(echo "$go_body" | sed '$d')
   rs_status=$(echo "$rs_body" | tail -1); rs_body=$(echo "$rs_body" | sed '$d')
 
-  if [ "$go_status" != "$rs_status" ]; then
+  if [[ "$go_status" != "$rs_status" ]]; then
     printf "%b%-32s%b FAIL  status %s vs %s\n" "$RED" "$label" "$NC" "$go_status" "$rs_status"
     FAIL=$((FAIL+1)); continue
   fi
@@ -80,7 +80,7 @@ while IFS=$'\t' read -r label path shape_filter value_filter; do
   # If bodies parse identically (sorted keys), shape and value are trivially equal.
   go_norm=$(echo "$go_body" | jq -cS '.' 2>/dev/null)
   rs_norm=$(echo "$rs_body" | jq -cS '.' 2>/dev/null)
-  if [ -n "$go_norm" ] && [ "$go_norm" = "$rs_norm" ]; then
+  if [[ -n "$go_norm" ]] && [[ "$go_norm" = "$rs_norm" ]]; then
     printf "%b%-32s%b OK    HTTP %s %s (exact)\n" "$GREEN" "$label" "$NC" "$go_status" "$go_path"
     PASS=$((PASS+1)); continue
   fi
@@ -96,17 +96,17 @@ while IFS=$'\t' read -r label path shape_filter value_filter; do
     FAIL=$((FAIL+1)); continue
   fi
 
-  if [ "$go_shape" != "$rs_shape" ]; then
+  if [[ "$go_shape" != "$rs_shape" ]]; then
     printf "%b%-32s%b FAIL  shape mismatch\n" "$RED" "$label" "$NC"
     echo "    Go:   $go_shape"
     echo "    Rust: $rs_shape"
     FAIL=$((FAIL+1)); continue
   fi
 
-  if [ -n "${value_filter:-}" ]; then
+  if [[ -n "${value_filter:-}" ]]; then
     go_val=$(echo "$go_body" | jq -cS "$value_filter" 2>&1)
     rs_val=$(echo "$rs_body" | jq -cS "$value_filter" 2>&1)
-    if [ "$go_val" != "$rs_val" ]; then
+    if [[ "$go_val" != "$rs_val" ]]; then
       printf "%b%-32s%b FAIL  value mismatch\n" "$RED" "$label" "$NC"
       echo "    Go:   $go_val"
       echo "    Rust: $rs_val"
@@ -120,4 +120,4 @@ done <<<"$CASES"
 
 echo
 echo "PASS=$PASS FAIL=$FAIL SKIP=$SKIP"
-[ $FAIL -eq 0 ]
+[[ $FAIL -eq 0 ]]

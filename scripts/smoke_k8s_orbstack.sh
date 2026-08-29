@@ -15,12 +15,14 @@ if [[ "${TARGET_CONTEXT}" != "orbstack" && "${ALLOW_OTHER_CONTEXT:-0}" != "1" ]]
   exit 1
 fi
 
-for cmd in docker kubectl curl; do
+for cmd in docker kubectl curl openssl; do
   if ! command -v "${cmd}" >/dev/null 2>&1; then
     echo "Missing required command: ${cmd}" >&2
     exit 1
   fi
 done
+
+DB_PASSWORD="$(openssl rand -hex 24)"
 
 KUBECTL=(kubectl --context "${TARGET_CONTEXT}")
 PF_PID=""
@@ -69,7 +71,7 @@ spec:
             - name: POSTGRES_USER
               value: haruki
             - name: POSTGRES_PASSWORD
-              value: haruki
+              value: ${DB_PASSWORD}
           ports:
             - name: postgres
               containerPort: 5432
@@ -100,7 +102,7 @@ YAML
 
 "${KUBECTL[@]}" -n "${NAMESPACE}" rollout status deployment/postgres --timeout=180s
 
-"${KUBECTL[@]}" -n "${NAMESPACE}" apply -f - <<'YAML'
+"${KUBECTL[@]}" -n "${NAMESPACE}" apply -f - <<YAML
 apiVersion: v1
 kind: Secret
 metadata:
@@ -132,7 +134,7 @@ stringData:
           cron: "*/2 * * * *"
         gorm_config:
           dialect: postgres
-          dsn: "postgres://haruki:haruki@postgres:5432/haruki_tracker_jp?sslmode=disable"
+          dsn: "postgres://haruki:${DB_PASSWORD}@postgres:5432/haruki_tracker_jp?sslmode=disable"
           max_open_conns: 8
           max_idle_conns: 1
           conn_max_lifetime: 1h

@@ -9,7 +9,7 @@ COPY Cargo.toml Cargo.lock ./
 RUN mkdir -p src && \
     echo 'fn main() {}' > src/main.rs && \
     echo '' > src/lib.rs && \
-    cargo build --release --bin haruki-event-tracker 2>/dev/null || true && \
+    cargo build --release --locked --bin haruki-event-tracker 2>/dev/null || true && \
     rm -rf src
 
 COPY . .
@@ -18,7 +18,7 @@ RUN if [ "$VERSION" != "3.0.0-dev" ]; then \
         sed -i "s/^version = \".*\"/version = \"${VERSION#v}\"/" Cargo.toml; \
     fi && \
     find src -name '*.rs' -exec touch {} + && \
-    cargo build --release --bin haruki-event-tracker && \
+    cargo build --release --locked --bin haruki-event-tracker && \
     strip target/release/haruki-event-tracker
 
 FROM alpine:3.24 AS runtime

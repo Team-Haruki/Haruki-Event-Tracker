@@ -188,24 +188,7 @@ async fn bench_l1_new(payload: Bytes) -> (f64, u64) {
         let map = map.clone();
         let hits = hits.clone();
         let payload = payload.clone();
-        handles.push(tokio::spawn(async move {
-            for i in 0..L1_OPS_PER_TASK {
-                let key = format!("k{}", (i * 31 + t * 7) % L1_KEYS);
-                if i % 10 == 0 {
-                    let mut m = map.lock().unwrap();
-                    if m.len() >= L1_CAP {
-                        let excess = m.len() - L1_CAP * 3 / 4;
-                        let doomed: Vec<String> = m.keys().take(excess).cloned().collect();
-                        for k in &doomed {
-                            m.remove(k);
-                        }
-                    }
-                    m.insert(key, payload.clone());
-                } else if map.lock().unwrap().get(&key).is_some() {
-                    hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                }
-            }
-        }));
+        handles.push(tokio::spawn(run_l1_new_task(map, hits, payload, t)));
     }
     for h in handles {
         h.await.unwrap();
@@ -215,6 +198,34 @@ async fn bench_l1_new(payload: Bytes) -> (f64, u64) {
         ops / start.elapsed().as_secs_f64(),
         hits.load(std::sync::atomic::Ordering::Relaxed),
     )
+}
+
+async fn run_l1_new_task(
+    map: Arc<std::sync::Mutex<HashMap<String, Bytes>>>,
+    hits: Arc<std::sync::atomic::AtomicU64>,
+    payload: Bytes,
+    task: usize,
+) {
+    for i in 0..L1_OPS_PER_TASK {
+        let key = format!("k{}", (i * 31 + task * 7) % L1_KEYS);
+        if i % 10 == 0 {
+            insert_l1_value(&map, key, &payload);
+        } else if map.lock().unwrap().get(&key).is_some() {
+            hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
+fn insert_l1_value(map: &std::sync::Mutex<HashMap<String, Bytes>>, key: String, payload: &Bytes) {
+    let mut map = map.lock().unwrap();
+    if map.len() >= L1_CAP {
+        let excess = map.len() - L1_CAP * 3 / 4;
+        let doomed: Vec<String> = map.keys().take(excess).cloned().collect();
+        for key in doomed {
+            map.remove(&key);
+        }
+    }
+    map.insert(key, payload.clone());
 }
 
 #[tokio::main]

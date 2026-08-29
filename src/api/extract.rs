@@ -69,21 +69,7 @@ pub fn parse_rank_query(raw: Option<&str>) -> Result<Vec<i64>, ApiError> {
         if key != "rank" && key != "ranks" {
             continue;
         }
-        for part in value.split(',') {
-            let part = part.trim();
-            if part.is_empty() {
-                continue;
-            }
-            let rank = part
-                .parse::<i64>()
-                .map_err(|_| ApiError::BadRequest(format!("invalid rank: {part}")))?;
-            if rank <= 0 {
-                return Err(ApiError::BadRequest(format!("invalid rank: {rank}")));
-            }
-            if !ranks.contains(&rank) {
-                ranks.push(rank);
-            }
-        }
+        append_ranks(value, &mut ranks)?;
     }
 
     if ranks.is_empty() {
@@ -95,6 +81,25 @@ pub fn parse_rank_query(raw: Option<&str>) -> Result<Vec<i64>, ApiError> {
         )));
     }
     Ok(ranks)
+}
+
+fn append_ranks(value: &str, ranks: &mut Vec<i64>) -> Result<(), ApiError> {
+    for part in value.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        let rank = part
+            .parse::<i64>()
+            .map_err(|_| ApiError::BadRequest(format!("invalid rank: {part}")))?;
+        if rank <= 0 {
+            return Err(ApiError::BadRequest(format!("invalid rank: {rank}")));
+        }
+        if !ranks.contains(&rank) {
+            ranks.push(rank);
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

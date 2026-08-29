@@ -50,6 +50,9 @@ struct UserKeyOnlyRow {
     user_id_key: i64,
 }
 
+type DirtyUser<'a> = (&'a str, Option<i64>);
+type ExistingUserState<'a> = (HashMap<String, i64>, Vec<DirtyUser<'a>>);
+
 /// Look up `time_id` per timestamp, inserting a new row with `status` when
 /// the timestamp is not yet present. Returns a `timestamp -> time_id` map.
 pub(crate) async fn batch_get_or_create_time_ids(
@@ -200,38 +203,14 @@ pub(crate) async fn batch_get_or_create_user_id_keys<C: ConnectionTrait>(
     table_name: &str,
     users: &HashMap<String, UserDimRow>,
 ) -> Result<HashMap<String, i64>, DbErr> {
-    let mut out = HashMap::with_capacity(users.len());
     let use_unique_ids = users.values().any(|u| u.unique_id.is_some());
     let all_ids: Vec<&str> = users.keys().map(String::as_str).collect();
     let hashes: HashMap<&str, i64> = users
         .iter()
         .map(|(id, u)| (id.as_str(), profile_hash(u)))
         .collect();
-
-    // `(user_id, effective cheerful_team_id)` rows that need writing.
-    let mut dirty: Vec<(&str, Option<i64>)> = Vec::new();
-
-    for row in select_user_rows(conn, backend, table_name, &all_ids, use_unique_ids).await? {
-        let Some((user_id, info)) = users.get_key_value(&row.user_id) else {
-            continue;
-        };
-        let name_changed = row.name != info.name;
-        let cheerful_changed = match (row.cheerful_team_id, info.cheerful_team_id) {
-            (_, None) => false,
-            (Some(stored), Some(new)) => stored != new,
-            (None, Some(_)) => true,
-        };
-        let unique_changed = use_unique_ids && row.unique_id != info.unique_id;
-        let profile_changed = row.profile_hash != Some(hashes[user_id.as_str()]);
-
-        if name_changed || cheerful_changed || unique_changed || profile_changed {
-            dirty.push((
-                user_id.as_str(),
-                info.cheerful_team_id.or(row.cheerful_team_id),
-            ));
-        }
-        out.insert(row.user_id, row.user_id_key);
-    }
+    let rows = select_user_rows(conn, backend, table_name, &all_ids, use_unique_ids).await?;
+    let (mut out, dirty) = collect_existing_user_state(rows, users, &hashes, use_unique_ids);
 
     let missing: Vec<&str> = users
         .keys()
@@ -240,65 +219,141 @@ pub(crate) async fn batch_get_or_create_user_id_keys<C: ConnectionTrait>(
         .collect();
     let mut upserts = dirty;
     upserts.extend(missing.iter().map(|id| (*id, users[*id].cheerful_team_id)));
-    if upserts.is_empty() {
-        return Ok(out);
+    if !upserts.is_empty() {
+        upsert_user_rows(conn, table_name, users, &hashes, &upserts, use_unique_ids).await?;
     }
 
+    load_missing_user_keys(conn, backend, table_name, &missing, &mut out).await?;
+    if out.len() != users.len() {
+        return Err(DbErr::Custom(format!(
+            "inserted user_id_key rows vanished ({} of {} resolved)",
+            out.len(),
+            users.len()
+        )));
+    }
+    Ok(out)
+}
+
+fn collect_existing_user_state<'a>(
+    rows: Vec<UserKeyRow>,
+    users: &'a HashMap<String, UserDimRow>,
+    hashes: &HashMap<&str, i64>,
+    use_unique_ids: bool,
+) -> ExistingUserState<'a> {
+    let mut out = HashMap::with_capacity(users.len());
+    let mut dirty = Vec::new();
+    for row in rows {
+        let Some((user_id, info)) = users.get_key_value(&row.user_id) else {
+            continue;
+        };
+        if user_row_changed(&row, info, hashes[user_id.as_str()], use_unique_ids) {
+            dirty.push((
+                user_id.as_str(),
+                info.cheerful_team_id.or(row.cheerful_team_id),
+            ));
+        }
+        out.insert(row.user_id, row.user_id_key);
+    }
+    (out, dirty)
+}
+
+fn user_row_changed(
+    row: &UserKeyRow,
+    info: &UserDimRow,
+    profile_hash: i64,
+    use_unique_ids: bool,
+) -> bool {
+    let cheerful_changed = match (row.cheerful_team_id, info.cheerful_team_id) {
+        (_, None) => false,
+        (Some(stored), Some(new)) => stored != new,
+        (None, Some(_)) => true,
+    };
+    row.name != info.name
+        || cheerful_changed
+        || use_unique_ids && row.unique_id != info.unique_id
+        || row.profile_hash != Some(profile_hash)
+}
+
+async fn upsert_user_rows<C: ConnectionTrait>(
+    conn: &C,
+    table_name: &str,
+    users: &HashMap<String, UserDimRow>,
+    hashes: &HashMap<&str, i64>,
+    upserts: &[DirtyUser<'_>],
+    use_unique_ids: bool,
+) -> Result<(), DbErr> {
     for chunk in upserts.chunks(INSERT_CHUNK) {
         let mut ins = Query::insert();
         ins.into_table(Alias::new(table_name));
-        let mut columns = vec![
-            event_users::Column::UserId,
-            event_users::Column::Name,
-            event_users::Column::CheerfulTeamId,
-            event_users::Column::CardId,
-            event_users::Column::CardLevel,
-            event_users::Column::CardMasterRank,
-            event_users::Column::CardSpecialTrainingStatus,
-            event_users::Column::CardDefaultImage,
-            event_users::Column::ProfileWord,
-            event_users::Column::ProfileHonorsJson,
-            event_users::Column::HonorMissionsJson,
-            event_users::Column::PlayerFramesJson,
-            event_users::Column::ProfileHash,
-        ];
+        let mut columns = user_upsert_columns();
         if use_unique_ids {
             columns.push(event_users::Column::UniqueId);
         }
         ins.columns(columns.clone());
         for (user_id, cheerful_team_id) in chunk {
             let info = &users[*user_id];
-            let mut values = vec![
-                (*user_id).into(),
-                info.name.clone().into(),
-                (*cheerful_team_id).into(),
-                info.card_id.into(),
-                info.card_level.into(),
-                info.card_master_rank.into(),
-                info.card_special_training_status.clone().into(),
-                info.card_default_image.clone().into(),
-                info.profile_word.clone().into(),
-                info.profile_honors_json.clone().into(),
-                info.honor_missions_json.clone().into(),
-                info.player_frames_json.clone().into(),
-                hashes[user_id].into(),
-            ];
+            let mut values = user_upsert_values(user_id, *cheerful_team_id, info, hashes[user_id]);
             if use_unique_ids {
                 values.push(info.unique_id.clone().into());
             }
             ins.values_panic(values);
         }
-        // Rows only reach this statement when they genuinely changed (or are
-        // new), so the conflict action can overwrite unconditionally.
         let mut conflict = OnConflict::column(event_users::Column::UserId);
         conflict.update_columns(columns.into_iter().skip(1));
         ins.on_conflict(conflict);
         conn.execute(&ins).await?;
     }
+    Ok(())
+}
 
-    if missing.is_empty() {
-        return Ok(out);
-    }
+fn user_upsert_columns() -> Vec<event_users::Column> {
+    vec![
+        event_users::Column::UserId,
+        event_users::Column::Name,
+        event_users::Column::CheerfulTeamId,
+        event_users::Column::CardId,
+        event_users::Column::CardLevel,
+        event_users::Column::CardMasterRank,
+        event_users::Column::CardSpecialTrainingStatus,
+        event_users::Column::CardDefaultImage,
+        event_users::Column::ProfileWord,
+        event_users::Column::ProfileHonorsJson,
+        event_users::Column::HonorMissionsJson,
+        event_users::Column::PlayerFramesJson,
+        event_users::Column::ProfileHash,
+    ]
+}
+
+fn user_upsert_values(
+    user_id: &str,
+    cheerful_team_id: Option<i64>,
+    info: &UserDimRow,
+    profile_hash: i64,
+) -> Vec<Expr> {
+    vec![
+        user_id.into(),
+        info.name.clone().into(),
+        cheerful_team_id.into(),
+        info.card_id.into(),
+        info.card_level.into(),
+        info.card_master_rank.into(),
+        info.card_special_training_status.clone().into(),
+        info.card_default_image.clone().into(),
+        info.profile_word.clone().into(),
+        info.profile_honors_json.clone().into(),
+        info.honor_missions_json.clone().into(),
+        info.player_frames_json.clone().into(),
+        profile_hash.into(),
+    ]
+}
+
+async fn load_missing_user_keys<C: ConnectionTrait>(
+    conn: &C,
+    backend: DatabaseBackend,
+    table_name: &str,
+    missing: &[&str],
+    out: &mut HashMap<String, i64>,
+) -> Result<(), DbErr> {
     for chunk in missing.chunks(INSERT_CHUNK) {
         let sel = Query::select()
             .expr_as(
@@ -319,14 +374,7 @@ pub(crate) async fn batch_get_or_create_user_id_keys<C: ConnectionTrait>(
             out.insert(row.user_id, row.user_id_key);
         }
     }
-    if out.len() != users.len() {
-        return Err(DbErr::Custom(format!(
-            "inserted user_id_key rows vanished ({} of {} resolved)",
-            out.len(),
-            users.len()
-        )));
-    }
-    Ok(out)
+    Ok(())
 }
 
 /// Keep multi-row statements well under every backend's bind-parameter cap

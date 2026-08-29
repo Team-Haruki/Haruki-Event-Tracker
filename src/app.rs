@@ -20,7 +20,7 @@ use crate::api::private_lookup::PrivateLookupVerifier;
 use crate::api::realtime::RealtimeHub;
 use crate::api::state::AppState;
 use crate::api::ws_ticket::WsTicketStore;
-use crate::config::{Config, RedisConfig};
+use crate::config::{Config, RedisConfig, ServerConfig};
 use crate::db::engine::{DatabaseEngine, EngineError};
 use crate::model::enums::SekaiServerRegion;
 use crate::privacy::UidAnonymizer;
@@ -62,45 +62,8 @@ pub async fn build(cfg: &Config) -> Result<AppContext, BootstrapError> {
         .values()
         .any(|server_cfg| server_cfg.enabled && server_cfg.tracker.enabled);
 
-    let (redis, api) = if tracker_enabled {
-        tracing::info!("connecting Redis");
-        let redis_url = redis_url(&cfg.redis);
-        let client = redis::Client::open(redis_url)?;
-        let redis = redis::aio::ConnectionManager::new(client).await?;
-        tracing::info!("Redis ready");
-
-        let api = HarukiSekaiAPIClient::new(
-            cfg.sekai_api.api_endpoint.clone(),
-            &cfg.sekai_api.api_token,
-        )?;
-        (Some(redis), Some(api))
-    } else {
-        tracing::info!("all trackers disabled; running API only");
-        (None, None)
-    };
-
-    let (api_cache, api_cache_redis) = if cfg.api_cache.enabled {
-        let redis_url = if cfg.api_cache.redis_url.trim().is_empty() {
-            redis_url(&cfg.redis)
-        } else {
-            cfg.api_cache.redis_url.clone()
-        };
-        let pool_size = cfg.api_cache.pool_size.max(1);
-        tracing::info!(pool_size, "connecting API cache Redis");
-        let client = redis::Client::open(redis_url)?;
-        let mut conns = Vec::with_capacity(pool_size);
-        for _ in 0..pool_size {
-            conns.push(redis::aio::ConnectionManager::new(client.clone()).await?);
-        }
-        let invalidation_conn = redis::aio::ConnectionManager::new(client).await?;
-        tracing::info!(pool_size, "API cache Redis ready");
-        (
-            Some(ApiCache::new(conns, cfg.api_cache.clone())),
-            Some(invalidation_conn),
-        )
-    } else {
-        (None, None)
-    };
+    let (redis, api) = build_tracker_dependencies(cfg, tracker_enabled).await?;
+    let (api_cache, api_cache_redis) = build_api_cache(cfg).await?;
 
     let mut dbs: HashMap<SekaiServerRegion, Arc<DatabaseEngine>> = HashMap::new();
     let mut trackers: HashMap<SekaiServerRegion, Arc<Mutex<HarukiEventTracker>>> = HashMap::new();
@@ -112,75 +75,19 @@ pub async fn build(cfg: &Config) -> Result<AppContext, BootstrapError> {
     };
 
     for (server, server_cfg) in &cfg.servers {
-        if !server_cfg.enabled {
-            tracing::info!(%server, "server disabled, skipping");
-            continue;
-        }
-        tracing::info!(%server, "connecting database");
-        let engine = Arc::new(DatabaseEngine::connect(&server_cfg.db).await?);
-        dbs.insert(*server, engine.clone());
-
-        if !server_cfg.tracker.enabled {
-            continue;
-        }
-        let redis = redis
-            .as_ref()
-            .expect("redis is initialized when any tracker is enabled")
-            .clone();
-        let api = api
-            .as_ref()
-            .expect("sekai api is initialized when any tracker is enabled")
-            .clone();
-        let mut daemon = HarukiEventTracker::new(
+        configure_server(
             *server,
-            api,
-            redis,
-            api_cache_redis.clone(),
-            engine.clone(),
-            realtime.clone(),
-            anonymizer.clone(),
-            server_cfg.tracker.post_end_user_refresh_interval_secs,
-            &server_cfg.master_data_dir,
-        )?;
-        if let Err(err) = daemon.init().await {
-            tracing::warn!(%server, %err, "tracker init failed; will retry on first tick");
-        }
-        let daemon = Arc::new(Mutex::new(daemon));
-        trackers.insert(*server, daemon.clone());
-
-        let cron_expr = if server_cfg.tracker.use_second_level_cron {
-            server_cfg.tracker.cron.clone()
-        } else {
-            format!("0 {}", server_cfg.tracker.cron)
-        };
-        let server_label = *server;
-        let daemon_for_job = daemon.clone();
-        let job = Job::new_async(cron_expr.as_str(), move |_uuid, _l| {
-            let daemon = daemon_for_job.clone();
-            Box::pin(async move {
-                // A tick that outlives the cron interval must not queue the
-                // next firing behind the mutex — back-to-back stale ticks
-                // would pile onto an already slow upstream/DB.
-                match daemon.try_lock() {
-                    Ok(mut daemon) => {
-                        tracing::info!(server = %server_label, "tracker tick");
-                        daemon.track_ranking_data().await;
-                    }
-                    Err(_) => {
-                        tracing::warn!(
-                            server = %server_label,
-                            "previous tracker tick still running; skipping this tick"
-                        );
-                    }
-                }
-            })
-        })?;
-        scheduler
-            .as_ref()
-            .expect("scheduler is initialized when any tracker is enabled")
-            .add(job)
-            .await?;
-        tracing::info!(%server, cron = %cron_expr, "scheduled tracker");
+            server_cfg,
+            &redis,
+            &api,
+            &api_cache_redis,
+            &realtime,
+            &anonymizer,
+            &scheduler,
+            &mut dbs,
+            &mut trackers,
+        )
+        .await?;
     }
 
     if let Some(scheduler) = &scheduler {
@@ -204,6 +111,134 @@ pub async fn build(cfg: &Config) -> Result<AppContext, BootstrapError> {
         trackers,
         scheduler,
     })
+}
+
+async fn build_tracker_dependencies(
+    cfg: &Config,
+    tracker_enabled: bool,
+) -> Result<
+    (
+        Option<redis::aio::ConnectionManager>,
+        Option<HarukiSekaiAPIClient>,
+    ),
+    BootstrapError,
+> {
+    if !tracker_enabled {
+        tracing::info!("all trackers disabled; running API only");
+        return Ok((None, None));
+    }
+
+    tracing::info!("connecting Redis");
+    let client = redis::Client::open(redis_url(&cfg.redis))?;
+    let redis = redis::aio::ConnectionManager::new(client).await?;
+    tracing::info!("Redis ready");
+    let api =
+        HarukiSekaiAPIClient::new(cfg.sekai_api.api_endpoint.clone(), &cfg.sekai_api.api_token)?;
+    Ok((Some(redis), Some(api)))
+}
+
+async fn build_api_cache(
+    cfg: &Config,
+) -> Result<(Option<ApiCache>, Option<redis::aio::ConnectionManager>), BootstrapError> {
+    if !cfg.api_cache.enabled {
+        return Ok((None, None));
+    }
+    let redis_url = if cfg.api_cache.redis_url.trim().is_empty() {
+        redis_url(&cfg.redis)
+    } else {
+        cfg.api_cache.redis_url.clone()
+    };
+    let pool_size = cfg.api_cache.pool_size.max(1);
+    tracing::info!(pool_size, "connecting API cache Redis");
+    let client = redis::Client::open(redis_url)?;
+    let mut conns = Vec::with_capacity(pool_size);
+    for _ in 0..pool_size {
+        conns.push(redis::aio::ConnectionManager::new(client.clone()).await?);
+    }
+    let invalidation_conn = redis::aio::ConnectionManager::new(client).await?;
+    tracing::info!(pool_size, "API cache Redis ready");
+    Ok((
+        Some(ApiCache::new(conns, cfg.api_cache.clone())),
+        Some(invalidation_conn),
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn configure_server(
+    server: SekaiServerRegion,
+    server_cfg: &ServerConfig,
+    redis: &Option<redis::aio::ConnectionManager>,
+    api: &Option<HarukiSekaiAPIClient>,
+    api_cache_redis: &Option<redis::aio::ConnectionManager>,
+    realtime: &RealtimeHub,
+    anonymizer: &UidAnonymizer,
+    scheduler: &Option<JobScheduler>,
+    dbs: &mut HashMap<SekaiServerRegion, Arc<DatabaseEngine>>,
+    trackers: &mut HashMap<SekaiServerRegion, Arc<Mutex<HarukiEventTracker>>>,
+) -> Result<(), BootstrapError> {
+    if !server_cfg.enabled {
+        tracing::info!(%server, "server disabled, skipping");
+        return Ok(());
+    }
+    tracing::info!(%server, "connecting database");
+    let engine = Arc::new(DatabaseEngine::connect(&server_cfg.db).await?);
+    dbs.insert(server, engine.clone());
+
+    if !server_cfg.tracker.enabled {
+        return Ok(());
+    }
+    let mut daemon = HarukiEventTracker::new(
+        server,
+        api.as_ref()
+            .expect("sekai api is initialized when any tracker is enabled")
+            .clone(),
+        redis
+            .as_ref()
+            .expect("redis is initialized when any tracker is enabled")
+            .clone(),
+        api_cache_redis.clone(),
+        engine,
+        realtime.clone(),
+        anonymizer.clone(),
+        server_cfg.tracker.post_end_user_refresh_interval_secs,
+        &server_cfg.master_data_dir,
+    )?;
+    if let Err(err) = daemon.init().await {
+        tracing::warn!(%server, %err, "tracker init failed; will retry on first tick");
+    }
+    let daemon = Arc::new(Mutex::new(daemon));
+    trackers.insert(server, daemon.clone());
+
+    let cron_expr = if server_cfg.tracker.use_second_level_cron {
+        server_cfg.tracker.cron.clone()
+    } else {
+        format!("0 {}", server_cfg.tracker.cron)
+    };
+    let daemon_for_job = daemon.clone();
+    let job = Job::new_async(cron_expr.as_str(), move |_uuid, _l| {
+        let daemon = daemon_for_job.clone();
+        Box::pin(async move {
+            // A tick that outlives the cron interval must not queue the
+            // next firing behind the mutex — back-to-back stale ticks
+            // would pile onto an already slow upstream/DB.
+            match daemon.try_lock() {
+                Ok(mut daemon) => {
+                    tracing::info!(%server, "tracker tick");
+                    daemon.track_ranking_data().await;
+                }
+                Err(_) => {
+                    tracing::warn!(%server, "previous tracker tick still running; skipping this tick");
+                }
+            }
+        })
+    })?;
+    scheduler
+        .as_ref()
+        .expect("scheduler is initialized when any tracker is enabled")
+        .add(job)
+        .await?;
+    tracing::info!(%server, cron = %cron_expr, "scheduled tracker");
+    Ok(())
 }
 
 fn build_anonymizer(cfg: &Config) -> Result<UidAnonymizer, BootstrapError> {

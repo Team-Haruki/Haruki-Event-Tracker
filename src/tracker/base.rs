@@ -28,7 +28,8 @@ use crate::model::enums::{SekaiEventType, SekaiServerRegion};
 use crate::model::event::WorldBloomChapterStatus;
 use crate::model::sekai::{BorderRankingResponse, PlayerRankingSchema, Top100RankingResponse};
 use crate::model::tracker::{
-    HandledRankingData, PlayerEventRankingRecordSchema, PlayerState, RankState, WorldBloomKey,
+    HandledRankingData, PlayerEventRankingRecordSchema, PlayerState,
+    PlayerWorldBloomRankingRecordSchema, RankState, WorldBloomKey,
 };
 use crate::privacy::UidAnonymizer;
 use crate::sekai_api::client::HarukiSekaiAPIClient;
@@ -310,19 +311,46 @@ impl EventTrackerBase {
         now: i64,
     ) -> Result<bool, TrackerError> {
         tracing::info!("recording ranking data");
-        let mut batch_called = false;
-        let mut changed_ranks: HashMap<i64, RankState> = HashMap::new();
-        let mut records = Vec::new();
+        let (changed_ranks, records) = self.build_main_records(data, only_world_bloom);
+        let wl_rows = self.build_world_bloom_records(data);
+        let will_write = !records.is_empty() || !wl_rows.is_empty();
+        self.begin_cache_update(will_write).await;
+        let batch_called = self.persist_main_records(&records, &changed_ranks).await?;
+        let batch_called = self
+            .persist_world_bloom_records(&wl_rows, batch_called)
+            .await?;
+        self.complete_cache_update(batch_called, write_idle_heartbeat, now)
+            .await?;
+        self.commit_border_cache(data, only_world_bloom).await;
 
-        if !only_world_bloom && !data.rankings.is_empty() {
-            let (idx, changed) = diff_rank_based(&data.rankings, &self.prev_rank_state);
-            changed_ranks = changed;
-            let diffed: Vec<&PlayerRankingSchema> =
-                idx.iter().map(|&i| &data.rankings[i]).collect();
-            records = build_event_records(data.record_time, &diffed);
+        if let Err(err) =
+            save_rank_state(&mut self.redis, self.server, self.event_id, &changed_ranks).await
+        {
+            tracing::warn!(%err, "failed to save rank_state to Redis");
         }
+        tracing::info!("finished recording ranking data");
+        Ok(batch_called)
+    }
 
-        let wl_rows = build_world_bloom_rows(
+    fn build_main_records(
+        &self,
+        data: &HandledRankingData,
+        only_world_bloom: bool,
+    ) -> (HashMap<i64, RankState>, Vec<PlayerEventRankingRecordSchema>) {
+        if only_world_bloom || data.rankings.is_empty() {
+            return (HashMap::new(), Vec::new());
+        }
+        let (indices, changed) = diff_rank_based(&data.rankings, &self.prev_rank_state);
+        let diffed: Vec<&PlayerRankingSchema> =
+            indices.iter().map(|&index| &data.rankings[index]).collect();
+        (changed, build_event_records(data.record_time, &diffed))
+    }
+
+    fn build_world_bloom_records(
+        &self,
+        data: &HandledRankingData,
+    ) -> Vec<PlayerWorldBloomRankingRecordSchema> {
+        build_world_bloom_rows(
             data.record_time,
             &data.world_bloom_rankings,
             |character_id, uid, score, rank| {
@@ -334,115 +362,128 @@ impl EventTrackerBase {
                         user_id_key,
                         character_id,
                     })
-                    .is_some_and(|p| p.score == score && p.rank == rank)
+                    .is_some_and(|state| state.score == score && state.rank == rank)
             },
-        );
-        let will_write = !records.is_empty() || !wl_rows.is_empty();
+        )
+    }
+
+    async fn begin_cache_update(&mut self, will_write: bool) {
         if will_write
             && let Some(conn) = self.api_cache_redis.as_mut()
             && let Err(err) = begin_event_update(conn, self.server, self.event_id).await
         {
             tracing::warn!(%err, "failed to mark API cache dirty");
         }
+    }
 
-        if !records.is_empty() {
-            if let Err(err) = batch_insert_event_rankings(
+    async fn persist_main_records(
+        &mut self,
+        records: &[PlayerEventRankingRecordSchema],
+        changed_ranks: &HashMap<i64, RankState>,
+    ) -> Result<bool, TrackerError> {
+        if !records.is_empty()
+            && let Err(err) = batch_insert_event_rankings(
                 &self.db,
                 self.server,
                 self.event_id,
                 &self.anonymizer,
-                &records,
+                records,
             )
             .await
-            {
-                if let Some(conn) = self.api_cache_redis.as_mut()
-                    && let Err(redis_err) =
-                        abort_event_update(conn, self.server, self.event_id).await
-                {
-                    tracing::warn!(%redis_err, "failed to clear API cache dirty after insert error");
-                }
-                return Err(err.into());
-            }
-            batch_called = true;
+        {
+            self.abort_cache_update("failed to clear API cache dirty after insert error")
+                .await;
+            return Err(err.into());
         }
-        // Commit the in-memory rank state only now that the rows landed —
-        // advancing it before the insert would drop the changed rows for
-        // good if the write had failed (they'd diff as unchanged next tick).
-        if !changed_ranks.is_empty() {
-            self.prev_rank_state
-                .extend(changed_ranks.iter().map(|(rank, s)| (*rank, s.clone())));
-        }
+        // Advance only after the rows land so a failed write remains diffable.
+        self.prev_rank_state.extend(
+            changed_ranks
+                .iter()
+                .map(|(rank, state)| (*rank, state.clone())),
+        );
+        Ok(!records.is_empty())
+    }
 
-        if !wl_rows.is_empty() {
-            match batch_insert_world_bloom_rankings(
-                &self.db,
-                self.server,
-                self.event_id,
-                &self.anonymizer,
-                &wl_rows,
-                &mut self.prev_world_bloom_state,
-                &mut self.wl_user_keys,
-            )
-            .await
-            {
-                Ok(inserted) => {
-                    if inserted > 0 {
-                        batch_called = true;
-                    } else if !batch_called
-                        && let Some(conn) = self.api_cache_redis.as_mut()
-                        && let Err(redis_err) =
-                            abort_event_update(conn, self.server, self.event_id).await
-                    {
-                        tracing::warn!(%redis_err, "failed to clear API cache dirty after no-op world bloom insert");
-                    }
+    async fn persist_world_bloom_records(
+        &mut self,
+        records: &[PlayerWorldBloomRankingRecordSchema],
+        batch_called: bool,
+    ) -> Result<bool, TrackerError> {
+        if records.is_empty() {
+            return Ok(batch_called);
+        }
+        let result = batch_insert_world_bloom_rankings(
+            &self.db,
+            self.server,
+            self.event_id,
+            &self.anonymizer,
+            records,
+            &mut self.prev_world_bloom_state,
+            &mut self.wl_user_keys,
+        )
+        .await;
+        match result {
+            Ok(inserted) if inserted > 0 => Ok(true),
+            Ok(_) => {
+                if !batch_called {
+                    self.abort_cache_update(
+                        "failed to clear API cache dirty after no-op world bloom insert",
+                    )
+                    .await;
                 }
-                Err(err) => {
-                    if batch_called
-                        && let Some(conn) = self.api_cache_redis.as_mut()
-                        && let Err(redis_err) =
-                            finish_event_update(conn, self.server, self.event_id).await
-                    {
-                        tracing::warn!(%redis_err, "failed to bump API cache epoch after partial write");
-                    }
-                    if !batch_called
-                        && let Some(conn) = self.api_cache_redis.as_mut()
-                        && let Err(redis_err) =
-                            abort_event_update(conn, self.server, self.event_id).await
-                    {
-                        tracing::warn!(%redis_err, "failed to clear API cache dirty after insert error");
-                    }
-                    return Err(err.into());
+                Ok(batch_called)
+            }
+            Err(err) => {
+                if batch_called {
+                    self.finish_cache_update("failed to bump API cache epoch after partial write")
+                        .await;
+                } else {
+                    self.abort_cache_update("failed to clear API cache dirty after insert error")
+                        .await;
                 }
+                Err(err.into())
             }
         }
+    }
 
-        if !batch_called {
-            if write_idle_heartbeat {
-                write_heartbeat(&self.db, self.event_id, now, 0).await?;
-            }
-        } else if let Some(conn) = self.api_cache_redis.as_mut()
+    async fn complete_cache_update(
+        &mut self,
+        batch_called: bool,
+        write_idle_heartbeat: bool,
+        now: i64,
+    ) -> Result<(), TrackerError> {
+        if batch_called {
+            self.finish_cache_update("failed to bump API cache epoch")
+                .await;
+        } else if write_idle_heartbeat {
+            write_heartbeat(&self.db, self.event_id, now, 0).await?;
+        }
+        Ok(())
+    }
+
+    async fn abort_cache_update(&mut self, message: &'static str) {
+        if let Some(conn) = self.api_cache_redis.as_mut()
+            && let Err(err) = abort_event_update(conn, self.server, self.event_id).await
+        {
+            tracing::warn!(%err, "{message}");
+        }
+    }
+
+    async fn finish_cache_update(&mut self, message: &'static str) {
+        if let Some(conn) = self.api_cache_redis.as_mut()
             && let Err(err) = finish_event_update(conn, self.server, self.event_id).await
         {
-            tracing::warn!(%err, "failed to bump API cache epoch");
+            tracing::warn!(%err, "{message}");
         }
+    }
 
-        // Only advance the border hash once its merged rows have persisted;
-        // committing earlier would suppress the merge forever if this write
-        // had failed (or never ran, as the old post-end refresh did).
+    async fn commit_border_cache(&mut self, data: &HandledRankingData, only_world_bloom: bool) {
         if !only_world_bloom
             && let Some((cache_key, border_hash)) = &data.border_cache
             && let Err(err) = store_cache(&mut self.redis, cache_key, border_hash).await
         {
             tracing::warn!(%err, "failed to store border cache hash");
         }
-
-        if let Err(err) =
-            save_rank_state(&mut self.redis, self.server, self.event_id, &changed_ranks).await
-        {
-            tracing::warn!(%err, "failed to save rank_state to Redis");
-        }
-        tracing::info!("finished recording ranking data");
-        Ok(batch_called)
     }
 
     async fn handle_ranking_data(&mut self) -> Result<HandledRankingData, TrackerError> {
