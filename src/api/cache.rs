@@ -2027,6 +2027,54 @@ pub fn wb_batch_rank_suffix(kind: &str, character_id: i64, ranks: &[i64]) -> Str
 mod tests {
     use super::*;
     use serde::Deserialize;
+    use std::sync::atomic::AtomicI64;
+
+    static NEXT_EVENT_ID: AtomicI64 = AtomicI64::new(900_000);
+
+    async fn coverage_redis() -> Option<ConnectionManager> {
+        let Ok(url) = std::env::var("HARUKI_COVERAGE_REDIS_URL") else {
+            return None;
+        };
+        let client = redis::Client::open(url).expect("coverage Redis URL should be valid");
+        Some(
+            ConnectionManager::new(client)
+                .await
+                .expect("coverage Redis should be reachable"),
+        )
+    }
+
+    fn next_event_id() -> i64 {
+        let millis = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        millis * 1_000 + NEXT_EVENT_ID.fetch_add(1, Ordering::Relaxed) % 1_000
+    }
+
+    fn test_config() -> ApiCacheConfig {
+        ApiCacheConfig {
+            enabled: true,
+            local_control_ttl_ms: 60_000,
+            local_value_ttl_ms: 60_000,
+            precompress_min_bytes: 1,
+            max_value_bytes: 1024 * 1024,
+            batch_max_value_bytes: 4 * 1024 * 1024,
+            ..ApiCacheConfig::default()
+        }
+    }
+
+    fn test_cache(conn: &ConnectionManager, cfg: &ApiCacheConfig) -> ApiCache {
+        ApiCache::new(vec![conn.clone()], cfg.clone())
+    }
+
+    async fn redis_set(conn: &mut ConnectionManager, key: &str, value: &[u8]) {
+        redis::cmd("SET")
+            .arg(key)
+            .arg(value)
+            .query_async::<()>(conn)
+            .await
+            .unwrap();
+    }
 
     #[test]
     fn builds_epoch_value_keys() {
@@ -2296,5 +2344,454 @@ mod tests {
             Flight::Owner(_) => {}
             Flight::Waiter(_) => panic!("dropped owner should remove in-flight key"),
         }
+    }
+
+    #[tokio::test]
+    async fn redis_cache_covers_dynamic_l1_l2_dirty_and_negative_paths() {
+        let Some(mut conn) = coverage_redis().await else {
+            return;
+        };
+        let event_id = next_event_id();
+        let cfg = test_config();
+        let cache = test_cache(&conn, &cfg);
+
+        let first = cache
+            .get_or_fetch::<TypedCachePayload, _>("JP", event_id, "typed".into(), 60, async {
+                Ok(TypedCachePayload { items: vec![1] })
+            })
+            .await
+            .unwrap();
+        assert_eq!(first.items, vec![1]);
+
+        let l1 = cache
+            .get_or_fetch::<TypedCachePayload, _>("jp", event_id, "typed".into(), 60, async {
+                Err(ApiError::ServiceUnavailable("should not fetch".into()))
+            })
+            .await
+            .unwrap();
+        assert_eq!(l1.items, vec![1]);
+
+        let l2_cache = test_cache(&conn, &cfg);
+        let l2 = l2_cache
+            .get_or_fetch_json_bytes::<TypedCachePayload, _>(
+                "jp",
+                event_id,
+                "typed".into(),
+                60,
+                async { Err(ApiError::ServiceUnavailable("should not fetch".into())) },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            sonic_rs::from_slice::<TypedCachePayload>(&l2)
+                .unwrap()
+                .items,
+            vec![1]
+        );
+
+        let control_miss = l2_cache
+            .get_or_fetch_json_bytes::<TypedCachePayload, _>(
+                "jp",
+                event_id,
+                "other".into(),
+                60,
+                async { Ok(TypedCachePayload { items: vec![2] }) },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            sonic_rs::from_slice::<TypedCachePayload>(&control_miss)
+                .unwrap()
+                .items,
+            vec![2]
+        );
+
+        begin_event_update(&mut conn, "JP", event_id).await.unwrap();
+        let l1_dirty_cache = test_cache(&conn, &cfg);
+        l1_dirty_cache.store_l1_control(control_cache_key("jp", event_id), 0, true);
+        let l1_dirty = l1_dirty_cache
+            .get_or_fetch_json_bytes::<TypedCachePayload, _>(
+                "jp",
+                event_id,
+                "dirty-l1".into(),
+                60,
+                async { Ok(TypedCachePayload { items: vec![30] }) },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            sonic_rs::from_slice::<TypedCachePayload>(&l1_dirty)
+                .unwrap()
+                .items,
+            vec![30]
+        );
+
+        let dirty_cache = test_cache(&conn, &cfg);
+        let dirty = dirty_cache
+            .get_or_fetch_json_bytes::<TypedCachePayload, _>(
+                "jp",
+                event_id,
+                "dirty".into(),
+                60,
+                async { Ok(TypedCachePayload { items: vec![3] }) },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            sonic_rs::from_slice::<TypedCachePayload>(&dirty)
+                .unwrap()
+                .items,
+            vec![3]
+        );
+        abort_event_update(&mut conn, "jp", event_id).await.unwrap();
+
+        let negative_cache = test_cache(&conn, &cfg);
+        assert!(matches!(
+            negative_cache
+                .get_or_fetch_json_bytes::<TypedCachePayload, _>(
+                    "jp",
+                    event_id,
+                    "missing".into(),
+                    60,
+                    async { Err(ApiError::NotFound) },
+                )
+                .await,
+            Err(ApiError::NotFound)
+        ));
+        let negative_l2 = test_cache(&conn, &cfg);
+        assert!(matches!(
+            negative_l2
+                .get_or_fetch_json_bytes::<TypedCachePayload, _>(
+                    "jp",
+                    event_id,
+                    "missing".into(),
+                    60,
+                    async { Ok(TypedCachePayload { items: vec![99] }) },
+                )
+                .await,
+            Err(ApiError::NotFound)
+        ));
+
+        finish_event_update(&mut conn, "jp", event_id)
+            .await
+            .unwrap();
+        let epoch_cache = test_cache(&conn, &cfg);
+        let refreshed = epoch_cache
+            .get_or_fetch_json_bytes::<TypedCachePayload, _>(
+                "jp",
+                event_id,
+                "typed".into(),
+                60,
+                async { Ok(TypedCachePayload { items: vec![4] }) },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            sonic_rs::from_slice::<TypedCachePayload>(&refreshed)
+                .unwrap()
+                .items,
+            vec![4]
+        );
+    }
+
+    #[tokio::test]
+    async fn redis_cache_refetches_invalid_dynamic_and_static_json() {
+        let Some(mut conn) = coverage_redis().await else {
+            return;
+        };
+        let event_id = next_event_id();
+        let cfg = test_config();
+        let dynamic_key = value_key("jp", event_id, 0, "invalid");
+        redis_set(&mut conn, &dynamic_key, br#"{"oldItems":[1]}"#).await;
+
+        let cache = test_cache(&conn, &cfg);
+        let dynamic = cache
+            .get_or_fetch::<StrictTypedCachePayload, _>(
+                "jp",
+                event_id,
+                "invalid".into(),
+                60,
+                async { Ok(StrictTypedCachePayload { items: vec![5] }) },
+            )
+            .await
+            .unwrap();
+        assert_eq!(dynamic.items, vec![5]);
+
+        let controlled_key = value_key("jp", event_id, 0, "controlled-invalid");
+        redis_set(&mut conn, &controlled_key, br#"{"oldItems":[2]}"#).await;
+        let controlled = test_cache(&conn, &cfg);
+        controlled.store_l1_control(control_cache_key("jp", event_id), 0, false);
+        let result = controlled
+            .get_or_fetch::<StrictTypedCachePayload, _>(
+                "jp",
+                event_id,
+                "controlled-invalid".into(),
+                60,
+                async { Ok(StrictTypedCachePayload { items: vec![6] }) },
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.items, vec![6]);
+
+        let static_key = static_value_key("jp", event_id, "static-invalid");
+        redis_set(&mut conn, &static_key, br#"{"oldItems":[3]}"#).await;
+        let static_cache = test_cache(&conn, &cfg);
+        let result = static_cache
+            .get_or_fetch_static::<StrictTypedCachePayload, _>(
+                "jp",
+                event_id,
+                "static-invalid".into(),
+                60,
+                async { Ok(StrictTypedCachePayload { items: vec![7] }) },
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.items, vec![7]);
+
+        let static_l2 = test_cache(&conn, &cfg)
+            .get_or_fetch_static_json_bytes::<StrictTypedCachePayload, _>(
+                "jp",
+                event_id,
+                "static-invalid".into(),
+                60,
+                async { Err(ApiError::ServiceUnavailable("should not fetch".into())) },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            sonic_rs::from_slice::<StrictTypedCachePayload>(&static_l2)
+                .unwrap()
+                .items,
+            vec![7]
+        );
+    }
+
+    #[tokio::test]
+    async fn redis_cache_covers_gzip_l1_l2_and_batch_paths() {
+        let Some(mut conn) = coverage_redis().await else {
+            return;
+        };
+        let event_id = next_event_id();
+        let cfg = test_config();
+        let cache = test_cache(&conn, &cfg);
+
+        let encoded = cache
+            .get_or_fetch_encoded_json::<TypedCachePayload, _>(
+                "jp",
+                event_id,
+                "gzip".into(),
+                60,
+                true,
+                async {
+                    Ok(TypedCachePayload {
+                        items: (0..128).collect(),
+                    })
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(encoded.encoding, CachedJsonEncoding::Gzip);
+
+        let l1_gzip = cache
+            .get_or_fetch_encoded_json::<TypedCachePayload, _>(
+                "jp",
+                event_id,
+                "gzip".into(),
+                60,
+                true,
+                async { Err(ApiError::ServiceUnavailable("should not fetch".into())) },
+            )
+            .await
+            .unwrap();
+        assert_eq!(l1_gzip.encoding, CachedJsonEncoding::Gzip);
+
+        let combined_l2 = test_cache(&conn, &cfg)
+            .get_or_fetch_encoded_json::<TypedCachePayload, _>(
+                "jp",
+                event_id,
+                "gzip".into(),
+                60,
+                true,
+                async { Err(ApiError::ServiceUnavailable("should not fetch".into())) },
+            )
+            .await
+            .unwrap();
+        assert_eq!(combined_l2.encoding, CachedJsonEncoding::Gzip);
+
+        let l2_cache = test_cache(&conn, &cfg);
+        l2_cache.store_l1_control(control_cache_key("jp", event_id), 0, false);
+        let l2_gzip = l2_cache
+            .get_or_fetch_encoded_json::<TypedCachePayload, _>(
+                "jp",
+                event_id,
+                "gzip".into(),
+                60,
+                true,
+                async { Err(ApiError::ServiceUnavailable("should not fetch".into())) },
+            )
+            .await
+            .unwrap();
+        assert_eq!(l2_gzip.encoding, CachedJsonEncoding::Gzip);
+
+        let value = value_key("jp", event_id, 0, "identity-only");
+        redis_set(&mut conn, &value, br#"{"items":[8,9]}"#).await;
+        let identity_cache = test_cache(&conn, &cfg);
+        identity_cache.store_l1_control(control_cache_key("jp", event_id), 0, false);
+        let rebuilt = identity_cache
+            .get_or_fetch_encoded_json::<TypedCachePayload, _>(
+                "jp",
+                event_id,
+                "identity-only".into(),
+                60,
+                true,
+                async { Err(ApiError::ServiceUnavailable("should not fetch".into())) },
+            )
+            .await
+            .unwrap();
+        assert_eq!(rebuilt.encoding, CachedJsonEncoding::Gzip);
+
+        let batch = cache
+            .get_or_fetch_batch_encoded_json("jp", event_id, "batch".into(), 60, true, async {
+                Ok(Bytes::from_static(br#"{"items":[10]}"#))
+            })
+            .await
+            .unwrap();
+        assert_eq!(batch.encoding, CachedJsonEncoding::Gzip);
+
+        let identity = cache
+            .get_or_fetch_batch_encoded_json(
+                "jp",
+                event_id,
+                "batch-identity".into(),
+                60,
+                false,
+                async { Ok(Bytes::from_static(br#"{"items":[11]}"#)) },
+            )
+            .await
+            .unwrap();
+        assert_eq!(identity.encoding, CachedJsonEncoding::Identity);
+
+        begin_event_update(&mut conn, "jp", event_id).await.unwrap();
+        let dirty_cache = test_cache(&conn, &cfg);
+        dirty_cache.store_l1_control(control_cache_key("jp", event_id), 0, true);
+        let dirty = dirty_cache
+            .get_or_fetch_encoded_json::<TypedCachePayload, _>(
+                "jp",
+                event_id,
+                "dirty-gzip".into(),
+                60,
+                true,
+                async { Ok(TypedCachePayload { items: vec![14] }) },
+            )
+            .await
+            .unwrap();
+        assert_eq!(dirty.encoding, CachedJsonEncoding::Gzip);
+        abort_event_update(&mut conn, "jp", event_id).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn redis_cache_covers_encoded_negative_miss_and_identity_fallbacks() {
+        let Some(mut conn) = coverage_redis().await else {
+            return;
+        };
+        let event_id = next_event_id();
+        let mut cfg = test_config();
+        let cache = test_cache(&conn, &cfg);
+
+        assert!(matches!(
+            cache
+                .get_or_fetch_encoded_json::<TypedCachePayload, _>(
+                    "jp",
+                    event_id,
+                    "encoded-missing".into(),
+                    60,
+                    true,
+                    async { Err(ApiError::NotFound) },
+                )
+                .await,
+            Err(ApiError::NotFound)
+        ));
+        let negative = test_cache(&conn, &cfg);
+        negative.store_l1_control(control_cache_key("jp", event_id), 0, false);
+        assert!(matches!(
+            negative
+                .get_or_fetch_encoded_json::<TypedCachePayload, _>(
+                    "jp",
+                    event_id,
+                    "encoded-missing".into(),
+                    60,
+                    true,
+                    async { Ok(TypedCachePayload { items: vec![1] }) },
+                )
+                .await,
+            Err(ApiError::NotFound)
+        ));
+
+        cfg.precompress_gzip_enabled = false;
+        let identity_cache = test_cache(&conn, &cfg);
+        let identity = identity_cache
+            .get_or_fetch_encoded_json("jp", event_id, "disabled-gzip".into(), 60, true, async {
+                Ok(TypedCachePayload { items: vec![12] })
+            })
+            .await
+            .unwrap();
+        assert_eq!(identity.encoding, CachedJsonEncoding::Identity);
+
+        let bypass = identity_cache
+            .get_or_fetch_static_json_bytes("jp", event_id, "ttl-zero".into(), 0, async {
+                Ok(TypedCachePayload { items: vec![13] })
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            sonic_rs::from_slice::<TypedCachePayload>(&bypass)
+                .unwrap()
+                .items,
+            vec![13]
+        );
+    }
+
+    #[tokio::test]
+    async fn cache_handles_oversized_and_large_gzip_payloads() {
+        let Some(conn) = coverage_redis().await else {
+            return;
+        };
+        let event_id = next_event_id();
+        let mut cfg = test_config();
+        cfg.max_value_bytes = 1;
+        cfg.batch_max_value_bytes = 1;
+        let cache = test_cache(&conn, &cfg);
+
+        let oversized = cache
+            .get_or_fetch_json_bytes("jp", event_id, "oversized".into(), 60, async {
+                Ok(TypedCachePayload { items: vec![1, 2] })
+            })
+            .await
+            .unwrap();
+        assert!(!oversized.is_empty());
+
+        let batch = cache
+            .get_or_fetch_batch_encoded_json(
+                "jp",
+                event_id,
+                "oversized-batch".into(),
+                60,
+                true,
+                async { Ok(Bytes::from(vec![b'x'; 64])) },
+            )
+            .await
+            .unwrap();
+        assert_eq!(batch.encoding, CachedJsonEncoding::Gzip);
+
+        let large = cache
+            .get_or_fetch_encoded_json("jp", event_id, "large-gzip".into(), 0, true, async {
+                Ok(TypedCachePayload {
+                    items: (0..20_000).collect(),
+                })
+            })
+            .await
+            .unwrap();
+        assert_eq!(large.encoding, CachedJsonEncoding::Gzip);
+        assert!(large.bytes.len() > 100);
     }
 }

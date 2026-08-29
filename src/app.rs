@@ -261,3 +261,146 @@ fn redis_url(cfg: &RedisConfig) -> String {
         format!("redis://:{}@{}:{}/", cfg.password, cfg.host, cfg.port)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::db_config::DbConfig;
+
+    fn coverage_redis_config() -> Option<(String, RedisConfig)> {
+        let Ok(url) = std::env::var("HARUKI_COVERAGE_REDIS_URL") else {
+            return None;
+        };
+        let authority = url.strip_prefix("redis://")?.trim_end_matches('/');
+        let (host, port) = authority.rsplit_once(':')?;
+        let host = host.to_owned();
+        let port = port.parse().ok()?;
+        Some((
+            url,
+            RedisConfig {
+                host,
+                port,
+                password: String::new(),
+            },
+        ))
+    }
+
+    #[tokio::test]
+    async fn builds_api_only_context_with_no_servers() {
+        let context = build(&Config::default()).await.unwrap();
+
+        assert!(context.dbs.is_empty());
+        assert!(context.trackers.is_empty());
+        assert!(context.scheduler.is_none());
+    }
+
+    #[tokio::test]
+    async fn builds_enabled_api_only_sqlite_server() {
+        let mut cfg = Config::default();
+        cfg.servers.insert(
+            SekaiServerRegion::Jp,
+            ServerConfig {
+                enabled: true,
+                db: DbConfig {
+                    dialect: "sqlite".into(),
+                    dsn: "sqlite::memory:".into(),
+                    max_open_conns: 1,
+                    max_idle_conns: 1,
+                    ..DbConfig::default()
+                },
+                ..ServerConfig::default()
+            },
+        );
+
+        let context = build(&cfg).await.unwrap();
+
+        assert!(context.dbs.contains_key(&SekaiServerRegion::Jp));
+        assert!(context.trackers.is_empty());
+        assert!(context.scheduler.is_none());
+    }
+
+    #[tokio::test]
+    async fn skips_disabled_server_configuration() {
+        let mut dbs = HashMap::new();
+        let mut trackers = HashMap::new();
+
+        configure_server(
+            SekaiServerRegion::En,
+            &ServerConfig::default(),
+            &None,
+            &None,
+            &None,
+            &RealtimeHub::new(),
+            &UidAnonymizer::disabled(),
+            &None,
+            &mut dbs,
+            &mut trackers,
+        )
+        .await
+        .unwrap();
+
+        assert!(dbs.is_empty());
+        assert!(trackers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn disabled_api_cache_needs_no_redis() {
+        let result = build_api_cache(&Config::default()).await.unwrap();
+
+        assert!(result.0.is_none());
+        assert!(result.1.is_none());
+    }
+
+    #[tokio::test]
+    async fn builds_enabled_cache_and_tracker_dependencies() {
+        let Some((url, redis)) = coverage_redis_config() else {
+            return;
+        };
+        let mut cfg = Config {
+            redis,
+            ..Config::default()
+        };
+        cfg.api_cache.enabled = true;
+        cfg.api_cache.redis_url = url;
+        cfg.api_cache.pool_size = 2;
+        cfg.sekai_api.api_endpoint = "http://127.0.0.1".into();
+
+        let (cache, invalidation) = build_api_cache(&cfg).await.unwrap();
+        assert!(cache.is_some());
+        assert!(invalidation.is_some());
+
+        let (redis, api) = build_tracker_dependencies(&cfg, true).await.unwrap();
+        assert!(redis.is_some());
+        assert!(api.is_some());
+    }
+
+    #[test]
+    fn builds_anonymizer_from_privacy_configuration() {
+        let disabled = build_anonymizer(&Config::default()).unwrap();
+        assert!(!disabled.is_enabled());
+
+        let mut enabled_cfg = Config::default();
+        enabled_cfg.privacy.uid_anonymization.enabled = true;
+        enabled_cfg.privacy.uid_anonymization.salt = "secret".into();
+        assert!(build_anonymizer(&enabled_cfg).unwrap().is_enabled());
+
+        enabled_cfg.privacy.uid_anonymization.salt.clear();
+        assert!(matches!(
+            build_anonymizer(&enabled_cfg),
+            Err(BootstrapError::Privacy(_))
+        ));
+    }
+
+    #[test]
+    fn builds_redis_urls_with_and_without_passwords() {
+        let mut cfg = RedisConfig {
+            host: "redis.internal".into(),
+            port: 6380,
+            password: String::new(),
+        };
+        assert_eq!(redis_url(&cfg), "redis://redis.internal:6380/");
+
+        cfg.password = "password".into();
+        assert_eq!(redis_url(&cfg), "redis://:password@redis.internal:6380/");
+    }
+}

@@ -563,7 +563,69 @@ fn should_refresh_after_end(last: Option<i64>, now: i64, interval_secs: u64) -> 
 
 #[cfg(test)]
 mod tests {
-    use super::should_refresh_after_end;
+    use super::*;
+    use sea_orm::{Database, DatabaseBackend};
+    use std::sync::atomic::{AtomicI64, Ordering};
+
+    static NEXT_EVENT_ID: AtomicI64 = AtomicI64::new(950_000);
+
+    fn ranking(rank: i64, user_id: i64, score: i64) -> PlayerRankingSchema {
+        PlayerRankingSchema {
+            is_own: None,
+            name: Some(format!("player-{user_id}")),
+            rank: Some(rank),
+            score: Some(score),
+            user_id: Some(user_id),
+            user_card: None,
+            user_profile: None,
+            user_profile_honors: Vec::new(),
+            user_cheerful_carnival: None,
+            user_honor_missions: Vec::new(),
+            user_player_frames: Vec::new(),
+        }
+    }
+
+    async fn tracker_fixture(event_type: SekaiEventType) -> Option<EventTrackerBase> {
+        let Ok(redis_url) = std::env::var("HARUKI_COVERAGE_REDIS_URL") else {
+            return None;
+        };
+        let redis_client = redis::Client::open(redis_url).expect("coverage Redis URL is valid");
+        let redis = redis::aio::ConnectionManager::new(redis_client)
+            .await
+            .expect("coverage Redis is reachable");
+        let sql = Database::connect("sqlite::memory:").await.unwrap();
+        let db = Arc::new(DatabaseEngine::from_connection(
+            sql,
+            DatabaseBackend::Sqlite,
+        ));
+        let millis = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        let event_id = millis * 1_000 + NEXT_EVENT_ID.fetch_add(1, Ordering::Relaxed) % 1_000;
+        create_event_tables(
+            &db,
+            SekaiServerRegion::Jp,
+            event_id,
+            event_type == SekaiEventType::WorldBloom,
+        )
+        .await
+        .unwrap();
+
+        Some(EventTrackerBase::new(
+            SekaiServerRegion::Jp,
+            event_id,
+            event_type,
+            false,
+            db,
+            redis.clone(),
+            Some(redis),
+            HarukiSekaiAPIClient::new("http://127.0.0.1", "").unwrap(),
+            UidAnonymizer::disabled(),
+            3600,
+            HashMap::new(),
+        ))
+    }
 
     #[test]
     fn post_end_refresh_gate_respects_interval() {
@@ -571,5 +633,104 @@ mod tests {
         assert!(!should_refresh_after_end(Some(100), 200, 3600));
         assert!(should_refresh_after_end(Some(100), 3700, 3600));
         assert!(should_refresh_after_end(Some(100), 101, 0));
+    }
+
+    #[tokio::test]
+    async fn builds_main_and_world_bloom_records_from_tracker_state() {
+        let Some(mut tracker) = tracker_fixture(SekaiEventType::WorldBloom).await else {
+            return;
+        };
+        let mut data = HandledRankingData {
+            record_time: 1_700_000_000,
+            rankings: vec![ranking(1, 100, 1_000)],
+            world_bloom_rankings: HashMap::from([(39, vec![ranking(2, 200, 900)])]),
+            border_cache: None,
+        };
+
+        let (changed, main) = tracker.build_main_records(&data, false);
+        assert_eq!(changed.len(), 1);
+        assert_eq!(main.len(), 1);
+        assert_eq!(main[0].user_id, "100");
+        assert!(tracker.build_main_records(&data, true).1.is_empty());
+
+        let world_bloom = tracker.build_world_bloom_records(&data);
+        assert_eq!(world_bloom.len(), 1);
+        tracker.wl_user_keys.insert(200, 7);
+        tracker.prev_world_bloom_state.insert(
+            WorldBloomKey {
+                user_id_key: 7,
+                character_id: 39,
+            },
+            PlayerState {
+                score: 900,
+                rank: 2,
+            },
+        );
+        assert!(tracker.build_world_bloom_records(&data).is_empty());
+
+        data.rankings.clear();
+        assert!(tracker.build_main_records(&data, false).1.is_empty());
+    }
+
+    #[tokio::test]
+    async fn persists_main_rankings_and_invalidates_cache_epoch() {
+        let Some(mut tracker) = tracker_fixture(SekaiEventType::Marathon).await else {
+            return;
+        };
+        let data = HandledRankingData {
+            record_time: 1_700_000_001,
+            rankings: vec![ranking(1, 300, 2_000)],
+            world_bloom_rankings: HashMap::new(),
+            border_cache: Some(("coverage-border-cache".into(), [7; 32])),
+        };
+
+        assert!(
+            tracker
+                .persist_ranking_data(&data, false, false, data.record_time)
+                .await
+                .unwrap()
+        );
+        assert_eq!(tracker.prev_rank_state[&1].score, 2_000);
+
+        let unchanged = HandledRankingData {
+            border_cache: None,
+            ..data
+        };
+        assert!(
+            !tracker
+                .persist_ranking_data(&unchanged, false, false, unchanged.record_time)
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn persists_world_bloom_rankings_and_updates_local_state() {
+        let Some(mut tracker) = tracker_fixture(SekaiEventType::WorldBloom).await else {
+            return;
+        };
+        let data = HandledRankingData {
+            record_time: 1_700_000_002,
+            rankings: Vec::new(),
+            world_bloom_rankings: HashMap::from([(21, vec![ranking(5, 400, 1_500)])]),
+            border_cache: None,
+        };
+
+        assert!(
+            tracker
+                .persist_ranking_data(&data, true, false, data.record_time)
+                .await
+                .unwrap()
+        );
+        assert_eq!(tracker.wl_user_keys.len(), 1);
+        assert_eq!(tracker.prev_world_bloom_state.len(), 1);
+
+        tracker.begin_cache_update(false).await;
+        tracker
+            .abort_cache_update("coverage abort should succeed")
+            .await;
+        tracker
+            .finish_cache_update("coverage finish should succeed")
+            .await;
     }
 }
