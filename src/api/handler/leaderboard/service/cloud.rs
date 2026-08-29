@@ -366,7 +366,229 @@ fn cloud_info_from_rank_data(
 mod tests {
     use super::*;
     use crate::api::handler::leaderboard::service::util::meta;
+    use crate::api::limiter::ApiQueryLimiter;
+    use crate::api::realtime::RealtimeHub;
+    use crate::api::state::AppState;
+    use crate::api::ws_ticket::WsTicketStore;
+    use crate::config::ApiQueryConfig;
+    use crate::db::query::web::tests::{
+        seed_normal_event_with_history, seed_world_bloom_event_with_history, sqlite_engine,
+    };
+    use crate::db::schema::create_event_tables;
+    use crate::model::enums::SekaiServerRegion;
+    use crate::privacy::UidAnonymizer;
     use sonic_rs::JsonValueTrait;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    const NORMAL_EVENT: i64 = 801;
+    const WORLD_BLOOM_EVENT: i64 = 802;
+
+    async fn test_state() -> AppState {
+        let engine = sqlite_engine().await;
+        create_event_tables(&engine, SekaiServerRegion::Jp, NORMAL_EVENT, false)
+            .await
+            .unwrap();
+        seed_normal_event_with_history(&engine, NORMAL_EVENT).await;
+        create_event_tables(&engine, SekaiServerRegion::Jp, WORLD_BLOOM_EVENT, true)
+            .await
+            .unwrap();
+        seed_world_bloom_event_with_history(&engine, WORLD_BLOOM_EVENT).await;
+        AppState::new(
+            HashMap::from([(SekaiServerRegion::Jp, Arc::new(engine))]),
+            None,
+            ApiQueryLimiter::new(ApiQueryConfig::default(), [SekaiServerRegion::Jp]),
+            UidAnonymizer::disabled(),
+            None,
+            RealtimeHub::new(),
+            WsTicketStore::default(),
+        )
+    }
+
+    fn query() -> CloudQuery {
+        CloudQuery {
+            user_id: None,
+            interval: Some(60),
+            unit_seconds: Some(120),
+            include_adjacent: Some(true),
+            skip_missing: Some(false),
+            subject_type: None,
+            subject: None,
+            limit: Some(10),
+        }
+    }
+
+    #[tokio::test]
+    async fn cloud_endpoints_cover_normal_and_world_bloom_scopes() {
+        let state = test_state().await;
+
+        let response = cloud_query_for_scope(
+            state.clone(),
+            "jp".into(),
+            NORMAL_EVENT,
+            None,
+            query(),
+            Some("rank=2".into()),
+            false,
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(response.ranks[0].rank, 2);
+        assert_eq!(response.previous.unwrap().rank, 1);
+        assert_eq!(response.next.unwrap().rank, 3);
+
+        let check_room = cloud_check_room_for_scope(
+            state.clone(),
+            "jp".into(),
+            NORMAL_EVENT,
+            None,
+            query(),
+            Some("ranks=1,2".into()),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(check_room.rank.rank, 1);
+        assert_eq!(check_room.ranks.len(), 2);
+
+        let line = cloud_line_for_scope(
+            state.clone(),
+            "jp".into(),
+            NORMAL_EVENT,
+            None,
+            query(),
+            Some("rank=1&rank=3".into()),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(line.ranks.len(), 2);
+        assert!(line.ranks.iter().all(|rank| rank.name.is_empty()));
+
+        let speed = cloud_speed_for_scope(
+            state.clone(),
+            "jp".into(),
+            NORMAL_EVENT,
+            None,
+            query(),
+            Some("rank=1".into()),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(speed.interval_seconds, 60);
+        assert_eq!(speed.unit_seconds, 120);
+
+        let world = cloud_query_for_scope(
+            state,
+            "jp".into(),
+            WORLD_BLOOM_EVENT,
+            Some(17),
+            query(),
+            Some("rank=1".into()),
+            false,
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(world.ranks[0].character_id, Some(17));
+    }
+
+    #[tokio::test]
+    async fn cloud_query_resolves_users_and_handles_missing_ranks() {
+        let state = test_state().await;
+        let mut by_user = query();
+        by_user.user_id = Some("100".into());
+        let response = cloud_query_for_scope(
+            state.clone(),
+            "jp".into(),
+            NORMAL_EVENT,
+            None,
+            by_user,
+            None,
+            false,
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(response.ranks[0].rank, 1);
+
+        let error = cloud_query_for_scope(
+            state.clone(),
+            "jp".into(),
+            NORMAL_EVENT,
+            None,
+            query(),
+            None,
+            false,
+        )
+        .await
+        .err()
+        .expect("query without rank or user must fail");
+        assert!(matches!(error, ApiError::BadRequest(_)));
+
+        let mut skip = query();
+        skip.skip_missing = Some(true);
+        let response = cloud_query_for_scope(
+            state.clone(),
+            "jp".into(),
+            NORMAL_EVENT,
+            None,
+            skip,
+            Some("ranks=1,999".into()),
+            false,
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(response.ranks.len(), 1);
+
+        let error = cloud_query_for_scope(
+            state,
+            "jp".into(),
+            NORMAL_EVENT,
+            None,
+            query(),
+            Some("rank=999".into()),
+            false,
+        )
+        .await
+        .err()
+        .expect("missing rank must fail");
+        assert!(matches!(error, ApiError::NotFound));
+    }
+
+    #[tokio::test]
+    async fn cloud_trace_supports_user_and_rank_subjects() {
+        let state = test_state().await;
+        let mut user = query();
+        user.subject = Some("100".into());
+        let trace = cloud_trace_for_scope(state.clone(), "jp".into(), NORMAL_EVENT, None, user)
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(trace.subject.resolved_user_id.as_deref(), Some("100"));
+        assert_eq!(trace.rank_data.len(), 2);
+
+        let mut rank = query();
+        rank.subject_type = Some("rank".into());
+        rank.subject = Some("2".into());
+        let trace = cloud_trace_for_scope(state.clone(), "jp".into(), NORMAL_EVENT, None, rank)
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(trace.subject.resolved_rank, Some(2));
+
+        let mut world = query();
+        world.subject_type = Some("rank".into());
+        world.subject = Some("1".into());
+        let trace = cloud_trace_for_scope(state, "jp".into(), WORLD_BLOOM_EVENT, Some(17), world)
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(trace.rank_data[0].character_id, Some(17));
+    }
 
     #[test]
     fn cloud_rank_info_serializes_round_metric_fields() {

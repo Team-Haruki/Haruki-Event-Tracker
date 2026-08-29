@@ -278,3 +278,83 @@ pub fn config_location_from_args_env() -> String {
         .or_else(|_| env::var(LEGACY_CONFIG_ENV))
         .unwrap_or_else(|_| DEFAULT_CONFIG_FILE.to_owned())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_config(name: &str, contents: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "haruki-event-tracker-{name}-{}.yaml",
+            std::process::id()
+        ));
+        std::fs::write(&path, contents).unwrap();
+        path
+    }
+
+    #[test]
+    fn defaults_match_runtime_expectations() {
+        let cfg = Config::default();
+        assert!(!cfg.api_cache.enabled);
+        assert_eq!(cfg.api_cache.pool_size, 2);
+        assert_eq!(cfg.api_cache.default_ttl_secs, 2);
+        assert_eq!(cfg.api_query.trace_global_max_concurrency, 32);
+        assert_eq!(cfg.backend.access_log_sample_rate, 1.0);
+        assert_eq!(
+            TrackerConfig::default().post_end_user_refresh_interval_secs,
+            3600
+        );
+    }
+
+    #[test]
+    fn loads_yaml_and_classifies_file_errors() {
+        let path = temp_config(
+            "valid",
+            r#"
+redis:
+  host: localhost
+  port: 6379
+api_cache:
+  enabled: true
+servers:
+  jp:
+    enabled: true
+"#,
+        );
+        let cfg = load_from_file(&path).unwrap();
+        assert_eq!(cfg.redis.host, "localhost");
+        assert!(cfg.api_cache.enabled);
+        assert!(cfg.servers[&SekaiServerRegion::Jp].enabled);
+        std::fs::remove_file(&path).unwrap();
+
+        assert!(matches!(
+            load_from_file(&path),
+            Err(ConfigError::Read { .. })
+        ));
+        let invalid = temp_config("invalid", "redis: [");
+        assert!(matches!(
+            load_from_file(&invalid),
+            Err(ConfigError::Parse { .. })
+        ));
+        std::fs::remove_file(invalid).unwrap();
+    }
+
+    #[tokio::test]
+    async fn loads_file_locations_and_reports_storage_errors() {
+        let path = temp_config("location", "api_query:\n  acquire_timeout_ms: 25\n");
+        let cfg = load_from_location(path.to_str().unwrap()).await.unwrap();
+        assert_eq!(cfg.api_query.acquire_timeout_ms, 25);
+        std::fs::remove_file(&path).unwrap();
+
+        assert!(matches!(
+            load_from_location(path.to_str().unwrap()).await,
+            Err(ConfigError::ReadStorage { .. })
+        ));
+        let invalid = temp_config("location-invalid", "backend: [");
+        assert!(matches!(
+            load_from_location(invalid.to_str().unwrap()).await,
+            Err(ConfigError::Parse { .. })
+        ));
+        std::fs::remove_file(invalid).unwrap();
+    }
+}

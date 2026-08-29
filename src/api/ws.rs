@@ -490,3 +490,354 @@ impl WsResponse {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::api::limiter::ApiQueryLimiter;
+    use crate::api::realtime::RealtimeHub;
+    use crate::api::state::AppState;
+    use crate::api::ws_ticket::WsTicketStore;
+    use crate::config::ApiQueryConfig;
+    use crate::privacy::UidAnonymizer;
+    use axum::Json;
+    use axum::routing::get;
+    use futures::{SinkExt, StreamExt};
+    use serde_json::json;
+    use std::collections::HashMap;
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    use tokio_tungstenite::tungstenite::protocol::Message as ClientMessage;
+
+    fn router() -> Router {
+        Router::new()
+            .route(
+                "/api/v2/web/ok",
+                get(|| async { Json(json!({"value": 42})) }),
+            )
+            .route(
+                "/api/v2/web/error",
+                get(|| async {
+                    (
+                        StatusCode::UNPROCESSABLE_ENTITY,
+                        Json(json!({"error": "bad query"})),
+                    )
+                }),
+            )
+            .route(
+                "/api/v2/web/text",
+                get(|| async { (StatusCode::OK, "not json") }),
+            )
+    }
+
+    fn state() -> AppState {
+        AppState::new(
+            HashMap::new(),
+            None,
+            ApiQueryLimiter::new(ApiQueryConfig::default(), []),
+            UidAnonymizer::disabled(),
+            None,
+            RealtimeHub::new(),
+            WsTicketStore::default(),
+        )
+    }
+
+    async fn next_json<S>(socket: &mut tokio_tungstenite::WebSocketStream<S>) -> sonic_rs::Value
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
+        loop {
+            let message = socket.next().await.unwrap().unwrap();
+            if let ClientMessage::Text(text) = message {
+                return sonic_rs::from_str(&text).unwrap();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn text_requests_manage_topics_and_ping() {
+        let router = router();
+        let hub = crate::api::realtime::RealtimeHub::new();
+        let mut topics = HashSet::new();
+        hub.connection_opened();
+
+        let invalid = handle_text_request(&router, &hub, &mut topics, "owner", "{").await;
+        assert_eq!(invalid.status, StatusCode::BAD_REQUEST.as_u16());
+
+        let missing = handle_text_request(
+            &router,
+            &hub,
+            &mut topics,
+            "owner",
+            r#"{"id":"1","type":"subscribe"}"#,
+        )
+        .await;
+        assert!(!missing.ok);
+
+        let missing_event = handle_text_request(
+            &router,
+            &hub,
+            &mut topics,
+            "owner",
+            r#"{"id":"2","type":"subscribe","server":"jp"}"#,
+        )
+        .await;
+        assert!(!missing_event.ok);
+
+        let subscribed = handle_text_request(
+            &router,
+            &hub,
+            &mut topics,
+            "owner",
+            r#"{"id":"3","type":"subscribe","server":"jp","eventId":10}"#,
+        )
+        .await;
+        assert!(subscribed.ok);
+        assert_eq!(topics.len(), 1);
+
+        let duplicate = handle_text_request(
+            &router,
+            &hub,
+            &mut topics,
+            "owner",
+            r#"{"id":"4","type":"subscribe","server":"jp","eventId":10}"#,
+        )
+        .await;
+        assert!(duplicate.ok);
+        assert_eq!(
+            hub.topic_online(&RealtimeTopic::new(SekaiServerRegion::Jp, 10))
+                .await,
+            1
+        );
+
+        let ping = handle_text_request(
+            &router,
+            &hub,
+            &mut topics,
+            "owner",
+            r#"{"id":"5","type":"ping"}"#,
+        )
+        .await;
+        assert!(ping.ok);
+        assert_eq!(ping.data.unwrap()["type"].as_str(), Some("pong"));
+
+        let missing_unsubscribe = handle_text_request(
+            &router,
+            &hub,
+            &mut topics,
+            "owner",
+            r#"{"id":"6","type":"unsubscribe"}"#,
+        )
+        .await;
+        assert!(!missing_unsubscribe.ok);
+
+        let invalid_unsubscribe = handle_text_request(
+            &router,
+            &hub,
+            &mut topics,
+            "owner",
+            r#"{"id":"7","type":"unsubscribe","server":"jp","eventId":0}"#,
+        )
+        .await;
+        assert!(!invalid_unsubscribe.ok);
+
+        let unsubscribed = handle_text_request(
+            &router,
+            &hub,
+            &mut topics,
+            "owner",
+            r#"{"id":"8","type":"unsubscribe","server":"jp","eventId":10}"#,
+        )
+        .await;
+        assert!(unsubscribed.ok);
+        assert!(topics.is_empty());
+        hub.connection_closed(&[]).await;
+    }
+
+    #[tokio::test]
+    async fn proxy_requests_validate_paths_status_and_json() {
+        let router = router();
+        let hub = crate::api::realtime::RealtimeHub::new();
+        let mut topics = HashSet::new();
+
+        let ok = handle_text_request(
+            &router,
+            &hub,
+            &mut topics,
+            "owner-1",
+            r#"{"id":"1","path":"/api/v2/web/ok"}"#,
+        )
+        .await;
+        assert!(ok.ok);
+        assert_eq!(ok.data.unwrap()["value"].as_i64(), Some(42));
+
+        let error = handle_text_request(
+            &router,
+            &hub,
+            &mut topics,
+            "owner-1",
+            r#"{"id":"2","path":"/api/v2/web/error"}"#,
+        )
+        .await;
+        assert_eq!(error.status, StatusCode::UNPROCESSABLE_ENTITY.as_u16());
+        assert_eq!(error.error.as_deref(), Some("bad query"));
+
+        let invalid_json = handle_text_request(
+            &router,
+            &hub,
+            &mut topics,
+            "owner-1",
+            r#"{"id":"3","path":"/api/v2/web/text"}"#,
+        )
+        .await;
+        assert_eq!(
+            invalid_json.status,
+            StatusCode::INTERNAL_SERVER_ERROR.as_u16()
+        );
+
+        for path in [
+            "/other/path",
+            "/api/v2/web/http://evil.test",
+            "/api/v2/web/bad\\path",
+            "/api/v2/web/bad\npath",
+        ] {
+            let request = WsRequest {
+                id: "bad".into(),
+                path: path.into(),
+                kind: String::new(),
+                server: None,
+                event_id: None,
+            };
+            let response = handle_proxy_request(&router, request, "owner-1").await;
+            assert_eq!(response.status, StatusCode::BAD_REQUEST.as_u16());
+        }
+    }
+
+    #[test]
+    fn subject_and_error_helpers_cover_header_aliases() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-user-id", "  user-1  ".parse().unwrap());
+        assert_eq!(
+            resolve_oathkeeper_subject(&headers).as_deref(),
+            Some("user-1")
+        );
+        headers.clear();
+        headers.insert("x-user", "fallback".parse().unwrap());
+        assert_eq!(
+            resolve_oathkeeper_subject(&headers).as_deref(),
+            Some("fallback")
+        );
+        headers.clear();
+        assert!(resolve_oathkeeper_subject(&headers).is_none());
+
+        assert!(is_allowed_event_path("/api/v2/web/events/jp/1"));
+        assert!(!is_allowed_event_path("/api/v2/cloud/events/jp/1"));
+        assert_eq!(
+            extract_error_message(br#"{"error":"boom"}"#).as_deref(),
+            Some("boom")
+        );
+        assert!(extract_error_message(b"not-json").is_none());
+    }
+
+    #[tokio::test]
+    async fn websocket_session_handles_frames_and_realtime_events() {
+        let state = state();
+        let hub = state.realtime().clone();
+        let (trust, invalid) = ProxyTrust::from_config(false, &[], "X-Forwarded-For", 1.0, 1000);
+        assert!(invalid.is_empty());
+        let app = Router::new().route(
+            "/ws",
+            get(connect).with_state((state.clone(), Arc::new(trust))),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
+
+        let mut request = format!("ws://{address}/ws").into_client_request().unwrap();
+        request
+            .headers_mut()
+            .insert("x-oathkeeper-subject", "identity-1".parse().unwrap());
+        let (mut socket, _) = tokio_tungstenite::connect_async(request).await.unwrap();
+        let ready = next_json(&mut socket).await;
+        assert_eq!(ready["type"].as_str(), Some("ready"));
+
+        socket
+            .send(ClientMessage::Ping(vec![1, 2].into()))
+            .await
+            .unwrap();
+        assert!(matches!(
+            socket.next().await.unwrap().unwrap(),
+            ClientMessage::Pong(_)
+        ));
+
+        socket
+            .send(ClientMessage::Text(
+                r#"{"id":"sub","type":"subscribe","server":"jp","eventId":99}"#.into(),
+            ))
+            .await
+            .unwrap();
+        let mut saw_subscribed = false;
+        let mut saw_online = false;
+        for _ in 0..2 {
+            let message = next_json(&mut socket).await;
+            saw_subscribed |=
+                message["id"].as_str() == Some("sub") && message["ok"].as_bool() == Some(true);
+            saw_online |= message["type"].as_str() == Some("online");
+        }
+        assert!(saw_subscribed && saw_online);
+
+        hub.notify_update(RealtimeTopic::new(SekaiServerRegion::Jp, 99), 1234);
+        let updated = next_json(&mut socket).await;
+        assert_eq!(updated["type"].as_str(), Some("updated"));
+        assert_eq!(updated["timestamp"].as_i64(), Some(1234));
+
+        socket
+            .send(ClientMessage::Binary(vec![0xff].into()))
+            .await
+            .unwrap();
+        assert_eq!(next_json(&mut socket).await["status"].as_i64(), Some(400));
+        socket
+            .send(ClientMessage::Binary(
+                br#"{"id":"binary","type":"ping"}"#.to_vec().into(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(next_json(&mut socket).await["id"].as_str(), Some("binary"));
+        socket
+            .send(ClientMessage::Pong(Vec::new().into()))
+            .await
+            .unwrap();
+
+        socket
+            .send(ClientMessage::Text(
+                r#"{"id":"unsub","type":"unsubscribe","server":"jp","eventId":99}"#.into(),
+            ))
+            .await
+            .unwrap();
+        let unsubscribed = next_json(&mut socket).await;
+        assert_eq!(unsubscribed["id"].as_str(), Some("unsub"));
+        socket.close(None).await.unwrap();
+
+        let ticket = state.ws_tickets().issue("ticket-owner".into()).await;
+        let url = format!("ws://{address}/ws?ticket={}", ticket.ticket);
+        let (mut ticket_socket, _) = tokio_tungstenite::connect_async(url).await.unwrap();
+        assert_eq!(
+            next_json(&mut ticket_socket).await["subject"].as_str(),
+            Some("ticket-owner")
+        );
+        ticket_socket.close(None).await.unwrap();
+
+        assert_eq!(
+            hub.topic_online(&RealtimeTopic::new(SekaiServerRegion::Jp, 99))
+                .await,
+            0
+        );
+        server.abort();
+    }
+}

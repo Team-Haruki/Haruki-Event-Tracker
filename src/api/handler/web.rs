@@ -792,8 +792,279 @@ fn not_found_if_empty(items: &[RecordedRankData]) -> Result<(), ApiError> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+    use crate::api::limiter::ApiQueryLimiter;
+    use crate::api::realtime::RealtimeHub;
+    use crate::api::ws_ticket::WsTicketStore;
+    use crate::config::ApiQueryConfig;
+    use crate::db::query::web::tests::{
+        seed_normal_event_with_history, seed_world_bloom_event_with_history, sqlite_engine,
+    };
+    use crate::db::schema::create_event_tables;
+    use crate::privacy::UidAnonymizer;
+    use axum::extract::{Path, Query, State};
+    use axum::response::IntoResponse;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    pub(crate) const NORMAL_EVENT: i64 = 821;
+    pub(crate) const WORLD_BLOOM_EVENT: i64 = 822;
+
+    pub(crate) async fn test_state(anonymization: bool) -> AppState {
+        let engine = sqlite_engine().await;
+        create_event_tables(&engine, SekaiServerRegion::Jp, NORMAL_EVENT, false)
+            .await
+            .unwrap();
+        seed_normal_event_with_history(&engine, NORMAL_EVENT).await;
+        create_event_tables(&engine, SekaiServerRegion::Jp, WORLD_BLOOM_EVENT, true)
+            .await
+            .unwrap();
+        seed_world_bloom_event_with_history(&engine, WORLD_BLOOM_EVENT).await;
+        AppState::new(
+            HashMap::from([(SekaiServerRegion::Jp, Arc::new(engine))]),
+            None,
+            ApiQueryLimiter::new(ApiQueryConfig::default(), [SekaiServerRegion::Jp]),
+            if anonymization {
+                UidAnonymizer::enabled("test-salt")
+            } else {
+                UidAnonymizer::disabled()
+            },
+            None,
+            RealtimeHub::new(),
+            WsTicketStore::default(),
+        )
+    }
+
+    fn ranking_query() -> RankingSearchQuery {
+        RankingSearchQuery {
+            rank_min: Some(1),
+            rank_max: Some(3),
+            score_min: None,
+            score_max: None,
+            start_time: None,
+            end_time: None,
+            before: None,
+            after: None,
+            timestamp: Some(1_710_000_060),
+            cursor: None,
+            limit: Some(2),
+        }
+    }
+
+    #[tokio::test]
+    async fn public_web_handlers_query_rankings_traces_and_users() {
+        let state = test_state(true).await;
+        let normal_user_id =
+            state
+                .anonymizer()
+                .public_user_id(SekaiServerRegion::Jp, NORMAL_EVENT, "100");
+        let world_user_id =
+            state
+                .anonymizer()
+                .public_user_id(SekaiServerRegion::Jp, WORLD_BLOOM_EVENT, "100");
+        let page = rankings(
+            State(state.clone()),
+            Path(("jp".into(), NORMAL_EVENT)),
+            Query(ranking_query()),
+        )
+        .await
+        .unwrap();
+        assert!(!page.0.is_empty());
+
+        let world_page = world_bloom_rankings(
+            State(state.clone()),
+            Path(("jp".into(), WORLD_BLOOM_EVENT, 17)),
+            Query(ranking_query()),
+        )
+        .await
+        .unwrap();
+        assert!(!world_page.0.is_empty());
+
+        let trace_query = UserTraceQuery {
+            start_time: Some(1_710_000_000),
+            end_time: Some(1_710_000_060),
+            cursor: None,
+            limit: Some(10),
+        };
+        let trace = user_trace(
+            State(state.clone()),
+            Path(("jp".into(), NORMAL_EVENT, normal_user_id)),
+            Query(trace_query),
+        )
+        .await
+        .unwrap();
+        assert!(!trace.0.is_empty());
+
+        let world_trace = world_bloom_user_trace(
+            State(state.clone()),
+            Path(("jp".into(), WORLD_BLOOM_EVENT, 17, world_user_id)),
+            Query(UserTraceQuery {
+                start_time: None,
+                end_time: None,
+                cursor: None,
+                limit: Some(10),
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(!world_trace.0.is_empty());
+
+        let users = users(
+            State(state),
+            Path(("jp".into(), NORMAL_EVENT)),
+            Query(UserSearchQuery {
+                unique_id: None,
+                name: Some("Alpha".into()),
+                profile_word: Some("hello".into()),
+                card_id: Some(1404),
+                card_level: Some(60),
+                card_master_rank: Some(5),
+                card_special_training_status: Some("done".into()),
+                card_default_image: Some("original".into()),
+                cheerful_team_id: None,
+                cursor: None,
+                limit: Some(10),
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(!users.0.is_empty());
+    }
+
+    #[test]
+    fn public_web_overview_handlers_cover_normal_and_world_bloom() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(async {
+                        let state = test_state(true).await;
+                        let normal = overview(
+                            State(state.clone()),
+                            Path(("jp".into(), NORMAL_EVENT)),
+                            Query(OverviewQuery {
+                                interval: Some(60),
+                                at: Some(1_710_000_060),
+                            }),
+                            HeaderMap::new(),
+                        )
+                        .await
+                        .unwrap();
+                        assert!(normal.into_response().status().is_success());
+
+                        let world = world_bloom_overview(
+                            State(state),
+                            Path(("jp".into(), WORLD_BLOOM_EVENT, 17)),
+                            Query(OverviewQuery {
+                                interval: Some(60),
+                                at: Some(1_710_000_060),
+                            }),
+                            HeaderMap::new(),
+                        )
+                        .await
+                        .unwrap();
+                        assert!(world.into_response().status().is_success());
+                    });
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn public_web_handlers_reject_invalid_filters_and_privacy_configuration() {
+        assert!(matches!(
+            ranking_query_with_bounds(Some(3), Some(1), None, None, None, None).into_filter(),
+            Err(ApiError::BadRequest(_))
+        ));
+        assert!(matches!(
+            ranking_query_with_bounds(None, None, Some(2), Some(1), None, None).into_filter(),
+            Err(ApiError::BadRequest(_))
+        ));
+        assert!(matches!(
+            ranking_query_with_bounds(None, None, None, None, Some(2), Some(1)).into_filter(),
+            Err(ApiError::BadRequest(_))
+        ));
+        let mut bad_cursor = ranking_query();
+        bad_cursor.cursor = Some("bad".into());
+        assert!(bad_cursor.into_filter().is_err());
+        assert!(parse_ranking_cursor(Some("1:2")).is_err());
+        assert!(not_found_if_empty(&[]).is_err());
+        assert!(
+            not_found_if_empty(&[RecordedRankData::Normal(
+                crate::model::api::RecordedRankingSchema {
+                    user_id: String::new(),
+                    score: 0,
+                    rank: 1,
+                    timestamp: 0,
+                },
+            )])
+            .is_ok()
+        );
+
+        let no_filters = UserSearchQuery {
+            unique_id: None,
+            name: None,
+            profile_word: None,
+            card_id: None,
+            card_level: None,
+            card_master_rank: None,
+            card_special_training_status: None,
+            card_default_image: None,
+            cheerful_team_id: None,
+            cursor: None,
+            limit: None,
+        };
+        assert!(no_filters.into_filter().is_err());
+        assert!(
+            UserTraceQuery {
+                start_time: Some(2),
+                end_time: Some(1),
+                cursor: None,
+                limit: None,
+            }
+            .into_filter()
+            .is_err()
+        );
+
+        let state = test_state(false).await;
+        let error = rankings(
+            State(state),
+            Path(("jp".into(), NORMAL_EVENT)),
+            Query(ranking_query()),
+        )
+        .await
+        .err()
+        .expect("privacy-disabled web API must fail");
+        assert!(matches!(error, ApiError::BadRequest(_)));
+    }
+
+    fn ranking_query_with_bounds(
+        rank_min: Option<i64>,
+        rank_max: Option<i64>,
+        score_min: Option<i64>,
+        score_max: Option<i64>,
+        start_time: Option<i64>,
+        end_time: Option<i64>,
+    ) -> RankingSearchQuery {
+        RankingSearchQuery {
+            rank_min,
+            rank_max,
+            score_min,
+            score_max,
+            start_time,
+            end_time,
+            before: None,
+            after: None,
+            timestamp: None,
+            cursor: None,
+            limit: None,
+        }
+    }
 
     #[test]
     fn ranking_cursor_round_trips() {

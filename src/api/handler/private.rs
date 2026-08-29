@@ -401,3 +401,218 @@ fn rank_of_rank_data(rank_data: &RecordedRankData) -> i64 {
         RecordedRankData::WorldBloom(data) => data.rank,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::api::limiter::ApiQueryLimiter;
+    use crate::api::private_lookup::PrivateLookupVerifier;
+    use crate::api::private_lookup::tests::spawn_toolbox;
+    use crate::api::realtime::RealtimeHub;
+    use crate::api::ws_ticket::WsTicketStore;
+    use crate::config::{ApiQueryConfig, ToolboxConfig};
+    use crate::db::query::web::tests::{
+        seed_normal_event_with_history, seed_world_bloom_event_with_history, sqlite_engine,
+    };
+    use crate::db::schema::create_event_tables;
+    use crate::privacy::UidAnonymizer;
+    use axum::Router;
+    use axum::body::Body;
+    use axum::http::Request;
+    use axum::middleware;
+    use axum::routing::get;
+    use std::collections::HashMap;
+    use tokio::sync::Mutex;
+    use tower::ServiceExt;
+
+    const NORMAL_EVENT: i64 = 831;
+    const WORLD_BLOOM_EVENT: i64 = 832;
+
+    async fn test_state(with_verifier: bool) -> AppState {
+        let engine = sqlite_engine().await;
+        create_event_tables(&engine, SekaiServerRegion::Jp, NORMAL_EVENT, false)
+            .await
+            .unwrap();
+        seed_normal_event_with_history(&engine, NORMAL_EVENT).await;
+        create_event_tables(&engine, SekaiServerRegion::Jp, WORLD_BLOOM_EVENT, true)
+            .await
+            .unwrap();
+        seed_world_bloom_event_with_history(&engine, WORLD_BLOOM_EVENT).await;
+        let verifier = if with_verifier {
+            let base_url = spawn_toolbox(
+                r#"{"updatedData":{"kratosIdentityId":"identity-1","gameAccountBindings":[{"server":"jp","userId":100}]}}"#,
+                Arc::new(Mutex::new(Vec::new())),
+            )
+            .await;
+            PrivateLookupVerifier::from_config(&ToolboxConfig {
+                base_url,
+                ..ToolboxConfig::default()
+            })
+        } else {
+            None
+        };
+        AppState::new(
+            HashMap::from([(SekaiServerRegion::Jp, Arc::new(engine))]),
+            None,
+            ApiQueryLimiter::new(ApiQueryConfig::default(), [SekaiServerRegion::Jp]),
+            UidAnonymizer::enabled("test-salt"),
+            verifier,
+            RealtimeHub::new(),
+            WsTicketStore::default(),
+        )
+    }
+
+    fn lookup_query() -> PrivateLookupQuery {
+        PrivateLookupQuery {
+            owner: Some("identity-1".into()),
+            owner_id: None,
+        }
+    }
+
+    fn detail_query() -> PrivateWebDetailQuery {
+        PrivateWebDetailQuery {
+            owner: None,
+            owner_id: Some("identity-1".into()),
+            include_trace: Some(true),
+            include_profile: Some(true),
+        }
+    }
+
+    fn subject() -> axum::Extension<PrivateSubject> {
+        axum::Extension(PrivateSubject("identity-1".into()))
+    }
+
+    #[tokio::test]
+    async fn private_lookup_handlers_return_raw_user_data() {
+        let state = test_state(true).await;
+        let latest = latest_by_user(
+            State(state.clone()),
+            Path(("jp".into(), NORMAL_EVENT, "100".into())),
+            Query(lookup_query()),
+            subject(),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert!(latest.rank_data.is_some());
+        assert_eq!(latest.user_data.unwrap().user_id, "100");
+
+        let world = latest_world_bloom_by_user(
+            State(state.clone()),
+            Path(("jp".into(), WORLD_BLOOM_EVENT, 17, "100".into())),
+            Query(lookup_query()),
+            subject(),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert!(matches!(
+            world.rank_data,
+            Some(RecordedRankData::WorldBloom(_))
+        ));
+
+        let trace = trace_by_user(
+            State(state.clone()),
+            Path(("jp".into(), NORMAL_EVENT, "100".into())),
+            Query(lookup_query()),
+            subject(),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(trace.rank_data.len(), 2);
+
+        let world_trace = trace_world_bloom_by_user(
+            State(state),
+            Path(("jp".into(), WORLD_BLOOM_EVENT, 17, "100".into())),
+            Query(lookup_query()),
+            subject(),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(world_trace.rank_data.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn private_web_details_cover_total_and_world_bloom() {
+        let state = test_state(true).await;
+        let total = web_total_user_detail(
+            State(state.clone()),
+            Path(("jp".into(), NORMAL_EVENT, "100".into())),
+            Query(detail_query()),
+            subject(),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert!(total.current.is_some());
+        assert!(total.next.is_some());
+        assert_eq!(total.player_trace.len(), 2);
+        assert_eq!(total.profile.unwrap().user_id, "100");
+
+        let world = web_world_bloom_user_detail(
+            State(state),
+            Path(("jp".into(), WORLD_BLOOM_EVENT, 17, "100".into())),
+            Query(detail_query()),
+            subject(),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert!(world.current.is_some());
+        assert!(world.next.is_some());
+        assert_eq!(world.meta.character_id, Some(17));
+    }
+
+    #[tokio::test]
+    async fn private_auth_and_error_mapping_cover_failure_paths() {
+        let (trust, invalid) = ProxyTrust::from_config(false, &[], "X-Forwarded-For", 1.0, 1000);
+        assert!(invalid.is_empty());
+        let trust = Arc::new(trust);
+        let app = Router::new()
+            .route("/", get(|| async { "ok" }))
+            .route_layer(middleware::from_fn_with_state(trust, require_subject));
+        let unauthorized = app
+            .clone()
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(unauthorized.status(), axum::http::StatusCode::UNAUTHORIZED);
+
+        let mut request = Request::builder().uri("/").body(Body::empty()).unwrap();
+        request
+            .extensions_mut()
+            .insert(PrivateSubject("identity-1".into()));
+        assert!(app.oneshot(request).await.unwrap().status().is_success());
+
+        assert!(matches!(
+            map_private_lookup_error(PrivateLookupError::NotConfigured),
+            ApiError::ServiceUnavailable(_)
+        ));
+        assert!(matches!(
+            map_private_lookup_error(PrivateLookupError::Unauthorized),
+            ApiError::Unauthorized
+        ));
+        assert!(matches!(
+            map_private_lookup_error(PrivateLookupError::Forbidden),
+            ApiError::Forbidden
+        ));
+        assert!(matches!(
+            map_private_lookup_error(PrivateLookupError::Upstream),
+            ApiError::ServiceUnavailable(_)
+        ));
+
+        let state = test_state(false).await;
+        let error = require_bound_user(
+            &state,
+            &PrivateSubject("identity-1".into()),
+            None,
+            SekaiServerRegion::Jp,
+            "100",
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, ApiError::ServiceUnavailable(_)));
+    }
+}

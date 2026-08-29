@@ -107,6 +107,12 @@ pub async fn set_event_ended_flag(
 mod tests {
     use super::*;
 
+    async fn connection() -> Option<ConnectionManager> {
+        let url = std::env::var("HARUKI_COVERAGE_REDIS_URL").ok()?;
+        let client = redis::Client::open(url).ok()?;
+        ConnectionManager::new(client).await.ok()
+    }
+
     #[test]
     fn key_format_matches_go() {
         assert_eq!(
@@ -116,6 +122,64 @@ mod tests {
         assert_eq!(
             redis_key(SekaiServerRegion::En, 200, "ended"),
             "haruki:tracker:en:200:ended"
+        );
+    }
+
+    #[tokio::test]
+    async fn persists_filters_and_restores_tracker_state() {
+        let Some(mut conn) = connection().await else {
+            return;
+        };
+        let event_id = chrono::Utc::now().timestamp_millis();
+        save_rank_state(&mut conn, SekaiServerRegion::Jp, event_id, &HashMap::new())
+            .await
+            .unwrap();
+        let key = redis_key(SekaiServerRegion::Jp, event_id, "rank_state");
+        let _: () = redis::cmd("HSET")
+            .arg(&key)
+            .arg("bad-rank")
+            .arg(r#"{"u":1,"s":2}"#)
+            .arg("3")
+            .arg("not-json")
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+        let changed = HashMap::from([
+            (
+                1,
+                RankState {
+                    user_id: "100".into(),
+                    score: 200,
+                },
+            ),
+            (
+                2,
+                RankState {
+                    user_id: "101".into(),
+                    score: 201,
+                },
+            ),
+        ]);
+        save_rank_state(&mut conn, SekaiServerRegion::Jp, event_id, &changed)
+            .await
+            .unwrap();
+        let loaded = load_rank_state(&mut conn, SekaiServerRegion::Jp, event_id)
+            .await
+            .unwrap();
+        assert_eq!(loaded, changed);
+
+        assert!(
+            !check_event_ended_flag(&mut conn, SekaiServerRegion::Jp, event_id)
+                .await
+                .unwrap()
+        );
+        set_event_ended_flag(&mut conn, SekaiServerRegion::Jp, event_id)
+            .await
+            .unwrap();
+        assert!(
+            check_event_ended_flag(&mut conn, SekaiServerRegion::Jp, event_id)
+                .await
+                .unwrap()
         );
     }
 }

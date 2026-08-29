@@ -55,3 +55,34 @@ impl IntoResponse for ApiError {
         (status, body).into_response()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn maps_every_error_variant_to_its_http_status() {
+        let cases = [
+            (
+                ApiError::InvalidServer("xx".into()),
+                StatusCode::BAD_REQUEST,
+            ),
+            (ApiError::BadRequest("bad".into()), StatusCode::BAD_REQUEST),
+            (ApiError::Unauthorized, StatusCode::UNAUTHORIZED),
+            (ApiError::Forbidden, StatusCode::FORBIDDEN),
+            (ApiError::NotFound, StatusCode::NOT_FOUND),
+            (
+                ApiError::ServiceUnavailable("busy".into()),
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (
+                ApiError::Db(DbErr::Custom("broken".into())),
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ),
+        ];
+
+        for (error, expected) in cases {
+            assert_eq!(error.into_response().status(), expected);
+        }
+    }
+}

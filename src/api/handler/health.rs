@@ -71,3 +71,65 @@ pub async fn readyz(State(state): State<AppState>) -> Response {
     });
     (status, body).into_response()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::api::limiter::ApiQueryLimiter;
+    use crate::api::private_lookup::PrivateLookupVerifier;
+    use crate::api::realtime::RealtimeHub;
+    use crate::api::ws_ticket::WsTicketStore;
+    use crate::config::ApiQueryConfig;
+    use crate::db::engine::DatabaseEngine;
+    use crate::model::enums::SekaiServerRegion;
+    use crate::privacy::UidAnonymizer;
+    use sea_orm::{Database, DatabaseBackend};
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    fn state_with_dbs(dbs: HashMap<SekaiServerRegion, Arc<DatabaseEngine>>) -> AppState {
+        AppState::new(
+            dbs,
+            None,
+            ApiQueryLimiter::new(ApiQueryConfig::default(), [SekaiServerRegion::Jp]),
+            UidAnonymizer::disabled(),
+            Option::<PrivateLookupVerifier>::None,
+            RealtimeHub::new(),
+            WsTicketStore::default(),
+        )
+    }
+
+    #[tokio::test]
+    async fn liveness_and_empty_readiness_are_ok() {
+        assert_eq!(livez().await.0.status, "ok");
+        let response = readyz(State(state_with_dbs(HashMap::new()))).await;
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn readiness_reports_healthy_and_failed_databases() {
+        let healthy = Arc::new(DatabaseEngine::from_connection(
+            Database::connect("sqlite::memory:").await.unwrap(),
+            DatabaseBackend::Sqlite,
+        ));
+        let response = readyz(State(state_with_dbs(HashMap::from([(
+            SekaiServerRegion::Jp,
+            healthy,
+        )]))))
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let failed_conn = Database::connect("sqlite::memory:").await.unwrap();
+        failed_conn.clone().close().await.unwrap();
+        let failed = Arc::new(DatabaseEngine::from_connection(
+            failed_conn,
+            DatabaseBackend::Sqlite,
+        ));
+        let response = readyz(State(state_with_dbs(HashMap::from([(
+            SekaiServerRegion::Jp,
+            failed,
+        )]))))
+        .await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+}

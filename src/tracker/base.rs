@@ -562,7 +562,7 @@ fn should_refresh_after_end(last: Option<i64>, now: i64, interval_secs: u64) -> 
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use sea_orm::{Database, DatabaseBackend};
     use std::sync::atomic::{AtomicI64, Ordering};
@@ -585,7 +585,7 @@ mod tests {
         }
     }
 
-    async fn tracker_fixture(event_type: SekaiEventType) -> Option<EventTrackerBase> {
+    pub(crate) async fn tracker_fixture(event_type: SekaiEventType) -> Option<EventTrackerBase> {
         let Ok(redis_url) = std::env::var("HARUKI_COVERAGE_REDIS_URL") else {
             return None;
         };

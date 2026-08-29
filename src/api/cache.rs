@@ -2067,6 +2067,206 @@ mod tests {
         ApiCache::new(vec![conn.clone()], cfg.clone())
     }
 
+    #[tokio::test]
+    async fn ttl_selection_and_zero_ttl_bypass_cover_public_entrypoints() {
+        let Some(conn) = coverage_redis().await else {
+            return;
+        };
+        let mut cfg = test_config();
+        cfg.default_ttl_secs = 9;
+        cfg.latest_rank_ttl_secs = 0;
+        cfg.trace_rank_ttl_secs = 2;
+        cfg.batch_trace_rank_ttl_secs = 3;
+        cfg.user_data_ttl_secs = 4;
+        cfg.replay_overview_ttl_secs = 5;
+        let cache = test_cache(&conn, &cfg);
+        assert_eq!(cache.ttl(CacheTtl::LatestRank), 9);
+        assert_eq!(cache.ttl(CacheTtl::TraceRank), 2);
+        assert_eq!(cache.ttl(CacheTtl::BatchTraceRank), 3);
+        assert_eq!(cache.ttl(CacheTtl::UserData), 4);
+        assert_eq!(cache.ttl(CacheTtl::ReplayOverview), 5);
+
+        assert_eq!(
+            cache
+                .get_or_fetch("jp", 1, "typed".into(), 0, async { Ok(7_i64) })
+                .await
+                .unwrap(),
+            7
+        );
+        assert_eq!(
+            cache
+                .get_or_fetch_static("jp", 1, "static".into(), 0, async { Ok(8_i64) })
+                .await
+                .unwrap(),
+            8
+        );
+        assert_eq!(
+            cache
+                .get_or_fetch_json_bytes("jp", 1, "json".into(), 0, async { Ok(9_i64) })
+                .await
+                .unwrap(),
+            Bytes::from_static(b"9")
+        );
+        assert_eq!(
+            cache
+                .get_or_fetch_static_json_bytes("jp", 1, "static-json".into(), 0, async {
+                    Ok(10_i64)
+                })
+                .await
+                .unwrap(),
+            Bytes::from_static(b"10")
+        );
+        let encoded = cache
+            .get_or_fetch_encoded_json("jp", 1, "encoded".into(), 0, false, async { Ok(11_i64) })
+            .await
+            .unwrap();
+        assert_eq!(encoded.encoding, CachedJsonEncoding::Identity);
+        let batch = cache
+            .get_or_fetch_batch_encoded_json("jp", 1, "batch".into(), 0, false, async {
+                Ok(Bytes::from_static(b"batch"))
+            })
+            .await
+            .unwrap();
+        assert_eq!(batch.bytes, Bytes::from_static(b"batch"));
+    }
+
+    #[tokio::test]
+    async fn l2_resolvers_cover_hit_miss_negative_invalid_and_error_paths() {
+        let Some(conn) = coverage_redis().await else {
+            return;
+        };
+        let cache = test_cache(&conn, &test_config());
+        let event_id = next_event_id();
+        let options = CacheOptions {
+            max_value_bytes: 1024,
+            is_batch: false,
+            validate_cached_bytes: None,
+        };
+        let request = CacheRequest {
+            server: "jp",
+            event_id,
+            suffix: "resolver",
+            ttl_secs: 60,
+            options,
+        };
+        let key = request.value_key(0);
+        let bytes = cache
+            .resolve_l2_value(
+                request,
+                0,
+                key.clone(),
+                Ok(L2ValueRead::Hit(Bytes::from_static(b"hit"))),
+                async { Ok(Bytes::from_static(b"unused")) },
+            )
+            .await
+            .unwrap();
+        assert_eq!(bytes, Bytes::from_static(b"hit"));
+
+        let invalid_request = CacheRequest {
+            options: CacheOptions {
+                validate_cached_bytes: Some(|_| false),
+                ..options
+            },
+            ..request
+        };
+        let bytes = cache
+            .resolve_l2_value(
+                invalid_request,
+                0,
+                key.clone(),
+                Ok(L2ValueRead::Hit(Bytes::from_static(b"invalid"))),
+                async { Ok(Bytes::from_static(b"refetched")) },
+            )
+            .await
+            .unwrap();
+        assert_eq!(bytes, Bytes::from_static(b"refetched"));
+        assert!(matches!(
+            cache
+                .resolve_l2_value(request, 0, key.clone(), Ok(L2ValueRead::NotFound), async {
+                    Ok(Bytes::new())
+                },)
+                .await,
+            Err(ApiError::NotFound)
+        ));
+        assert_eq!(
+            cache
+                .resolve_l2_value(request, 0, key.clone(), Ok(L2ValueRead::Miss), async {
+                    Ok(Bytes::from_static(b"miss"))
+                },)
+                .await
+                .unwrap(),
+            Bytes::from_static(b"miss")
+        );
+        let redis_error = || redis::RedisError::from((redis::ErrorKind::Io, "test error"));
+        assert_eq!(
+            cache
+                .resolve_l2_value(request, 0, key.clone(), Err(redis_error()), async {
+                    Ok(Bytes::from_static(b"fallback"))
+                },)
+                .await
+                .unwrap(),
+            Bytes::from_static(b"fallback")
+        );
+
+        let gzip = gzip_key(&key);
+        let encoded = cache
+            .resolve_l2_encoded(
+                request,
+                0,
+                key.clone(),
+                gzip.clone(),
+                Ok(L2EncodedRead::Gzip(Bytes::from_static(b"gzip"))),
+                async { Ok(Bytes::new()) },
+            )
+            .await
+            .unwrap();
+        assert_eq!(encoded.encoding, CachedJsonEncoding::Gzip);
+        let encoded = cache
+            .resolve_l2_encoded(
+                request,
+                0,
+                key.clone(),
+                gzip.clone(),
+                Ok(L2EncodedRead::Identity(Bytes::from_static(b"identity"))),
+                async { Ok(Bytes::new()) },
+            )
+            .await
+            .unwrap();
+        assert_eq!(encoded.encoding, CachedJsonEncoding::Gzip);
+        assert!(matches!(
+            cache
+                .resolve_l2_encoded(
+                    request,
+                    0,
+                    key.clone(),
+                    gzip.clone(),
+                    Ok(L2EncodedRead::NotFound),
+                    async { Ok(Bytes::new()) },
+                )
+                .await,
+            Err(ApiError::NotFound)
+        ));
+        let encoded = cache
+            .resolve_l2_encoded(
+                request,
+                0,
+                key.clone(),
+                gzip.clone(),
+                Ok(L2EncodedRead::Miss),
+                async { Ok(Bytes::from_static(b"miss")) },
+            )
+            .await
+            .unwrap();
+        assert_eq!(encoded.encoding, CachedJsonEncoding::Gzip);
+        let encoded = cache
+            .resolve_l2_encoded(request, 0, key, gzip, Err(redis_error()), async {
+                Ok(Bytes::from_static(b"fallback"))
+            })
+            .await
+            .unwrap();
+        assert_eq!(encoded.encoding, CachedJsonEncoding::Gzip);
+    }
+
     async fn redis_set(conn: &mut ConnectionManager, key: &str, value: &[u8]) {
         redis::cmd("SET")
             .arg(key)

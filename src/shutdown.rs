@@ -57,3 +57,27 @@ pub async fn signal() {
         tracing::info!("Ctrl+C received");
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::api::limiter::ApiQueryLimiter;
+    use crate::api::realtime::RealtimeHub;
+    use crate::api::ws_ticket::WsTicketStore;
+    use crate::config::ApiQueryConfig;
+    use crate::privacy::UidAnonymizer;
+
+    #[tokio::test]
+    async fn shuts_down_without_scheduler_or_trackers() {
+        let state = AppState::new(
+            HashMap::new(),
+            None,
+            ApiQueryLimiter::new(ApiQueryConfig::default(), []),
+            UidAnonymizer::disabled(),
+            None,
+            RealtimeHub::new(),
+            WsTicketStore::default(),
+        );
+        run(None, HashMap::new(), HashMap::new(), state).await;
+    }
+}

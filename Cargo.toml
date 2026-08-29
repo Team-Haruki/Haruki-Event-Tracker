@@ -102,6 +102,7 @@ opendal = { version = "0.57", default-features = false, features = ["services-fs
 
 [dev-dependencies]
 tokio = { version = "1.52", features = ["full", "test-util", "macros"] }
+tokio-tungstenite = "0.29"
 
 [profile.release]
 lto = "thin"

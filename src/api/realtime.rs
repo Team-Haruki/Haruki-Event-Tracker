@@ -133,3 +133,60 @@ impl RealtimeHub {
         });
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn tracks_connections_topics_and_broadcasts_updates() {
+        let hub = RealtimeHub::new();
+        let topic = RealtimeTopic::new(SekaiServerRegion::En, 42);
+        let mut receiver = hub.subscribe();
+
+        assert_eq!(hub.connection_opened(), 1);
+        assert_eq!(hub.total_online(), 1);
+        assert_eq!(hub.add_topic_subscription(topic.clone()).await, 1);
+        assert_eq!(hub.topic_online(&topic).await, 1);
+        match receiver.recv().await.unwrap() {
+            RealtimeMessage::Online {
+                topic: received,
+                total,
+                topic_online,
+            } => {
+                assert_eq!(received, topic);
+                assert_eq!(total, 1);
+                assert_eq!(topic_online, 1);
+            }
+            RealtimeMessage::Updated { .. } => panic!("expected online message"),
+        }
+
+        hub.notify_update(topic.clone(), 1234);
+        match receiver.recv().await.unwrap() {
+            RealtimeMessage::Updated {
+                topic: received,
+                timestamp,
+            } => {
+                assert_eq!(received, topic);
+                assert_eq!(timestamp, 1234);
+            }
+            RealtimeMessage::Online { .. } => panic!("expected update message"),
+        }
+
+        hub.remove_topic_subscription(&topic).await;
+        assert_eq!(hub.topic_online(&topic).await, 0);
+        assert!(matches!(
+            receiver.recv().await.unwrap(),
+            RealtimeMessage::Online {
+                topic_online: 0,
+                ..
+            }
+        ));
+        hub.remove_topic_subscription(&topic).await;
+
+        assert_eq!(hub.add_topic_subscription(topic.clone()).await, 1);
+        hub.connection_closed(std::slice::from_ref(&topic)).await;
+        assert_eq!(hub.total_online(), 0);
+        assert_eq!(hub.topic_online(&topic).await, 0);
+    }
+}

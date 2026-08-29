@@ -1327,7 +1327,7 @@ where
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use sea_orm::{ConnectionTrait, Database, DatabaseBackend, Statement};
 
@@ -1877,12 +1877,12 @@ mod tests {
         assert_eq!(items[0].profile_honors[0].honor_id, Some(95));
     }
 
-    async fn sqlite_engine() -> DatabaseEngine {
+    pub(crate) async fn sqlite_engine() -> DatabaseEngine {
         let conn = Database::connect("sqlite::memory:").await.unwrap();
         DatabaseEngine::from_connection(conn, DatabaseBackend::Sqlite)
     }
 
-    async fn seed_normal_event(engine: &DatabaseEngine, event_id: i64) {
+    pub(crate) async fn seed_normal_event(engine: &DatabaseEngine, event_id: i64) {
         let users_tbl = intern(TableKind::EventUsers, event_id);
         let time_tbl = intern(TableKind::TimeId, event_id);
         let event_tbl = intern(TableKind::Event, event_id);
@@ -1912,7 +1912,7 @@ mod tests {
         }
     }
 
-    async fn seed_normal_event_with_history(engine: &DatabaseEngine, event_id: i64) {
+    pub(crate) async fn seed_normal_event_with_history(engine: &DatabaseEngine, event_id: i64) {
         let users_tbl = intern(TableKind::EventUsers, event_id);
         let time_tbl = intern(TableKind::TimeId, event_id);
         let event_tbl = intern(TableKind::Event, event_id);
@@ -1947,7 +1947,10 @@ mod tests {
         }
     }
 
-    async fn seed_normal_event_with_rank_changes(engine: &DatabaseEngine, event_id: i64) {
+    pub(crate) async fn seed_normal_event_with_rank_changes(
+        engine: &DatabaseEngine,
+        event_id: i64,
+    ) {
         let users_tbl = intern(TableKind::EventUsers, event_id);
         let time_tbl = intern(TableKind::TimeId, event_id);
         let event_tbl = intern(TableKind::Event, event_id);
@@ -1980,7 +1983,10 @@ mod tests {
         }
     }
 
-    async fn seed_world_bloom_event_with_history(engine: &DatabaseEngine, event_id: i64) {
+    pub(crate) async fn seed_world_bloom_event_with_history(
+        engine: &DatabaseEngine,
+        event_id: i64,
+    ) {
         let users_tbl = intern(TableKind::EventUsers, event_id);
         let time_tbl = intern(TableKind::TimeId, event_id);
         let wl_tbl = intern(TableKind::WorldBloom, event_id);
@@ -2016,7 +2022,10 @@ mod tests {
         }
     }
 
-    async fn seed_world_bloom_event_with_rank_changes(engine: &DatabaseEngine, event_id: i64) {
+    pub(crate) async fn seed_world_bloom_event_with_rank_changes(
+        engine: &DatabaseEngine,
+        event_id: i64,
+    ) {
         let users_tbl = intern(TableKind::EventUsers, event_id);
         let time_tbl = intern(TableKind::TimeId, event_id);
         let wl_tbl = intern(TableKind::WorldBloom, event_id);

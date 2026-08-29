@@ -301,3 +301,192 @@ fn world_bloom_statuses_equal(
         })
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::api::realtime::RealtimeMessage;
+    use crate::model::enums::SekaiUnit;
+    use crate::model::event::Event;
+    use crate::tracker::base::tests::tracker_fixture;
+    use sea_orm::{Database, DatabaseBackend};
+
+    fn event_status(
+        event_id: i64,
+        event_type: SekaiEventType,
+        event_status: SekaiEventStatus,
+        chapter_statuses: HashMap<i64, WorldBloomChapterStatus>,
+    ) -> EventStatus {
+        EventStatus {
+            server: SekaiServerRegion::Jp,
+            event_id,
+            event_type,
+            event_status,
+            remain: String::new(),
+            assetbundle_name: "event".into(),
+            chapter_statuses,
+            detail: Event {
+                id: event_id,
+                event_type,
+                name: "test".into(),
+                assetbundle_name: "event".into(),
+                bgm_assetbundle_name: String::new(),
+                event_only_component_display_start_at: 0,
+                start_at: 0,
+                aggregate_at: 0,
+                ranking_announce_at: 0,
+                distribution_start_at: 0,
+                event_only_component_display_end_at: 0,
+                closed_at: 0,
+                distribution_end_at: 0,
+                virtual_live_id: 0,
+                unit: SekaiUnit::None,
+                is_count_leader_character_play: false,
+                event_point_assetbundle_name: String::new(),
+                standby_screen_display_start_at: 0,
+            },
+        }
+    }
+
+    fn chapter(
+        event_id: i64,
+        character_id: i64,
+        status: SekaiEventStatus,
+    ) -> WorldBloomChapterStatus {
+        WorldBloomChapterStatus {
+            server: SekaiServerRegion::Jp,
+            event_id,
+            character_id,
+            chapter_status: status,
+        }
+    }
+
+    #[test]
+    fn world_bloom_status_comparison_checks_every_field() {
+        let original = HashMap::from([(10, chapter(1, 10, SekaiEventStatus::Ongoing))]);
+        assert!(world_bloom_statuses_equal(&original, &original));
+        assert!(!world_bloom_statuses_equal(&original, &HashMap::new()));
+        for changed in [
+            chapter(2, 10, SekaiEventStatus::Ongoing),
+            chapter(1, 11, SekaiEventStatus::Ongoing),
+            chapter(1, 10, SekaiEventStatus::Ended),
+            WorldBloomChapterStatus {
+                server: SekaiServerRegion::En,
+                ..chapter(1, 10, SekaiEventStatus::Ongoing)
+            },
+        ] {
+            assert!(!world_bloom_statuses_equal(
+                &original,
+                &HashMap::from([(10, changed)])
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn daemon_handles_empty_master_data_and_aggregating_events() {
+        let Ok(redis_url) = std::env::var("HARUKI_COVERAGE_REDIS_URL") else {
+            return;
+        };
+        let client = redis::Client::open(redis_url).unwrap();
+        let redis = redis::aio::ConnectionManager::new(client).await.unwrap();
+        let conn = Database::connect("sqlite::memory:").await.unwrap();
+        let db = Arc::new(DatabaseEngine::from_connection(
+            conn,
+            DatabaseBackend::Sqlite,
+        ));
+        let root = std::env::temp_dir().join(format!("haruki-daemon-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("events.json"), "[]").unwrap();
+        std::fs::write(root.join("worldBlooms.json"), "[]").unwrap();
+
+        let mut daemon = HarukiEventTracker::new(
+            SekaiServerRegion::Jp,
+            HarukiSekaiAPIClient::new("http://127.0.0.1", "").unwrap(),
+            redis,
+            None,
+            db,
+            RealtimeHub::new(),
+            UidAnonymizer::disabled(),
+            3600,
+            root.to_string_lossy(),
+        )
+        .unwrap();
+        assert_eq!(daemon.server(), SekaiServerRegion::Jp);
+        assert!(matches!(
+            daemon.init().await,
+            Err(DaemonError::NoActiveEvent(_))
+        ));
+        daemon.track_ranking_data().await;
+
+        let Some(base) = tracker_fixture(SekaiEventType::Marathon).await else {
+            return;
+        };
+        let event_id = base.event_id();
+        daemon.inner = Some(base);
+        let aggregating = event_status(
+            event_id,
+            SekaiEventType::Marathon,
+            SekaiEventStatus::Aggregating,
+            HashMap::new(),
+        );
+        assert!(daemon.handle_tracker_match(&aggregating).await);
+        let ongoing = event_status(
+            event_id,
+            SekaiEventType::Marathon,
+            SekaiEventStatus::Ongoing,
+            HashMap::new(),
+        );
+        assert!(!daemon.handle_tracker_match(&ongoing).await);
+        daemon.inner = None;
+        assert!(!daemon.handle_tracker_match(&ongoing).await);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn world_bloom_helpers_skip_inactive_chapters_and_notify() {
+        let Some(mut base) = tracker_fixture(SekaiEventType::WorldBloom).await else {
+            return;
+        };
+        let event_id = base.event_id();
+        let realtime = RealtimeHub::new();
+        let mut receiver = realtime.subscribe();
+        notify_realtime_update(&realtime, SekaiServerRegion::Jp, event_id);
+        let RealtimeMessage::Updated { topic, .. } = receiver.recv().await.unwrap() else {
+            panic!("expected update");
+        };
+        assert_eq!(topic, RealtimeTopic::new(SekaiServerRegion::Jp, event_id));
+
+        let statuses = HashMap::from([
+            (10, chapter(event_id, 10, SekaiEventStatus::NotStarted)),
+            (11, chapter(event_id, 11, SekaiEventStatus::Aggregating)),
+        ]);
+        let event = event_status(
+            event_id,
+            SekaiEventType::WorldBloom,
+            SekaiEventStatus::Ongoing,
+            statuses,
+        );
+        HarukiEventTracker::handle_world_bloom(&mut base, &event, &realtime, SekaiServerRegion::Jp)
+            .await;
+        assert!(
+            !HarukiEventTracker::handle_event_ended(
+                &mut base,
+                &event,
+                &realtime,
+                SekaiServerRegion::Jp,
+            )
+            .await
+        );
+        assert!(
+            !HarukiEventTracker::handle_world_bloom_chapter(
+                &mut base,
+                &event,
+                10,
+                &chapter(event_id, 10, SekaiEventStatus::NotStarted),
+                &realtime,
+                SekaiServerRegion::Jp,
+            )
+            .await
+        );
+    }
+}

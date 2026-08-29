@@ -92,3 +92,24 @@ pub const SEKAI_EVENT_RANKING_LINES_WORLD_BLOOM: &[i64] = &[
     10, 20, 30, 40, 50, 100, 200, 300, 400, 500, 1000, 2000, 3000, 4000, 5000, 7000, 10000, 20000,
     30000, 40000, 50000, 70000, 100000,
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn server_regions_parse_and_display_all_values() {
+        for (raw, region) in [
+            ("JP", SekaiServerRegion::Jp),
+            ("en", SekaiServerRegion::En),
+            ("Tw", SekaiServerRegion::Tw),
+            ("kr", SekaiServerRegion::Kr),
+            ("cn", SekaiServerRegion::Cn),
+        ] {
+            assert_eq!(SekaiServerRegion::parse(raw), Some(region));
+            assert_eq!(region.to_string(), raw.to_ascii_lowercase());
+            assert_eq!(region.as_str(), raw.to_ascii_lowercase());
+        }
+        assert_eq!(SekaiServerRegion::parse("unknown"), None);
+    }
+}

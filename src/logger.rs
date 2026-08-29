@@ -361,3 +361,103 @@ pub fn init<P: AsRef<Path>>(
         .try_init()?;
     Ok(guards)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn maps_levels_components_and_colors() {
+        for (raw, expected) in [
+            ("trace", LevelFilter::TRACE),
+            ("DEBUG", LevelFilter::DEBUG),
+            ("info", LevelFilter::INFO),
+            ("WARN", LevelFilter::WARN),
+            ("warning", LevelFilter::WARN),
+            ("ERROR", LevelFilter::ERROR),
+            ("critical", LevelFilter::ERROR),
+            ("unknown", LevelFilter::INFO),
+        ] {
+            assert_eq!(parse_level(raw), expected);
+        }
+        for (level, name, color) in [
+            (Level::TRACE, "TRACE", COLOR_MAGENTA),
+            (Level::DEBUG, "DEBUG", COLOR_BLUE),
+            (Level::INFO, "INFO", COLOR_GREEN),
+            (Level::WARN, "WARNING", COLOR_DARK_ORANGE),
+            (Level::ERROR, "ERROR", COLOR_RED),
+        ] {
+            assert_eq!(level_name(&level), name);
+            assert_eq!(level_color(&level), color);
+        }
+        assert_eq!(component_name("haruki_event_tracker"), "main");
+        assert_eq!(component_name("haruki_event_tracker::api"), "api");
+        assert_eq!(component_name("tower_http::trace"), "http");
+        assert_eq!(component_name("tracker::daemon"), "tracker");
+        for component in [
+            "main",
+            "api",
+            "http",
+            "router",
+            "handler",
+            "tracker",
+            "daemon",
+            "sekai_api",
+            "client",
+            "db",
+            "storage",
+            "cache",
+            "state",
+            "config",
+            "model",
+            "access",
+            "other",
+        ] {
+            assert!(!component_color(component).is_empty());
+        }
+    }
+
+    #[test]
+    fn initializes_file_sinks_and_formats_events() {
+        let root = std::env::temp_dir().join(format!(
+            "haruki-logger-test-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let main_path = root.join("nested/main.log");
+        let access_path = root.join("access.log");
+        let guards = init("trace", Some(&main_path), Some(&access_path)).unwrap();
+
+        tracing::warn!(
+            user_id = "100",
+            enabled = true,
+            signed = -2_i64,
+            unsigned = 3_u64,
+            debug = ?vec![1, 2],
+            log_message = "detail",
+            "hello"
+        );
+        tracing::event!(target: ACCESS_TARGET, Level::WARN, uid = 200_i64, "request");
+        drop(guards);
+
+        let main = std::fs::read_to_string(&main_path).unwrap();
+        let access = std::fs::read_to_string(&access_path).unwrap();
+        assert!(main.contains("[User-100] hello"));
+        assert!(main.contains("enabled=true"));
+        assert!(!main.contains("request"));
+        assert!(access.contains("[User-200] request"));
+        assert_eq!(file_sink_dropped_lines(), (0, 0));
+
+        let blocker = root.join("blocker");
+        std::fs::write(&blocker, "file").unwrap();
+        assert!(matches!(
+            open_log_file(&blocker.join("child.log")),
+            Err(LoggerError::CreateDir { .. })
+        ));
+        assert!(matches!(
+            open_log_file(&root),
+            Err(LoggerError::OpenFile { .. })
+        ));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}

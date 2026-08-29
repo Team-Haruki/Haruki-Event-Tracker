@@ -147,3 +147,99 @@ pub fn web_v2_routes(trust: Arc<ProxyTrust>) -> Router<AppState> {
         )
         .merge(private_routes)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::api::handler::web::tests::{NORMAL_EVENT, WORLD_BLOOM_EVENT, test_state};
+    use crate::model::enums::SekaiServerRegion;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+
+    fn trust() -> Arc<ProxyTrust> {
+        let (trust, invalid) = ProxyTrust::from_config(false, &[], "X-Forwarded-For", 1.0, 1000);
+        assert!(invalid.is_empty());
+        Arc::new(trust)
+    }
+
+    async fn status(router: &Router, uri: &str) -> StatusCode {
+        router
+            .clone()
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+            .status()
+    }
+
+    #[test]
+    fn routes_all_cloud_and_web_endpoints() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(async {
+                        let state = test_state(true).await;
+                        let user = state.anonymizer().public_user_id(
+                            SekaiServerRegion::Jp,
+                            NORMAL_EVENT,
+                            "100",
+                        );
+                        let world_user = state.anonymizer().public_user_id(
+                            SekaiServerRegion::Jp,
+                            WORLD_BLOOM_EVENT,
+                            "100",
+                        );
+                        let router = build_router(state, trust());
+
+                        assert_eq!(status(&router, "/livez").await, StatusCode::OK);
+                        assert_eq!(status(&router, "/readyz").await, StatusCode::OK);
+                        assert_eq!(status(&router, "/missing").await, StatusCode::NOT_FOUND);
+
+                        let cloud_paths = [
+                            format!("/api/v2/cloud/events/jp/{NORMAL_EVENT}/leaderboards/total/sk/query?rank=1"),
+                            format!("/api/v2/cloud/events/jp/{NORMAL_EVENT}/leaderboards/total/sk/check-room?rank=1"),
+                            format!("/api/v2/cloud/events/jp/{NORMAL_EVENT}/leaderboards/total/sk/line?rank=1"),
+                            format!("/api/v2/cloud/events/jp/{NORMAL_EVENT}/leaderboards/total/sk/speed?rank=1&interval=60"),
+                            format!("/api/v2/cloud/events/jp/{NORMAL_EVENT}/leaderboards/total/sk/trace?subject={user}"),
+                            format!("/api/v2/cloud/events/jp/{NORMAL_EVENT}/leaderboards/total/sk/status"),
+                            format!("/api/v2/cloud/events/jp/{WORLD_BLOOM_EVENT}/leaderboards/world-bloom/17/sk/query?rank=1"),
+                            format!("/api/v2/cloud/events/jp/{WORLD_BLOOM_EVENT}/leaderboards/world-bloom/17/sk/check-room?rank=1"),
+                            format!("/api/v2/cloud/events/jp/{WORLD_BLOOM_EVENT}/leaderboards/world-bloom/17/sk/line?rank=1"),
+                            format!("/api/v2/cloud/events/jp/{WORLD_BLOOM_EVENT}/leaderboards/world-bloom/17/sk/speed?rank=1&interval=60"),
+                            format!("/api/v2/cloud/events/jp/{WORLD_BLOOM_EVENT}/leaderboards/world-bloom/17/sk/trace?subject={world_user}"),
+                        ];
+                        for path in cloud_paths {
+                            assert_eq!(status(&router, &path).await, StatusCode::OK, "{path}");
+                        }
+
+                        let web_paths = [
+                            format!("/api/v2/web/events/jp/{NORMAL_EVENT}/leaderboards/total/overview?at=1710000060&interval=60"),
+                            format!("/api/v2/web/events/jp/{NORMAL_EVENT}/leaderboards/total/replay/overview?at=1710000060&interval=60"),
+                            format!("/api/v2/web/events/jp/{NORMAL_EVENT}/leaderboards/total/details/rank/1?at=1710000060"),
+                            format!("/api/v2/web/events/jp/{NORMAL_EVENT}/leaderboards/total/details/user/{user}"),
+                            format!("/api/v2/web/events/jp/{NORMAL_EVENT}/leaderboards/total/users/search?name=Alpha"),
+                            format!("/api/v2/web/events/jp/{WORLD_BLOOM_EVENT}/leaderboards/world-bloom/17/overview?at=1710000060&interval=60"),
+                            format!("/api/v2/web/events/jp/{WORLD_BLOOM_EVENT}/leaderboards/world-bloom/17/replay/overview?at=1710000060&interval=60"),
+                            format!("/api/v2/web/events/jp/{WORLD_BLOOM_EVENT}/leaderboards/world-bloom/17/details/rank/1?at=1710000060"),
+                            format!("/api/v2/web/events/jp/{WORLD_BLOOM_EVENT}/leaderboards/world-bloom/17/details/user/{world_user}"),
+                            format!("/api/v2/web/events/jp/{WORLD_BLOOM_EVENT}/leaderboards/world-bloom/17/users/search?name=Alpha"),
+                        ];
+                        for path in web_paths {
+                            assert_eq!(status(&router, &path).await, StatusCode::OK, "{path}");
+                        }
+
+                        let private = format!(
+                            "/api/v2/web/events/jp/{NORMAL_EVENT}/leaderboards/total/private/details/user/100"
+                        );
+                        assert_eq!(status(&router, &private).await, StatusCode::UNAUTHORIZED);
+                    });
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+}

@@ -122,6 +122,18 @@ mod tests {
     use super::*;
     use axum::body::to_bytes;
     use axum::http::header::{CONTENT_ENCODING, CONTENT_TYPE, VARY};
+    use serde::Serializer;
+
+    struct BadJson;
+
+    impl Serialize for BadJson {
+        fn serialize<S>(&self, _serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: Serializer,
+        {
+            Err(serde::ser::Error::custom("expected failure"))
+        }
+    }
 
     #[tokio::test]
     async fn raw_json_returns_exact_bytes_and_content_type() {
@@ -167,5 +179,36 @@ mod tests {
         );
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         assert_eq!(body, Bytes::from_static(b"gzipped"));
+    }
+
+    #[test]
+    fn accepts_gzip_honors_wildcards_case_and_zero_quality() {
+        let mut headers = axum::http::HeaderMap::new();
+        assert!(!accepts_gzip(&headers));
+        for value in ["gzip", "br, GZIP; q=1", "*"] {
+            headers.insert(ACCEPT_ENCODING, value.parse().unwrap());
+            assert!(accepts_gzip(&headers), "{value}");
+        }
+        for value in [
+            "br",
+            "gzip;q=0",
+            "gzip;q=0.0",
+            "gzip;q=0.00",
+            "gzip;q=0.000",
+        ] {
+            headers.insert(ACCEPT_ENCODING, value.parse().unwrap());
+            assert!(!accepts_gzip(&headers), "{value}");
+        }
+    }
+
+    #[tokio::test]
+    async fn json_wrapper_reports_serialization_errors() {
+        let response = Json(BadJson).into_response();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(
+            body,
+            Bytes::from_static(br#"{"error":"json encode error"}"#)
+        );
     }
 }

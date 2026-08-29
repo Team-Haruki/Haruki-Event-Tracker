@@ -251,6 +251,201 @@ fn detail_trace_query(query: &WebDetailQuery, subject_type: &str) -> SubjectTrac
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::limiter::ApiQueryLimiter;
+    use crate::api::realtime::RealtimeHub;
+    use crate::api::state::AppState;
+    use crate::api::ws_ticket::WsTicketStore;
+    use crate::config::ApiQueryConfig;
+    use crate::db::query::web::tests::{
+        seed_normal_event_with_history, seed_world_bloom_event_with_history, sqlite_engine,
+    };
+    use crate::db::schema::create_event_tables;
+    use crate::model::enums::SekaiServerRegion;
+    use crate::privacy::UidAnonymizer;
+    use axum::response::IntoResponse;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    const NORMAL_EVENT: i64 = 811;
+    const WORLD_BLOOM_EVENT: i64 = 812;
+
+    async fn test_state() -> AppState {
+        let engine = sqlite_engine().await;
+        create_event_tables(&engine, SekaiServerRegion::Jp, NORMAL_EVENT, false)
+            .await
+            .unwrap();
+        seed_normal_event_with_history(&engine, NORMAL_EVENT).await;
+        create_event_tables(&engine, SekaiServerRegion::Jp, WORLD_BLOOM_EVENT, true)
+            .await
+            .unwrap();
+        seed_world_bloom_event_with_history(&engine, WORLD_BLOOM_EVENT).await;
+        AppState::new(
+            HashMap::from([(SekaiServerRegion::Jp, Arc::new(engine))]),
+            None,
+            ApiQueryLimiter::new(ApiQueryConfig::default(), [SekaiServerRegion::Jp]),
+            UidAnonymizer::disabled(),
+            None,
+            RealtimeHub::new(),
+            WsTicketStore::default(),
+        )
+    }
+
+    fn detail_query() -> WebDetailQuery {
+        WebDetailQuery {
+            interval: Some(60),
+            at: Some(1_710_000_060),
+            include_trace: Some(true),
+            include_player_trace: Some(true),
+            include_profile: Some(true),
+            cursor: None,
+            limit: Some(10),
+        }
+    }
+
+    #[test]
+    fn web_overviews_cover_live_replay_and_world_bloom() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(async {
+                        let state = test_state().await;
+                        let replay = web_overview_for_scope(
+                            state.clone(),
+                            "jp".into(),
+                            NORMAL_EVENT,
+                            None,
+                            OverviewQuery {
+                                interval: Some(60),
+                                at: Some(1_710_000_060),
+                            },
+                            "web:v2",
+                            false,
+                        )
+                        .await
+                        .unwrap();
+                        assert!(replay.into_response().status().is_success());
+
+                        let live = web_overview_for_scope(
+                            state.clone(),
+                            "jp".into(),
+                            NORMAL_EVENT,
+                            None,
+                            OverviewQuery {
+                                interval: Some(60),
+                                at: None,
+                            },
+                            "web:v2",
+                            true,
+                        )
+                        .await
+                        .unwrap();
+                        assert!(live.into_response().status().is_success());
+
+                        let world = web_overview_for_scope(
+                            state,
+                            "jp".into(),
+                            WORLD_BLOOM_EVENT,
+                            Some(17),
+                            OverviewQuery {
+                                interval: Some(60),
+                                at: Some(1_710_000_060),
+                            },
+                            "web:v2",
+                            false,
+                        )
+                        .await
+                        .unwrap();
+                        assert!(world.into_response().status().is_success());
+                    });
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn web_rank_details_include_metrics_and_traces() {
+        let state = test_state().await;
+        let detail = web_rank_detail_for_scope(
+            state.clone(),
+            "jp".into(),
+            NORMAL_EVENT,
+            None,
+            2,
+            detail_query(),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert!(detail.current.is_some());
+        assert!(detail.previous.is_some());
+        assert!(detail.next.is_some());
+        assert!(detail.metrics.is_some());
+        assert_eq!(detail.rank_trace.len(), 2);
+        assert_eq!(detail.player_trace.len(), 2);
+
+        let world = web_rank_detail_for_scope(
+            state.clone(),
+            "jp".into(),
+            WORLD_BLOOM_EVENT,
+            Some(17),
+            1,
+            detail_query(),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert!(world.current.is_some());
+        assert!(!world.rank_trace.is_empty());
+
+        let error =
+            web_rank_detail_for_scope(state, "jp".into(), NORMAL_EVENT, None, 0, detail_query())
+                .await
+                .err()
+                .expect("non-positive rank must fail");
+        assert!(matches!(error, ApiError::BadRequest(_)));
+    }
+
+    #[tokio::test]
+    async fn web_user_details_include_profile_and_optional_trace() {
+        let state = test_state().await;
+        let detail = web_user_detail_for_scope(
+            state.clone(),
+            "jp".into(),
+            NORMAL_EVENT,
+            None,
+            "100".into(),
+            detail_query(),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert!(detail.current.is_some());
+        assert_eq!(detail.profile.unwrap().name, "Alpha");
+        assert_eq!(detail.player_trace.len(), 2);
+
+        let mut without_trace = detail_query();
+        without_trace.include_trace = Some(false);
+        without_trace.include_profile = Some(false);
+        let world = web_user_detail_for_scope(
+            state,
+            "jp".into(),
+            WORLD_BLOOM_EVENT,
+            Some(17),
+            "100".into(),
+            without_trace,
+        )
+        .await
+        .unwrap()
+        .0;
+        assert!(world.current.is_some());
+        assert!(world.profile.is_none());
+        assert!(world.player_trace.is_empty());
+    }
 
     #[test]
     fn detail_trace_query_forwards_cursor_and_limit() {

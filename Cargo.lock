@@ -1319,6 +1319,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tokio-cron-scheduler",
+ "tokio-tungstenite",
  "tokio-util",
  "tower",
  "tower-http 0.7.0",

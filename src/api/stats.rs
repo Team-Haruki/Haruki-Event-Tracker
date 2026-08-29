@@ -141,3 +141,31 @@ fn log_snapshot() {
         "api aggregate stats"
     );
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn counters_increment_reset_and_default_to_zero() {
+        let cache = CacheStats::default();
+        let access = AccessStats::default();
+        let api = ApiStats::default();
+        incr(&cache.l1_hit);
+        incr(&access.logged);
+        incr(&api.service_unavailable);
+
+        assert_eq!(take(&cache.l1_hit), 1);
+        assert_eq!(take(&cache.l1_hit), 0);
+        assert_eq!(take(&access.logged), 1);
+        assert_eq!(take(&api.service_unavailable), 1);
+    }
+
+    #[tokio::test]
+    async fn aggregation_logger_only_starts_once() {
+        spawn_aggregation_logger();
+        spawn_aggregation_logger();
+        log_snapshot();
+        assert!(LOGGER_STARTED.load(Ordering::Relaxed));
+    }
+}

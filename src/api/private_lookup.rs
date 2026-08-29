@@ -172,7 +172,7 @@ fn normalize_toolbox_user_id(value: &sonic_rs::Value) -> Option<String> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use axum::Router;
     use axum::http::HeaderMap;
@@ -265,7 +265,7 @@ mod tests {
         assert!(matches!(err, PrivateLookupError::Forbidden));
     }
 
-    async fn spawn_toolbox(
+    pub(crate) async fn spawn_toolbox(
         body: &'static str,
         headers_seen: Arc<Mutex<Vec<(String, String)>>>,
     ) -> String {

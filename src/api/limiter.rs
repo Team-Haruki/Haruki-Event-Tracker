@@ -97,3 +97,64 @@ async fn acquire_optional(
         .map(Some)
         .map_err(|_| ApiError::ServiceUnavailable("trace query limiter closed".into()))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn disabled_limits_allow_requests_and_clamp_batch_fill() {
+        let limiter = ApiQueryLimiter::new(
+            ApiQueryConfig {
+                trace_global_max_concurrency: 0,
+                trace_per_server_max_concurrency: 0,
+                batch_trace_fill_concurrency: 0,
+                ..ApiQueryConfig::default()
+            },
+            [SekaiServerRegion::Jp],
+        );
+
+        limiter.acquire_trace(SekaiServerRegion::Jp).await.unwrap();
+        assert_eq!(limiter.batch_trace_fill_concurrency(), 1);
+    }
+
+    #[tokio::test]
+    async fn limits_concurrency_and_recovers_after_permit_drop() {
+        let limiter = ApiQueryLimiter::new(
+            ApiQueryConfig {
+                trace_global_max_concurrency: 1,
+                trace_per_server_max_concurrency: 1,
+                acquire_timeout_ms: 1,
+                batch_trace_fill_concurrency: 3,
+            },
+            [SekaiServerRegion::Jp],
+        );
+        let permit = limiter.acquire_trace(SekaiServerRegion::Jp).await.unwrap();
+        assert!(matches!(
+            limiter.acquire_trace(SekaiServerRegion::Jp).await,
+            Err(ApiError::ServiceUnavailable(_))
+        ));
+        drop(permit);
+        limiter.acquire_trace(SekaiServerRegion::Jp).await.unwrap();
+        assert_eq!(limiter.batch_trace_fill_concurrency(), 3);
+    }
+
+    #[tokio::test]
+    async fn reports_closed_semaphore_without_timeout() {
+        let limiter = ApiQueryLimiter::new(
+            ApiQueryConfig {
+                trace_global_max_concurrency: 1,
+                trace_per_server_max_concurrency: 0,
+                acquire_timeout_ms: 0,
+                ..ApiQueryConfig::default()
+            },
+            [SekaiServerRegion::Jp],
+        );
+        limiter.inner.global_trace.as_ref().unwrap().close();
+
+        assert!(matches!(
+            limiter.acquire_trace(SekaiServerRegion::Jp).await,
+            Err(ApiError::ServiceUnavailable(_))
+        ));
+    }
+}

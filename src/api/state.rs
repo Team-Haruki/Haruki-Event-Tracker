@@ -135,3 +135,54 @@ impl AppState {
         &self.inner.ws_tickets
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::api::limiter::ApiQueryLimiter;
+    use crate::config::ApiQueryConfig;
+    use crate::db::schema::create_event_tables;
+    use sea_orm::{Database, DatabaseBackend};
+
+    #[tokio::test]
+    async fn exposes_services_and_migrates_user_table_once() {
+        let conn = Database::connect("sqlite::memory:").await.unwrap();
+        let engine = Arc::new(DatabaseEngine::from_connection(
+            conn,
+            DatabaseBackend::Sqlite,
+        ));
+        create_event_tables(&engine, SekaiServerRegion::Jp, 123, false)
+            .await
+            .unwrap();
+        let realtime = RealtimeHub::new();
+        let tickets = WsTicketStore::default();
+        let state = AppState::new(
+            HashMap::from([(SekaiServerRegion::Jp, engine.clone())]),
+            None,
+            ApiQueryLimiter::new(ApiQueryConfig::default(), [SekaiServerRegion::Jp]),
+            UidAnonymizer::enabled("salt"),
+            None,
+            realtime.clone(),
+            tickets.clone(),
+        );
+
+        assert!(state.db(SekaiServerRegion::Jp).is_some());
+        assert!(state.db(SekaiServerRegion::En).is_none());
+        assert_eq!(state.dbs().count(), 1);
+        assert!(state.cache().is_none());
+        assert!(state.anonymizer().is_enabled());
+        assert!(state.private_lookup().is_none());
+        assert_eq!(state.realtime().total_online(), realtime.total_online());
+        assert!(state.ws_tickets().consume("").await.is_none());
+        assert_eq!(state.query_limiter().batch_trace_fill_concurrency(), 4);
+
+        state
+            .ensure_user_table_extensions(&engine, SekaiServerRegion::Jp, 123)
+            .await
+            .unwrap();
+        state
+            .ensure_user_table_extensions(&engine, SekaiServerRegion::Jp, 123)
+            .await
+            .unwrap();
+    }
+}

@@ -282,4 +282,39 @@ mod tests {
         let _ = std::fs::remove_file(file);
         let _ = std::fs::remove_dir(dir);
     }
+
+    #[tokio::test]
+    async fn rejects_invalid_paths_and_reports_read_failures() {
+        assert!(matches!(
+            StorageRoot::from_dir_location("  "),
+            Err(StorageError::InvalidLocation(_))
+        ));
+        assert!(matches!(
+            StorageFile::from_location(""),
+            Err(StorageError::InvalidLocation(_))
+        ));
+        assert!(normalize_object_path("").is_err());
+        assert!(normalize_object_path("a//b").is_err());
+        assert!(normalize_object_path("a/../b").is_err());
+        assert_eq!(normalize_object_path("/a/b").unwrap(), "a/b");
+        assert!(split_uri_file("s3://bucket").is_err());
+        assert!(split_uri_file("not-a-uri").is_err());
+
+        let dir =
+            std::env::temp_dir().join(format!("haruki-storage-errors-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let root = StorageRoot::from_dir_location(dir.to_str().unwrap()).unwrap();
+        assert!(matches!(
+            root.fingerprint("missing").await,
+            Err(StorageError::Read { .. })
+        ));
+        let invalid_utf8 = dir.join("invalid.bin");
+        std::fs::write(&invalid_utf8, [0xff]).unwrap();
+        let file = StorageFile::from_location(invalid_utf8.to_str().unwrap()).unwrap();
+        assert!(matches!(
+            file.read_to_string().await,
+            Err(StorageError::Utf8 { .. })
+        ));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 }

@@ -124,7 +124,14 @@ pub fn peer_from_connect_info(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::limiter::ApiQueryLimiter;
+    use crate::api::realtime::RealtimeHub;
+    use crate::api::state::AppState;
+    use crate::config::ApiQueryConfig;
+    use crate::privacy::UidAnonymizer;
     use axum::http::{HeaderMap, HeaderValue};
+    use axum::response::IntoResponse;
+    use std::collections::HashMap;
     use std::net::{IpAddr, SocketAddr};
 
     fn trust(enabled: bool, cidrs: &[&str]) -> ProxyTrust {
@@ -169,5 +176,46 @@ mod tests {
             ),
             None,
         );
+    }
+
+    #[tokio::test]
+    async fn ticket_helpers_cover_empty_expired_and_handler_paths() {
+        let store = WsTicketStore::default();
+        assert!(store.consume("   ").await.is_none());
+        store.inner.lock().await.insert(
+            "expired".into(),
+            WsTicket {
+                subject: "old".into(),
+                expires_at: Instant::now() - Duration::from_secs(1),
+            },
+        );
+        assert!(store.consume("expired").await.is_none());
+        let generated = generate_ticket();
+        assert_eq!(generated.len(), TICKET_BYTES * 2);
+        assert!(generated.chars().all(|ch| ch.is_ascii_hexdigit()));
+        assert_eq!(unauthorized().0, StatusCode::UNAUTHORIZED);
+
+        let state = AppState::new(
+            HashMap::new(),
+            None,
+            ApiQueryLimiter::new(ApiQueryConfig::default(), []),
+            UidAnonymizer::disabled(),
+            None,
+            RealtimeHub::new(),
+            store,
+        );
+        let trust = Arc::new(trust(false, &[]));
+        let mut headers = HeaderMap::new();
+        headers.insert("x-oathkeeper-subject", HeaderValue::from_static("user-2"));
+        let peer = SocketAddr::new(IpAddr::from([127, 0, 0, 1]), 1234);
+        assert_eq!(peer_from_connect_info(ConnectInfo(peer)), Some(peer));
+        let response = issue_ticket(
+            axum::extract::State((state, trust)),
+            ConnectInfo(peer),
+            headers,
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
     }
 }
