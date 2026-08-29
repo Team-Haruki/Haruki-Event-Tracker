@@ -2691,7 +2691,7 @@ mod tests {
 
     #[tokio::test]
     async fn redis_cache_covers_encoded_negative_miss_and_identity_fallbacks() {
-        let Some(mut conn) = coverage_redis().await else {
+        let Some(conn) = coverage_redis().await else {
             return;
         };
         let event_id = next_event_id();
