@@ -626,6 +626,19 @@ where
     }
 }
 
+/// Trace queries are the heaviest, limiter-guarded reads in the service.
+/// Keying them through the per-write epoch would invalidate them on every
+/// tracker write — at second-level tracking cadence that means every second,
+/// making the trace TTL meaningless and re-running each unique query per
+/// request. They use the epoch-free static keyspace with a time bucket in
+/// the suffix instead: one computation is reused for up to the trace TTL,
+/// and the bucket boundary provides the roll-over. Traces are append-only
+/// history, so a result at most one TTL old is semantically fine.
+fn trace_bucketed_suffix(suffix: &str, ttl_secs: u64, now_secs: i64) -> String {
+    let bucket = now_secs / i64::try_from(ttl_secs.max(1)).unwrap_or(60);
+    format!("{suffix}:b{bucket}")
+}
+
 async fn cached_trace_bytes<T, Fut>(
     state: &AppState,
     server: &str,
@@ -638,14 +651,10 @@ where
     Fut: std::future::Future<Output = Result<T, ApiError>>,
 {
     if let Some(cache) = state.cache() {
+        let ttl_secs = cache.ttl(CacheTtl::TraceRank);
+        let suffix = trace_bucketed_suffix(&suffix, ttl_secs, chrono::Utc::now().timestamp());
         cache
-            .get_or_fetch_json_bytes(
-                server,
-                event_id,
-                suffix,
-                cache.ttl(CacheTtl::TraceRank),
-                fetch,
-            )
+            .get_or_fetch_static_json_bytes(server, event_id, suffix, ttl_secs, fetch)
             .await
     } else {
         encode_fetched(fetch).await
@@ -728,14 +737,10 @@ where
     Fut: std::future::Future<Output = Result<T, ApiError>>,
 {
     if let Some(cache) = state.cache() {
+        let ttl_secs = cache.ttl(CacheTtl::TraceRank);
+        let suffix = trace_bucketed_suffix(&suffix, ttl_secs, chrono::Utc::now().timestamp());
         cache
-            .get_or_fetch(
-                server,
-                event_id,
-                suffix,
-                cache.ttl(CacheTtl::TraceRank),
-                fetch,
-            )
+            .get_or_fetch_static(server, event_id, suffix, ttl_secs, fetch)
             .await
     } else {
         fetch.await
@@ -1095,5 +1100,14 @@ pub(crate) mod tests {
     fn rejects_tiny_search_text() {
         assert!(validate_search_text(Some("a"), "name").is_err());
         assert!(validate_search_text(Some("ab"), "name").is_ok());
+    }
+
+    #[test]
+    fn trace_bucket_rolls_over_at_ttl_boundaries() {
+        assert_eq!(trace_bucketed_suffix("t", 60, 0), "t:b0");
+        assert_eq!(trace_bucketed_suffix("t", 60, 59), "t:b0");
+        assert_eq!(trace_bucketed_suffix("t", 60, 60), "t:b1");
+        // A zero TTL must not divide by zero.
+        assert_eq!(trace_bucketed_suffix("t", 0, 5), "t:b5");
     }
 }

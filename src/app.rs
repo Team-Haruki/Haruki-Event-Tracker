@@ -25,6 +25,7 @@ use crate::db::engine::{DatabaseEngine, EngineError};
 use crate::model::enums::SekaiServerRegion;
 use crate::privacy::UidAnonymizer;
 use crate::sekai_api::client::{BuildError as SekaiClientError, HarukiSekaiAPIClient};
+use crate::tracker::base::TrackerTuning;
 use crate::tracker::daemon::{DaemonError, HarukiEventTracker};
 use crate::tracker::parser::ParseError;
 
@@ -132,8 +133,12 @@ async fn build_tracker_dependencies(
     let client = redis::Client::open(redis_url(&cfg.redis))?;
     let redis = redis::aio::ConnectionManager::new(client).await?;
     tracing::info!("Redis ready");
-    let api =
-        HarukiSekaiAPIClient::new(cfg.sekai_api.api_endpoint.clone(), &cfg.sekai_api.api_token)?;
+    let api = HarukiSekaiAPIClient::with_timeouts(
+        cfg.sekai_api.api_endpoint.clone(),
+        &cfg.sekai_api.api_token,
+        std::time::Duration::from_secs(cfg.sekai_api.timeout_secs),
+        std::time::Duration::from_secs(cfg.sekai_api.connect_timeout_secs),
+    )?;
     Ok((Some(redis), Some(api)))
 }
 
@@ -200,7 +205,16 @@ async fn configure_server(
         engine,
         realtime.clone(),
         anonymizer.clone(),
-        server_cfg.tracker.post_end_user_refresh_interval_secs,
+        TrackerTuning {
+            post_end_user_refresh_interval_secs: server_cfg
+                .tracker
+                .post_end_user_refresh_interval_secs,
+            idle_heartbeat_interval_secs: server_cfg.tracker.idle_heartbeat_interval_secs,
+            border_fetch_interval_secs: server_cfg.tracker.border_fetch_interval_secs,
+            flush_interval_secs: server_cfg.tracker.flush_interval_secs,
+            flush_max_rows: server_cfg.tracker.flush_max_rows.max(1),
+            flush_hot_ranks: server_cfg.tracker.flush_hot_ranks,
+        },
         &server_cfg.master_data_dir,
     )?;
     if let Err(err) = daemon.init().await {
@@ -209,25 +223,35 @@ async fn configure_server(
     let daemon = Arc::new(Mutex::new(daemon));
     trackers.insert(server, daemon.clone());
 
-    let cron_expr = if server_cfg.tracker.use_second_level_cron {
-        server_cfg.tracker.cron.clone()
-    } else {
-        format!("0 {}", server_cfg.tracker.cron)
-    };
+    let cron_expr = scheduler_cron_expr(
+        server_cfg.tracker.use_second_level_cron,
+        &server_cfg.tracker.cron,
+    );
     let daemon_for_job = daemon.clone();
+    // At second-level cadence a slow upstream makes skipped ticks routine;
+    // rate-limit the warning instead of emitting one per skipped second.
+    let last_skip_warn = Arc::new(std::sync::atomic::AtomicI64::new(0));
     let job = Job::new_async(cron_expr.as_str(), move |_uuid, _l| {
         let daemon = daemon_for_job.clone();
+        let last_skip_warn = last_skip_warn.clone();
         Box::pin(async move {
             // A tick that outlives the cron interval must not queue the
             // next firing behind the mutex — back-to-back stale ticks
             // would pile onto an already slow upstream/DB.
             match daemon.try_lock() {
                 Ok(mut daemon) => {
-                    tracing::info!(%server, "tracker tick");
+                    tracing::debug!(%server, "tracker tick");
                     daemon.track_ranking_data().await;
                 }
                 Err(_) => {
-                    tracing::warn!(%server, "previous tracker tick still running; skipping this tick");
+                    let now = chrono::Utc::now().timestamp();
+                    let prev = last_skip_warn.load(std::sync::atomic::Ordering::Relaxed);
+                    if now - prev >= 60 {
+                        last_skip_warn.store(now, std::sync::atomic::Ordering::Relaxed);
+                        tracing::warn!(%server, "previous tracker tick still running; skipping ticks");
+                    } else {
+                        tracing::debug!(%server, "previous tracker tick still running; skipping this tick");
+                    }
                 }
             }
         })
@@ -239,6 +263,26 @@ async fn configure_server(
         .await?;
     tracing::info!(%server, cron = %cron_expr, "scheduled tracker");
     Ok(())
+}
+
+/// Normalize the configured cron into the 6-field form
+/// `tokio_cron_scheduler` requires. `use_second_level_cron: false` keeps the
+/// gocron-era 5-field convention (fires at second 0), but a 6-field
+/// expression is accepted as-is either way — blindly prepending `"0 "` to
+/// one would produce an unparseable 7-field schedule.
+fn scheduler_cron_expr(use_second_level_cron: bool, cron: &str) -> String {
+    let fields = cron.split_whitespace().count();
+    if use_second_level_cron || fields >= 6 {
+        if !use_second_level_cron && fields >= 6 {
+            tracing::warn!(
+                cron,
+                "cron has a seconds field but use_second_level_cron is false; using it as-is"
+            );
+        }
+        cron.to_string()
+    } else {
+        format!("0 {cron}")
+    }
 }
 
 fn build_anonymizer(cfg: &Config) -> Result<UidAnonymizer, BootstrapError> {
@@ -389,6 +433,14 @@ mod tests {
             build_anonymizer(&enabled_cfg),
             Err(BootstrapError::Privacy(_))
         ));
+    }
+
+    #[test]
+    fn cron_expr_pads_five_fields_and_passes_six_through() {
+        assert_eq!(scheduler_cron_expr(false, "*/2 * * * *"), "0 */2 * * * *");
+        assert_eq!(scheduler_cron_expr(true, "*/1 * * * * *"), "*/1 * * * * *");
+        // 6-field expression with the flag off must not gain a 7th field.
+        assert_eq!(scheduler_cron_expr(false, "*/1 * * * * *"), "*/1 * * * * *");
     }
 
     #[test]

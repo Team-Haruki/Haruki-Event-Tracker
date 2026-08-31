@@ -28,6 +28,7 @@ use crate::privacy::UidAnonymizer;
 #[derive(FromQueryResult)]
 struct TimeIdRow {
     time_id: i64,
+    timestamp: i64,
 }
 
 /// Lean per-user dimension state: everything needed to decide whether the
@@ -53,8 +54,13 @@ struct UserKeyOnlyRow {
 type DirtyUser<'a> = (&'a str, Option<i64>);
 type ExistingUserState<'a> = (HashMap<String, i64>, Vec<DirtyUser<'a>>);
 
-/// Look up `time_id` per timestamp, inserting a new row with `status` when
-/// the timestamp is not yet present. Returns a `timestamp -> time_id` map.
+/// Look up `time_id` per timestamp, inserting new rows with `status` for
+/// timestamps not yet present. Returns a `timestamp -> time_id` map.
+///
+/// One coalesced flush carries a whole window of per-second timestamps, so
+/// this runs as three set-based statements (select existing, multi-row
+/// conflict-ignoring insert, re-select) instead of up to three statements
+/// *per timestamp* inside the write transaction.
 pub(crate) async fn batch_get_or_create_time_ids(
     tx: &DatabaseTransaction,
     backend: DatabaseBackend,
@@ -63,36 +69,64 @@ pub(crate) async fn batch_get_or_create_time_ids(
     status: i16,
 ) -> Result<HashMap<i64, i64>, DbErr> {
     let mut out = HashMap::with_capacity(timestamps.len());
-    for &ts in timestamps {
-        let sel = Query::select()
+    if timestamps.is_empty() {
+        return Ok(out);
+    }
+    let select_by_ts = |ts: Vec<i64>| {
+        Query::select()
             .expr_as(Expr::col(time_id::Column::TimeId), Alias::new("time_id"))
+            .expr_as(
+                Expr::col(time_id::Column::Timestamp),
+                Alias::new("timestamp"),
+            )
             .from(Alias::new(table_name))
-            .and_where(Expr::col(time_id::Column::Timestamp).eq(ts))
-            .limit(1)
-            .to_owned();
+            .and_where(Expr::col(time_id::Column::Timestamp).is_in(ts))
+            .to_owned()
+    };
 
-        if let Some(row) = TimeIdRow::find_by_statement(backend.build(&sel))
-            .one(tx)
-            .await?
-        {
-            out.insert(ts, row.time_id);
-            continue;
-        }
+    let sel = select_by_ts(timestamps.iter().copied().collect());
+    for row in TimeIdRow::find_by_statement(backend.build(&sel))
+        .all(tx)
+        .await?
+    {
+        out.insert(row.timestamp, row.time_id);
+    }
 
-        let ins = Query::insert()
-            .into_table(Alias::new(table_name))
-            .columns([time_id::Column::Timestamp, time_id::Column::Status])
-            .values_panic([ts.into(), status.into()])
-            .to_owned();
-        tx.execute(&ins).await?;
+    let missing: Vec<i64> = timestamps
+        .iter()
+        .copied()
+        .filter(|ts| !out.contains_key(ts))
+        .collect();
+    if missing.is_empty() {
+        return Ok(out);
+    }
 
-        let row = TimeIdRow::find_by_statement(backend.build(&sel))
-            .one(tx)
-            .await?
-            .ok_or_else(|| {
-                DbErr::Custom(format!("inserted time_id row vanished for timestamp={ts}"))
-            })?;
-        out.insert(ts, row.time_id);
+    let mut ins = Query::insert();
+    ins.into_table(Alias::new(table_name))
+        .columns([time_id::Column::Timestamp, time_id::Column::Status]);
+    for &ts in &missing {
+        ins.values_panic([ts.into(), status.into()]);
+    }
+    ins.on_conflict(
+        OnConflict::column(time_id::Column::Timestamp)
+            .do_nothing_on([time_id::Column::Timestamp])
+            .to_owned(),
+    );
+    tx.execute(&ins).await?;
+
+    let sel = select_by_ts(missing);
+    for row in TimeIdRow::find_by_statement(backend.build(&sel))
+        .all(tx)
+        .await?
+    {
+        out.insert(row.timestamp, row.time_id);
+    }
+    if out.len() != timestamps.len() {
+        return Err(DbErr::Custom(format!(
+            "inserted time_id rows vanished ({} of {} resolved)",
+            out.len(),
+            timestamps.len()
+        )));
     }
     Ok(out)
 }
@@ -603,8 +637,11 @@ pub async fn batch_insert_world_bloom_rankings(
     // tick never opens one, and the state map is only updated after the
     // rows actually committed (a failed tick retries the same diff; the
     // ranking insert's DO NOTHING dedups any partially-landed rows).
+    // `running` advances per record within the batch: a coalesced flush can
+    // carry several samples for one `(user, chapter)`, and a value that
+    // oscillates back to the pre-batch state is still a real trace point.
     let mut changed: Vec<(i64, i64, i64, i64, i64)> = Vec::new();
-    let mut new_state: Vec<(WorldBloomKey, PlayerState)> = Vec::new();
+    let mut running: HashMap<WorldBloomKey, PlayerState> = HashMap::new();
     for r in records {
         let user_key = *user_lookup
             .get(&r.base.user_id)
@@ -613,7 +650,10 @@ pub async fn batch_insert_world_bloom_rankings(
             user_id_key: user_key,
             character_id: r.character_id,
         };
-        let last = prev_state.get(&key).copied();
+        let last = running
+            .get(&key)
+            .copied()
+            .or_else(|| prev_state.get(&key).copied());
         if last.is_none_or(|p| p.score != r.base.score || p.rank != r.base.rank) {
             changed.push((
                 r.base.timestamp,
@@ -622,13 +662,13 @@ pub async fn batch_insert_world_bloom_rankings(
                 r.base.score,
                 r.base.rank,
             ));
-            new_state.push((
+            running.insert(
                 key,
                 PlayerState {
                     score: r.base.score,
                     rank: r.base.rank,
                 },
-            ));
+            );
         }
     }
     if changed.is_empty() {
@@ -683,7 +723,7 @@ pub async fn batch_insert_world_bloom_rankings(
         .await
         .map_err(unwrap_tx_err)?;
 
-    prev_state.extend(new_state);
+    prev_state.extend(running);
     Ok(changed_len)
 }
 

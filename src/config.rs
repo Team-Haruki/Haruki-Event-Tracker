@@ -19,6 +19,11 @@ pub struct TrackerConfig {
     pub use_second_level_cron: bool,
     pub cron: String,
     pub post_end_user_refresh_interval_secs: u64,
+    pub idle_heartbeat_interval_secs: u64,
+    pub border_fetch_interval_secs: u64,
+    pub flush_interval_secs: u64,
+    pub flush_max_rows: usize,
+    pub flush_hot_ranks: u64,
 }
 
 impl Default for TrackerConfig {
@@ -28,6 +33,11 @@ impl Default for TrackerConfig {
             use_second_level_cron: false,
             cron: String::new(),
             post_end_user_refresh_interval_secs: 3600,
+            idle_heartbeat_interval_secs: 30,
+            border_fetch_interval_secs: 0,
+            flush_interval_secs: 0,
+            flush_max_rows: 2000,
+            flush_hot_ranks: 0,
         }
     }
 }
@@ -110,11 +120,24 @@ impl Default for ApiQueryConfig {
     }
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct SekaiApiConfig {
     pub api_endpoint: String,
     pub api_token: String,
+    pub timeout_secs: u64,
+    pub connect_timeout_secs: u64,
+}
+
+impl Default for SekaiApiConfig {
+    fn default() -> Self {
+        Self {
+            api_endpoint: String::new(),
+            api_token: String::new(),
+            timeout_secs: 5,
+            connect_timeout_secs: 3,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]

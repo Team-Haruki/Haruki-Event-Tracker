@@ -13,6 +13,7 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use thiserror::Error;
@@ -49,9 +50,16 @@ impl From<StorageError> for ParseError {
 
 type Fingerprint = (Option<i64>, u64, Option<String>);
 
+/// Minimum spacing between storage fingerprint probes. At second-level
+/// tracker cadence a stat/HEAD per tick is pure overhead (master data
+/// changes at most a few times a day); within this window the cached
+/// document is served without touching storage.
+const STAT_MIN_INTERVAL: Duration = Duration::from_secs(5);
+
 #[derive(Debug)]
 struct CachedDoc<T> {
     fingerprint: Fingerprint,
+    checked_at: Instant,
     value: Arc<T>,
 }
 
@@ -176,6 +184,16 @@ impl EventDataParser {
         path: &str,
         cache: &Mutex<Option<CachedDoc<T>>>,
     ) -> Result<Arc<T>, ParseError> {
+        {
+            let cached = cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(doc) = cached.as_ref()
+                && doc.checked_at.elapsed() < STAT_MIN_INTERVAL
+            {
+                return Ok(doc.value.clone());
+            }
+        }
         let fingerprint = match self.master_data.fingerprint(path).await {
             Ok(fp @ ((Some(_), _, _) | (_, _, Some(_)))) => Some(fp),
             Ok(_) => None,
@@ -185,12 +203,13 @@ impl EventDataParser {
             }
         };
         if let Some(fingerprint) = &fingerprint {
-            let cached = cache
+            let mut cached = cache
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if let Some(doc) = cached.as_ref()
+            if let Some(doc) = cached.as_mut()
                 && &doc.fingerprint == fingerprint
             {
+                doc.checked_at = Instant::now();
                 return Ok(doc.value.clone());
             }
         }
@@ -200,6 +219,7 @@ impl EventDataParser {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(CachedDoc {
                 fingerprint,
+                checked_at: Instant::now(),
                 value: value.clone(),
             });
         }

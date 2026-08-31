@@ -19,7 +19,7 @@ use crate::model::enums::{SekaiEventStatus, SekaiEventType, SekaiServerRegion};
 use crate::model::event::{EventStatus, WorldBloomChapterStatus};
 use crate::privacy::UidAnonymizer;
 use crate::sekai_api::client::HarukiSekaiAPIClient;
-use crate::tracker::base::{EventTrackerBase, TrackerError};
+use crate::tracker::base::{EventTrackerBase, TrackerError, TrackerTuning};
 use crate::tracker::parser::{EventDataParser, ParseError};
 
 #[derive(Debug, thiserror::Error)]
@@ -40,7 +40,7 @@ pub struct HarukiEventTracker {
     db: Arc<DatabaseEngine>,
     realtime: RealtimeHub,
     anonymizer: UidAnonymizer,
-    post_end_user_refresh_interval_secs: u64,
+    tuning: TrackerTuning,
     parser: EventDataParser,
     inner: Option<EventTrackerBase>,
 }
@@ -55,7 +55,7 @@ impl HarukiEventTracker {
         db: Arc<DatabaseEngine>,
         realtime: RealtimeHub,
         anonymizer: UidAnonymizer,
-        post_end_user_refresh_interval_secs: u64,
+        tuning: TrackerTuning,
         master_dir: impl AsRef<str>,
     ) -> Result<Self, ParseError> {
         Ok(Self {
@@ -67,7 +67,7 @@ impl HarukiEventTracker {
             db,
             realtime,
             anonymizer,
-            post_end_user_refresh_interval_secs,
+            tuning,
             inner: None,
         })
     }
@@ -96,7 +96,7 @@ impl HarukiEventTracker {
             self.api_cache_redis.clone(),
             self.api.clone(),
             self.anonymizer.clone(),
-            self.post_end_user_refresh_interval_secs,
+            self.tuning,
             event.chapter_statuses,
         );
         base.init().await?;
@@ -111,7 +111,7 @@ impl HarukiEventTracker {
         let event = match self.parser.get_current_event_status().await {
             Ok(Some(e)) => e,
             Ok(None) => {
-                tracing::info!("no active event, skipping tick");
+                tracing::debug!("no active event, skipping tick");
                 return;
             }
             Err(err) => {
@@ -146,8 +146,8 @@ impl HarukiEventTracker {
         let Some(base) = self.inner.as_mut() else {
             return;
         };
-        tracing::info!(event_id = event.event_id, "tracking ranking data");
-        match base.record_ranking_data(false).await {
+        tracing::debug!(event_id = event.event_id, "tracking ranking data");
+        match base.record_ranking_data(false, false).await {
             Ok(true) => self.notify_update(event.event_id),
             Ok(false) => {}
             Err(err) => {
@@ -178,7 +178,7 @@ impl HarukiEventTracker {
             return true;
         }
         if event.event_status == SekaiEventStatus::Aggregating {
-            tracing::info!(event_id = event.event_id, "event aggregating, skipping");
+            tracing::debug!(event_id = event.event_id, "event aggregating, skipping");
             return true;
         }
         let realtime = self.realtime.clone();
@@ -202,7 +202,7 @@ impl HarukiEventTracker {
             return false;
         }
         tracing::info!(event_id = event.event_id, "event ended, finalizing");
-        match base.record_ranking_data(false).await {
+        match base.record_ranking_data(false, true).await {
             Ok(true) => notify_realtime_update(realtime, server, event.event_id),
             Ok(false) => {}
             Err(err) => {
@@ -257,7 +257,7 @@ impl HarukiEventTracker {
                     character_id,
                     "WB chapter ended, finalizing"
                 );
-                match base.record_ranking_data(true).await {
+                match base.record_ranking_data(true, true).await {
                     Ok(true) => notify_realtime_update(realtime, server, event.event_id),
                     Ok(false) => {}
                     Err(err) => {
@@ -278,6 +278,14 @@ impl HarukiEventTracker {
 
     fn notify_update(&self, event_id: i64) {
         notify_realtime_update(&self.realtime, self.server, event_id);
+    }
+
+    /// Drain the inner tracker's pending write buffer. Called from graceful
+    /// shutdown so buffered samples survive a restart.
+    pub async fn flush_on_shutdown(&mut self) {
+        if let Some(base) = self.inner.as_mut() {
+            base.flush_on_shutdown().await;
+        }
     }
 }
 
@@ -407,7 +415,7 @@ mod tests {
             db,
             RealtimeHub::new(),
             UidAnonymizer::disabled(),
-            3600,
+            TrackerTuning::default(),
             root.to_string_lossy(),
         )
         .unwrap();

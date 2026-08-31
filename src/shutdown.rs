@@ -32,6 +32,13 @@ pub async fn run(
             tracing::error!(%err, "scheduler shutdown failed");
         }
     }
+    // The scheduler is stopped, so the lock is at worst held by one
+    // still-running tick; waiting on it means the flush sees that tick's
+    // samples too.
+    for (server, tracker) in &trackers {
+        tracing::debug!(%server, "flushing tracker before shutdown");
+        tracker.lock().await.flush_on_shutdown().await;
+    }
     drop(trackers);
     drop(state);
     drop(dbs);

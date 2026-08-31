@@ -8,7 +8,11 @@ use std::time::Duration;
 
 use reqwest::header::{HeaderMap, HeaderValue, USER_AGENT};
 
-const DEFAULT_TIMEOUT: Duration = Duration::from_secs(20);
+// The tracker can run at second-level cadence; a hung upstream must fail
+// fast enough to land an error heartbeat and recover the tick rhythm
+// instead of pinning the daemon mutex for tens of skipped ticks.
+const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
+const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 const TOKEN_HEADER: &str = "X-Haruki-Sekai-Token";
 
 #[derive(Debug, Clone)]
@@ -31,6 +35,22 @@ impl HarukiSekaiAPIClient {
     /// the public endpoint and goes into the `X-Haruki-Sekai-Token`
     /// header otherwise.
     pub fn new(api_endpoint: impl Into<String>, authorization: &str) -> Result<Self, BuildError> {
+        Self::with_timeouts(
+            api_endpoint,
+            authorization,
+            DEFAULT_TIMEOUT,
+            DEFAULT_CONNECT_TIMEOUT,
+        )
+    }
+
+    /// `new` with explicit timeouts (a zero duration falls back to the
+    /// default). Wired from the `sekai_api` config section.
+    pub fn with_timeouts(
+        api_endpoint: impl Into<String>,
+        authorization: &str,
+        timeout: Duration,
+        connect_timeout: Duration,
+    ) -> Result<Self, BuildError> {
         let mut headers = HeaderMap::new();
         let ua = format!("Haruki-Event-Tracker/{}", env!("CARGO_PKG_VERSION"));
         headers.insert(
@@ -42,8 +62,19 @@ impl HarukiSekaiAPIClient {
             headers.insert(TOKEN_HEADER, v);
         }
 
+        let timeout = if timeout.is_zero() {
+            DEFAULT_TIMEOUT
+        } else {
+            timeout
+        };
+        let connect_timeout = if connect_timeout.is_zero() {
+            DEFAULT_CONNECT_TIMEOUT
+        } else {
+            connect_timeout
+        };
         let http = reqwest::Client::builder()
-            .timeout(DEFAULT_TIMEOUT)
+            .timeout(timeout)
+            .connect_timeout(connect_timeout)
             .default_headers(headers)
             .build()?;
 
