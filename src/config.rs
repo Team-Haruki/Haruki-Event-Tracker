@@ -142,6 +142,15 @@ impl Default for SekaiApiConfig {
 
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
+pub struct RealtimeConfig {
+    /// Minimum spacing between WebSocket `updated` pushes per topic
+    /// (seconds). Updates inside the window coalesce into one trailing
+    /// push carrying the latest timestamp. `0` pushes every update.
+    pub push_min_interval_secs: u64,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
 pub struct UidAnonymizationConfig {
     pub enabled: bool,
     pub salt: String,
@@ -223,6 +232,7 @@ pub struct Config {
     pub privacy: PrivacyConfig,
     pub toolbox: ToolboxConfig,
     pub backend: BackendConfig,
+    pub realtime: RealtimeConfig,
     pub servers: HashMap<SekaiServerRegion, ServerConfig>,
     #[serde(rename = "sekai_api")]
     pub sekai_api: SekaiApiConfig,

@@ -57,7 +57,9 @@ pub struct AppContext {
 pub async fn build(cfg: &Config) -> Result<AppContext, BootstrapError> {
     let anonymizer = build_anonymizer(cfg)?;
     let private_lookup = PrivateLookupVerifier::from_config(&cfg.toolbox);
-    let realtime = RealtimeHub::new();
+    let realtime = RealtimeHub::with_min_push_interval(std::time::Duration::from_secs(
+        cfg.realtime.push_min_interval_secs,
+    ));
     let tracker_enabled = cfg
         .servers
         .values()
