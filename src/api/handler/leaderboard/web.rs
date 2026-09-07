@@ -100,7 +100,7 @@ pub async fn world_bloom_rank_detail(
     web_rank_detail_for_scope(state, server, event_id, Some(character_id), rank, query).await
 }
 
-#[tracing::instrument(skip(state, query), fields(server, event_id, user_id))]
+#[tracing::instrument(skip(state, query, user_id), fields(server, event_id))]
 pub async fn total_user_detail(
     State(state): State<AppState>,
     Path((server, event_id, user_id)): Path<(String, i64, String)>,
@@ -109,7 +109,7 @@ pub async fn total_user_detail(
     web_user_detail_for_scope(state, server, event_id, None, user_id, query).await
 }
 
-#[tracing::instrument(skip(state, query), fields(server, event_id, character_id, user_id))]
+#[tracing::instrument(skip(state, query, user_id), fields(server, event_id, character_id))]
 pub async fn world_bloom_user_detail(
     State(state): State<AppState>,
     Path((server, event_id, character_id, user_id)): Path<(String, i64, i64, String)>,

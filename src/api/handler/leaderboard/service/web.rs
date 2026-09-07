@@ -166,6 +166,17 @@ pub(crate) async fn web_user_detail_for_scope(
     user_id: String,
     query: WebDetailQuery,
 ) -> Result<Json<WebUserDetailResponseSchema>, ApiError> {
+    let (region, _) = resolve_region_engine(&state, &server)?;
+    let user_id = if user_id.len() <= 20
+        && user_id.bytes().all(|byte| byte.is_ascii_digit())
+        && user_id.parse::<u64>().is_ok_and(|id| id > 0)
+    {
+        state
+            .anonymizer()
+            .public_user_id(region, event_id, &user_id)
+    } else {
+        user_id
+    };
     let trace = build_subject_trace_response(
         state.clone(),
         server.clone(),
@@ -270,6 +281,10 @@ mod tests {
     const WORLD_BLOOM_EVENT: i64 = 812;
 
     async fn test_state() -> AppState {
+        test_state_with_anonymizer(UidAnonymizer::disabled()).await
+    }
+
+    async fn test_state_with_anonymizer(anonymizer: UidAnonymizer) -> AppState {
         let engine = sqlite_engine().await;
         create_event_tables(&engine, SekaiServerRegion::Jp, NORMAL_EVENT, false)
             .await
@@ -283,7 +298,7 @@ mod tests {
             HashMap::from([(SekaiServerRegion::Jp, Arc::new(engine))]),
             None,
             ApiQueryLimiter::new(ApiQueryConfig::default(), [SekaiServerRegion::Jp]),
-            UidAnonymizer::disabled(),
+            anonymizer,
             None,
             RealtimeHub::new(),
             WsTicketStore::default(),
@@ -445,6 +460,35 @@ mod tests {
         assert!(world.current.is_some());
         assert!(world.profile.is_none());
         assert!(world.player_trace.is_empty());
+    }
+
+    #[tokio::test]
+    async fn game_uid_lookup_returns_the_same_anonymous_player_in_total_and_world_bloom() {
+        let state = test_state_with_anonymizer(UidAnonymizer::enabled("test-salt")).await;
+        for (event, chapter) in [(NORMAL_EVENT, None), (WORLD_BLOOM_EVENT, Some(17))] {
+            let public_id = state
+                .anonymizer()
+                .public_user_id(SekaiServerRegion::Jp, event, "100");
+            for input in ["100".to_owned(), public_id.clone()] {
+                let detail = web_user_detail_for_scope(
+                    state.clone(),
+                    "jp".into(),
+                    event,
+                    chapter,
+                    input,
+                    detail_query(),
+                )
+                .await
+                .unwrap()
+                .0;
+                let current = detail.current.unwrap();
+                assert_eq!(
+                    user_id_of_rank_data(&current.rank_data).as_deref(),
+                    Some(public_id.as_str())
+                );
+                assert!(!detail.player_trace.is_empty());
+            }
+        }
     }
 
     #[test]

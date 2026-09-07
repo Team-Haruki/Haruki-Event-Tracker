@@ -34,7 +34,7 @@ GET .../leaderboards/world-bloom/{character_id}/details/rank/{rank}
 GET .../leaderboards/world-bloom/{character_id}/details/user/{user_id}
 ```
 
-`{user_id}` is the public `unique_id`. Query params: `interval`, `at`, `includeTrace`, `includePlayerTrace`, `includeProfile`, `cursor`, `limit` (trace pages are cursor-paginated).
+`{user_id}` accepts either the public `unique_id` or a positive numeric game UID. Numeric UIDs are resolved to the event-specific anonymous ID before querying; responses and detail cache keys still use anonymous IDs. This lookup does not require a Toolbox binding. Query params: `interval`, `at`, `includeTrace`, `includePlayerTrace`, `includeProfile`, `cursor`, `limit` (trace pages are cursor-paginated).
 
 ### Private Details (raw UID)
 
