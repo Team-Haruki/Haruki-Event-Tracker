@@ -1,13 +1,65 @@
-//! `GET /internal/updates` — the writer's update stream (see `crate::cluster`).
+//! `/internal/*` — the writer's update stream (see `crate::cluster`) and the
+//! master-registry webhook.
 
 use axum::extract::State;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
+use serde::Deserialize;
 use tokio::sync::broadcast::error::RecvError;
 
+use crate::api::json::Json;
 use crate::api::state::AppState;
 use crate::cluster::{StreamMessage, bearer_token, token_matches};
+use crate::model::enums::SekaiServerRegion;
+
+/// Body of the master registry's `POST <subscriber>/internal/master-updated`
+/// (`registry.subscribers` in Haruki-Sekai-API). Same shape a SekaiAPI peer
+/// accepts, so the registry needs no tracker-specific case.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MasterUpdatedNotice {
+    pub server: String,
+    #[serde(default)]
+    pub data_version: String,
+}
+
+#[derive(serde::Serialize)]
+struct MasterUpdatedResponse {
+    server: SekaiServerRegion,
+    invalidated: bool,
+}
+
+/// Drop the tracker's cached `events.json` / `worldBlooms.json` for the
+/// region so the next tick re-reads them from the registry instead of
+/// waiting out the stat throttle. Regions without a daemon here answer 200
+/// with `invalidated: false` — the registry fans out to every subscriber
+/// regardless of which regions it tracks.
+pub async fn master_updated(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    axum::Json(notice): axum::Json<MasterUpdatedNotice>,
+) -> Response {
+    if !bearer_token(&headers).is_some_and(|token| token_matches(token, state.cluster_token())) {
+        return (StatusCode::UNAUTHORIZED, "cluster token required").into_response();
+    }
+    let Some(server) = SekaiServerRegion::parse(&notice.server) else {
+        return (StatusCode::BAD_REQUEST, "unknown server").into_response();
+    };
+    let invalidated = match state.master_parser(server) {
+        Some(parser) => {
+            parser.invalidate();
+            tracing::info!(%server, data_version = %notice.data_version, "master data cache invalidated by registry");
+            true
+        }
+        None => false,
+    };
+    Json(MasterUpdatedResponse {
+        server,
+        invalidated,
+    })
+    .into_response()
+}
 
 pub async fn updates(
     State(state): State<AppState>,
@@ -190,6 +242,87 @@ mod tests {
         // Keepalive pings arrive on the configured interval.
         assert_eq!(next_message(&mut socket).await, StreamMessage::Ping);
         socket.send(Message::Close(None)).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn master_updated_webhook_requires_the_token_and_invalidates_parsers() {
+        use crate::tracker::parser::EventDataParser;
+        let dir = std::env::temp_dir().join(format!("tracker-webhook-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("events.json"), "[]").unwrap();
+        std::fs::write(dir.join("worldBlooms.json"), "[]").unwrap();
+        let parser = EventDataParser::new(SekaiServerRegion::Cn, dir.to_str().unwrap()).unwrap();
+        parser.load_event_data().await.unwrap();
+
+        let state = AppState::new(
+            HashMap::new(),
+            None,
+            ApiQueryLimiter::new(ApiQueryConfig::default(), []),
+            UidAnonymizer::enabled("salt"),
+            None,
+            RealtimeHub::new(),
+            WsTicketStore::default(),
+        )
+        .with_cluster(ClusterState {
+            role: ClusterRole::Writer,
+            cluster_token: "secret".into(),
+            update_bus: Some(UpdateBus::new()),
+            master_parsers: HashMap::from([(SekaiServerRegion::Cn, parser.clone())]),
+            ..ClusterState::default()
+        });
+        let (trust, _) = ProxyTrust::from_config(false, &[], "X-Forwarded-For", 1.0, 1000);
+        let router = build_router(state, Arc::new(trust));
+        let post = |token: Option<&str>, body: &str| {
+            let mut req = axum::http::Request::builder()
+                .method("POST")
+                .uri("/internal/master-updated")
+                .header("content-type", "application/json");
+            if let Some(token) = token {
+                req = req.header("authorization", format!("Bearer {token}"));
+            }
+            req.body(axum::body::Body::from(body.to_owned())).unwrap()
+        };
+        use tower::ServiceExt;
+        let body = r#"{"server":"cn","dataVersion":"6.0.0.1"}"#;
+        assert_eq!(
+            router
+                .clone()
+                .oneshot(post(None, body))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        let ok = router
+            .clone()
+            .oneshot(post(Some("secret"), body))
+            .await
+            .unwrap();
+        assert_eq!(ok.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(ok.into_body(), 1024).await.unwrap();
+        assert_eq!(&bytes[..], br#"{"server":"cn","invalidated":true}"#);
+        // The cache was dropped: a re-read hits the file again (bypassing
+        // the 5 s stat throttle) and still parses.
+        std::fs::write(dir.join("events.json"), "[]").unwrap();
+        parser.load_event_data().await.unwrap();
+
+        let other = router
+            .clone()
+            .oneshot(post(Some("secret"), r#"{"server":"jp"}"#))
+            .await
+            .unwrap();
+        assert_eq!(other.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(other.into_body(), 1024).await.unwrap();
+        assert_eq!(&bytes[..], br#"{"server":"jp","invalidated":false}"#);
+        assert_eq!(
+            router
+                .oneshot(post(Some("secret"), r#"{"server":"xx"}"#))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[tokio::test]

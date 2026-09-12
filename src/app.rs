@@ -136,6 +136,14 @@ pub async fn build(cfg: &Config) -> Result<AppContext, BootstrapError> {
     }
     tracing::info!(role = role.as_str(), "cluster role");
 
+    let mut master_parsers = HashMap::new();
+    for (server, tracker) in &trackers {
+        master_parsers.insert(*server, tracker.lock().await.parser());
+    }
+    if !cfg.cluster.token.trim().is_empty() && !master_parsers.is_empty() {
+        tracing::info!("POST /internal/master-updated accepts the registry webhook");
+    }
+
     let query_limiter = ApiQueryLimiter::new(cfg.api_query.clone(), dbs.keys().copied());
     let state = AppState::new(
         dbs.clone(),
@@ -155,6 +163,7 @@ pub async fn build(cfg: &Config) -> Result<AppContext, BootstrapError> {
         )),
         update_bus,
         link,
+        master_parsers,
     });
     Ok(AppContext {
         state,

@@ -77,6 +77,12 @@ impl HarukiEventTracker {
         self.server
     }
 
+    /// Shared handle on the master-data parser (its caches are `Arc`s, so a
+    /// clone invalidates the same cache the daemon reads).
+    pub fn parser(&self) -> EventDataParser {
+        self.parser.clone()
+    }
+
     /// Build a fresh `EventTrackerBase` for the currently-active event and
     /// run its initialization. Mirrors Go `HarukiEventTracker.Init`.
     #[tracing::instrument(skip(self), fields(server = %self.server))]

@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use axum::Router;
 use axum::middleware;
-use axum::routing::get;
+use axum::routing::{get, post};
 use tower_http::CompressionLevel;
 use tower_http::catch_panic::CatchPanicLayer;
 use tower_http::compression::CompressionLayer;
@@ -21,9 +21,14 @@ use crate::api::{cloud_auth, cluster, ws, ws_ticket};
 /// bearer token, web group, WebSocket realtime).
 pub fn build_router(state: AppState, trust: Arc<ProxyTrust>) -> Router {
     let ws_state = (state.clone(), trust.clone());
-    let base = Router::new()
+    let mut base = Router::new()
         .route("/livez", get(health::livez))
         .route("/readyz", get(health::readyz));
+    // Any process that runs tracker daemons can take the registry webhook;
+    // the bearer check inside rejects everything when no token is set.
+    if !state.cluster_token().is_empty() && !state.role().is_reader() {
+        base = base.route("/internal/master-updated", post(cluster::master_updated));
+    }
     let router = if state.role().is_writer() {
         base.route("/internal/updates", get(cluster::updates))
     } else {

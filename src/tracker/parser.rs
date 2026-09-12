@@ -85,6 +85,19 @@ impl EventDataParser {
         self.server
     }
 
+    /// Drop both cached documents so the next tick re-reads them, bypassing
+    /// the stat throttle. Driven by the registry's `master-updated` webhook.
+    pub fn invalidate(&self) {
+        *self
+            .events_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        *self
+            .chapters_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    }
+
     pub async fn load_event_data(&self) -> Result<Arc<Vec<Event>>, ParseError> {
         self.load_json_cached("events.json", &self.events_cache)
             .await

@@ -19,6 +19,7 @@ use crate::db::engine::DatabaseEngine;
 use crate::db::privacy::ensure_user_table_extensions;
 use crate::model::enums::SekaiServerRegion;
 use crate::privacy::UidAnonymizer;
+use crate::tracker::parser::EventDataParser;
 use sea_orm::DbErr;
 use tokio::sync::RwLock;
 
@@ -49,6 +50,9 @@ pub struct ClusterState {
     pub ping_interval: Option<std::time::Duration>,
     pub update_bus: Option<UpdateBus>,
     pub link: Option<Arc<ClusterLink>>,
+    /// Master-data parsers of the tracker daemons running in this process,
+    /// so `POST /internal/master-updated` can drop their caches.
+    pub master_parsers: HashMap<SekaiServerRegion, EventDataParser>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -117,6 +121,10 @@ impl AppState {
 
     pub fn cluster_link(&self) -> Option<&Arc<ClusterLink>> {
         self.inner.cluster.link.as_ref()
+    }
+
+    pub fn master_parser(&self, server: SekaiServerRegion) -> Option<&EventDataParser> {
+        self.inner.cluster.master_parsers.get(&server)
     }
 
     pub fn db(&self, server: SekaiServerRegion) -> Option<&Arc<DatabaseEngine>> {

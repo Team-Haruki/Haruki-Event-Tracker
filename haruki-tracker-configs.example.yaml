@@ -123,7 +123,9 @@ realtime:
 #             绝不执行 DDL；缺列时报错并等待 writer 迁移。
 cluster:
   role: standalone          # standalone | writer | reader
-  token: ""                 # /internal/* 的 bearer；writer 与所有 reader 必须一致
+  token: ""                 # /internal/* 的 bearer；writer 与所有 reader 必须一致；非空时同时开放
+                            # POST /internal/master-updated 供 master registry 的 subscribers 回调
+                            # （各区 master_data_dir 建议指向 registry：http://<registry>:9998/v1/master/<region>/files/）
   writer_url: ""            # reader 必填，例如 http://100.76.159.97:8777（只支持 http）
   replica_wait_ms: 1500     # reader：等待本机热备回放到通知里 LSN 的上限；读主库时设 0
   reconnect_min_secs: 1     # reader：断线重连退避下限
