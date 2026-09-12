@@ -1,7 +1,7 @@
 use serde::Deserialize;
 
 use crate::api::error::ApiError;
-use crate::api::extract::{prepare_user_id_mode, resolve_region_engine};
+use crate::api::extract::{ApiAudience, prepare_audience_user_id_mode, resolve_region_engine};
 use crate::api::handler::web::cached_trace;
 use crate::api::state::AppState;
 use crate::db::engine::DatabaseEngine;
@@ -31,6 +31,7 @@ pub struct SubjectTraceQuery {
     pub(super) limit: Option<u64>,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn build_subject_trace_response(
     state: AppState,
     server: String,
@@ -39,9 +40,16 @@ pub(super) async fn build_subject_trace_response(
     subject: String,
     query: SubjectTraceQuery,
     cache_prefix: &str,
+    audience: ApiAudience,
 ) -> Result<SubjectTraceResponseSchema, ApiError> {
     let subject_type = query.subject_type.as_deref().unwrap_or("user");
     let include_current = query.include_current.unwrap_or(true);
+    // Cloud subjects are raw upstream UIDs; keep those out of the Redis
+    // keyspace by hashing. Web subjects are already public unique_ids.
+    let subject_key = match audience {
+        ApiAudience::Cloud => hashed_subject(&subject),
+        ApiAudience::Web => subject.clone(),
+    };
     let filter = WebTraceFilter {
         start_time: query.start_time,
         end_time: query.end_time,
@@ -50,18 +58,19 @@ pub(super) async fn build_subject_trace_response(
     };
     let suffix = match character_id {
         Some(character_id) => format!(
-            "{cache_prefix}:wb:{character_id}:subject:{subject_type}:{subject}:current={include_current}:start={:?}:end={:?}:cursor={:?}:limit={:?}",
+            "{cache_prefix}:wb:{character_id}:subject:{subject_type}:{subject_key}:current={include_current}:start={:?}:end={:?}:cursor={:?}:limit={:?}",
             filter.start_time, filter.end_time, filter.cursor, filter.limit
         ),
         None => format!(
-            "{cache_prefix}:total:subject:{subject_type}:{subject}:current={include_current}:start={:?}:end={:?}:cursor={:?}:limit={:?}",
+            "{cache_prefix}:total:subject:{subject_type}:{subject_key}:current={include_current}:start={:?}:end={:?}:cursor={:?}:limit={:?}",
             filter.start_time, filter.end_time, filter.cursor, filter.limit
         ),
     };
     let cache_server = server.clone();
     let fetch = async {
         let (region, engine) = resolve_region_engine(&state, &server)?;
-        let mode = prepare_user_id_mode(&state, &engine, region, event_id).await?;
+        let mode =
+            prepare_audience_user_id_mode(&state, &engine, region, event_id, audience).await?;
         let (user_id, resolved_rank, current, subject_kind) = resolve_subject(
             &engine,
             event_id,
@@ -140,6 +149,16 @@ pub(super) async fn build_subject_trace_response(
         })
     };
     cached_trace(&state, &cache_server, event_id, suffix, fetch).await
+}
+
+fn hashed_subject(subject: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(subject.as_bytes());
+    let mut out = String::with_capacity(16);
+    for byte in &digest[..8] {
+        out.push_str(&format!("{byte:02x}"));
+    }
+    out
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

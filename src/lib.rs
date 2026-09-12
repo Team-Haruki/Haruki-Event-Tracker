@@ -1,5 +1,6 @@
 pub mod api;
 pub mod app;
+pub mod cluster;
 pub mod config;
 pub mod db;
 pub mod logger;

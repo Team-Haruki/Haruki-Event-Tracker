@@ -2,7 +2,7 @@ use chrono::{DateTime, Utc};
 use futures::StreamExt;
 use futures::stream;
 
-use crate::api::extract::{prepare_user_id_mode, resolve_region_engine};
+use crate::api::extract::{ApiAudience, prepare_audience_user_id_mode, resolve_region_engine};
 use crate::api::state::AppState;
 use crate::db::query::web::{WebTraceFilter, search_user_trace, search_world_bloom_user_trace};
 use crate::model::api::{CloudRankInfoSchema, RecordedRankData};
@@ -24,7 +24,9 @@ pub(super) async fn enrich_cloud_rank_infos_with_trace_metrics(
     let Ok((region, engine)) = resolve_region_engine(state, server) else {
         return;
     };
-    let Ok(mode) = prepare_user_id_mode(state, &engine, region, event_id).await else {
+    let Ok(mode) =
+        prepare_audience_user_id_mode(state, &engine, region, event_id, ApiAudience::Cloud).await
+    else {
         return;
     };
     let jobs: Vec<(usize, String, i64)> = ranks

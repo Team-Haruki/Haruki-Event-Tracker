@@ -20,6 +20,7 @@ use crate::model::event::{EventStatus, WorldBloomChapterStatus};
 use crate::privacy::UidAnonymizer;
 use crate::sekai_api::client::HarukiSekaiAPIClient;
 use crate::tracker::base::{EventTrackerBase, TrackerError, TrackerTuning};
+use crate::tracker::invalidation::CacheInvalidation;
 use crate::tracker::parser::{EventDataParser, ParseError};
 
 #[derive(Debug, thiserror::Error)]
@@ -36,7 +37,7 @@ pub struct HarukiEventTracker {
     server: SekaiServerRegion,
     api: HarukiSekaiAPIClient,
     redis: redis::aio::ConnectionManager,
-    api_cache_redis: Option<redis::aio::ConnectionManager>,
+    invalidation: CacheInvalidation,
     db: Arc<DatabaseEngine>,
     realtime: RealtimeHub,
     anonymizer: UidAnonymizer,
@@ -51,7 +52,7 @@ impl HarukiEventTracker {
         server: SekaiServerRegion,
         api: HarukiSekaiAPIClient,
         redis: redis::aio::ConnectionManager,
-        api_cache_redis: Option<redis::aio::ConnectionManager>,
+        invalidation: CacheInvalidation,
         db: Arc<DatabaseEngine>,
         realtime: RealtimeHub,
         anonymizer: UidAnonymizer,
@@ -63,7 +64,7 @@ impl HarukiEventTracker {
             parser: EventDataParser::new(server, master_dir)?,
             api,
             redis,
-            api_cache_redis,
+            invalidation,
             db,
             realtime,
             anonymizer,
@@ -93,7 +94,7 @@ impl HarukiEventTracker {
             is_event_ended,
             self.db.clone(),
             self.redis.clone(),
-            self.api_cache_redis.clone(),
+            self.invalidation.clone(),
             self.api.clone(),
             self.anonymizer.clone(),
             self.tuning,
@@ -411,7 +412,7 @@ mod tests {
             SekaiServerRegion::Jp,
             HarukiSekaiAPIClient::new("http://127.0.0.1", "").unwrap(),
             redis,
-            None,
+            CacheInvalidation::Disabled,
             db,
             RealtimeHub::new(),
             UidAnonymizer::disabled(),

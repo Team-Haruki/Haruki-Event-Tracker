@@ -18,15 +18,18 @@ use crate::api::cache::ApiCache;
 use crate::api::limiter::ApiQueryLimiter;
 use crate::api::private_lookup::PrivateLookupVerifier;
 use crate::api::realtime::RealtimeHub;
-use crate::api::state::AppState;
+use crate::api::state::{AppState, ClusterState};
 use crate::api::ws_ticket::WsTicketStore;
-use crate::config::{Config, RedisConfig, ServerConfig};
+use crate::cluster::subscriber::{SubscriberConfig, SubscriberDeps};
+use crate::cluster::{ClusterLink, UpdateBus};
+use crate::config::{ClusterRole, Config, RedisConfig, ServerConfig};
 use crate::db::engine::{DatabaseEngine, EngineError};
 use crate::model::enums::SekaiServerRegion;
 use crate::privacy::UidAnonymizer;
 use crate::sekai_api::client::{BuildError as SekaiClientError, HarukiSekaiAPIClient};
 use crate::tracker::base::TrackerTuning;
 use crate::tracker::daemon::{DaemonError, HarukiEventTracker};
+use crate::tracker::invalidation::CacheInvalidation;
 use crate::tracker::parser::ParseError;
 
 #[derive(Debug, thiserror::Error)]
@@ -45,6 +48,8 @@ pub enum BootstrapError {
     Scheduler(#[from] JobSchedulerError),
     #[error("privacy config: {0}")]
     Privacy(String),
+    #[error("cluster config: {0}")]
+    Cluster(String),
 }
 
 pub struct AppContext {
@@ -55,15 +60,20 @@ pub struct AppContext {
 }
 
 pub async fn build(cfg: &Config) -> Result<AppContext, BootstrapError> {
+    let role = cfg.cluster.role;
+    validate_cluster_config(cfg)?;
     let anonymizer = build_anonymizer(cfg)?;
     let private_lookup = PrivateLookupVerifier::from_config(&cfg.toolbox);
     let realtime = RealtimeHub::with_min_push_interval(std::time::Duration::from_secs(
         cfg.realtime.push_min_interval_secs,
     ));
-    let tracker_enabled = cfg
-        .servers
-        .values()
-        .any(|server_cfg| server_cfg.enabled && server_cfg.tracker.enabled);
+    // A reader never tracks, whatever the per-server flags say.
+    let tracker_enabled = !role.is_reader()
+        && cfg
+            .servers
+            .values()
+            .any(|server_cfg| server_cfg.enabled && server_cfg.tracker.enabled);
+    let update_bus = role.is_writer().then(UpdateBus::new);
 
     let (redis, api) = build_tracker_dependencies(cfg, tracker_enabled).await?;
     let (api_cache, api_cache_redis) = build_api_cache(cfg).await?;
@@ -77,13 +87,15 @@ pub async fn build(cfg: &Config) -> Result<AppContext, BootstrapError> {
         None
     };
 
+    let invalidation = CacheInvalidation::from_parts(api_cache_redis.clone(), update_bus.clone());
     for (server, server_cfg) in &cfg.servers {
         configure_server(
             *server,
             server_cfg,
+            role,
             &redis,
             &api,
-            &api_cache_redis,
+            &invalidation,
             &realtime,
             &anonymizer,
             &scheduler,
@@ -98,6 +110,32 @@ pub async fn build(cfg: &Config) -> Result<AppContext, BootstrapError> {
         tracing::info!("scheduler started");
     }
 
+    let link = role.is_reader().then(|| Arc::new(ClusterLink::default()));
+    if let Some(link) = &link {
+        tokio::spawn(crate::cluster::subscriber::run(
+            SubscriberConfig {
+                writer_url: cfg.cluster.writer_url.clone(),
+                token: cfg.cluster.token.clone(),
+                replica_wait: std::time::Duration::from_millis(cfg.cluster.replica_wait_ms),
+                reconnect_min: std::time::Duration::from_secs(cfg.cluster.reconnect_min_secs),
+                reconnect_max: std::time::Duration::from_secs(cfg.cluster.reconnect_max_secs),
+            },
+            SubscriberDeps {
+                dbs: dbs.clone(),
+                api_cache_redis: api_cache_redis.clone(),
+                realtime: realtime.clone(),
+                link: link.clone(),
+            },
+        ));
+        tracing::info!(writer_url = %cfg.cluster.writer_url, "cluster reader subscribing to writer");
+    }
+    if role.serves_api() && cfg.cloud_api.tokens.is_empty() {
+        tracing::warn!(
+            "cloud_api.tokens is empty; /api/v2/cloud/* is open to anyone who can reach it"
+        );
+    }
+    tracing::info!(role = role.as_str(), "cluster role");
+
     let query_limiter = ApiQueryLimiter::new(cfg.api_query.clone(), dbs.keys().copied());
     let state = AppState::new(
         dbs.clone(),
@@ -107,7 +145,17 @@ pub async fn build(cfg: &Config) -> Result<AppContext, BootstrapError> {
         private_lookup,
         realtime,
         WsTicketStore::default(),
-    );
+    )
+    .with_cluster(ClusterState {
+        role,
+        cluster_token: cfg.cluster.token.clone(),
+        cloud_tokens: cfg.cloud_api.tokens.clone(),
+        ping_interval: Some(std::time::Duration::from_secs(
+            cfg.cluster.ping_interval_secs.max(1),
+        )),
+        update_bus,
+        link,
+    });
     Ok(AppContext {
         state,
         dbs,
@@ -170,13 +218,65 @@ async fn build_api_cache(
     ))
 }
 
+/// Role invariants that are cheaper to reject at boot than to debug live.
+fn validate_cluster_config(cfg: &Config) -> Result<(), BootstrapError> {
+    let cluster = &cfg.cluster;
+    match cluster.role {
+        ClusterRole::Standalone => Ok(()),
+        ClusterRole::Writer => {
+            if cluster.token.trim().is_empty() {
+                return Err(BootstrapError::Cluster(
+                    "cluster.token is required for role writer".into(),
+                ));
+            }
+            if !cfg.privacy.uid_anonymization.enabled {
+                return Err(BootstrapError::Cluster(
+                    "role writer requires privacy.uid_anonymization.enabled so every user \
+                     gets a unique_id at write time"
+                        .into(),
+                ));
+            }
+            let idle: Vec<_> = cfg
+                .servers
+                .iter()
+                .filter(|(_, server)| server.enabled && !server.tracker.enabled)
+                .map(|(region, _)| region.to_string())
+                .collect();
+            if !idle.is_empty() {
+                tracing::warn!(servers = ?idle, "writer has enabled servers without a tracker");
+            }
+            Ok(())
+        }
+        ClusterRole::Reader => {
+            if cluster.token.trim().is_empty() || cluster.writer_url.trim().is_empty() {
+                return Err(BootstrapError::Cluster(
+                    "cluster.token and cluster.writer_url are required for role reader".into(),
+                ));
+            }
+            crate::cluster::subscriber::stream_url(&cluster.writer_url)
+                .map_err(|err| BootstrapError::Cluster(err.to_string()))?;
+            let tracking: Vec<_> = cfg
+                .servers
+                .iter()
+                .filter(|(_, server)| server.enabled && server.tracker.enabled)
+                .map(|(region, _)| region.to_string())
+                .collect();
+            if !tracking.is_empty() {
+                tracing::warn!(servers = ?tracking, "role reader ignores tracker.enabled");
+            }
+            Ok(())
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn configure_server(
     server: SekaiServerRegion,
     server_cfg: &ServerConfig,
+    role: ClusterRole,
     redis: &Option<redis::aio::ConnectionManager>,
     api: &Option<HarukiSekaiAPIClient>,
-    api_cache_redis: &Option<redis::aio::ConnectionManager>,
+    invalidation: &CacheInvalidation,
     realtime: &RealtimeHub,
     anonymizer: &UidAnonymizer,
     scheduler: &Option<JobScheduler>,
@@ -187,11 +287,15 @@ async fn configure_server(
         tracing::info!(%server, "server disabled, skipping");
         return Ok(());
     }
-    tracing::info!(%server, "connecting database");
-    let engine = Arc::new(DatabaseEngine::connect(&server_cfg.db).await?);
+    tracing::info!(%server, read_only = role.is_reader(), "connecting database");
+    let engine = Arc::new(
+        DatabaseEngine::connect(&server_cfg.db)
+            .await?
+            .with_read_only(role.is_reader()),
+    );
     dbs.insert(server, engine.clone());
 
-    if !server_cfg.tracker.enabled {
+    if !server_cfg.tracker.enabled || role.is_reader() {
         return Ok(());
     }
     let mut daemon = HarukiEventTracker::new(
@@ -203,7 +307,7 @@ async fn configure_server(
             .as_ref()
             .expect("redis is initialized when any tracker is enabled")
             .clone(),
-        api_cache_redis.clone(),
+        invalidation.clone(),
         engine,
         realtime.clone(),
         anonymizer.clone(),
@@ -373,9 +477,10 @@ mod tests {
         configure_server(
             SekaiServerRegion::En,
             &ServerConfig::default(),
+            ClusterRole::Standalone,
             &None,
             &None,
-            &None,
+            &CacheInvalidation::Disabled,
             &RealtimeHub::new(),
             &UidAnonymizer::disabled(),
             &None,

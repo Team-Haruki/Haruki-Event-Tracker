@@ -140,6 +140,86 @@ impl Default for SekaiApiConfig {
     }
 }
 
+/// Which part of the tracker cluster this process is.
+///
+/// `standalone` is the pre-cluster single-node deployment (tracks and serves
+/// from one process). `writer` only tracks and fans updates out over
+/// `/internal/updates`; `reader` only serves the API, subscribes to a writer,
+/// and treats its database as read-only (it may be a streaming replica).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ClusterRole {
+    #[default]
+    Standalone,
+    Writer,
+    Reader,
+}
+
+impl ClusterRole {
+    pub fn is_writer(self) -> bool {
+        matches!(self, Self::Writer)
+    }
+
+    pub fn is_reader(self) -> bool {
+        matches!(self, Self::Reader)
+    }
+
+    pub fn serves_api(self) -> bool {
+        !self.is_writer()
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Standalone => "standalone",
+            Self::Writer => "writer",
+            Self::Reader => "reader",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct ClusterConfig {
+    pub role: ClusterRole,
+    /// Bearer token for `/internal/*`; readers present it when dialing the
+    /// writer's update stream.
+    pub token: String,
+    /// Reader only: base URL of the writer, e.g. `http://100.76.159.97:8777`.
+    pub writer_url: String,
+    /// Reader only: how long to wait for the local replica to replay the
+    /// LSN carried by an update before invalidating caches. `0` disables the
+    /// wait (use it when the reader queries the primary directly).
+    pub replica_wait_ms: u64,
+    /// Reader only: reconnect backoff bounds for the update stream.
+    pub reconnect_min_secs: u64,
+    pub reconnect_max_secs: u64,
+    /// Writer only: keepalive ping interval on the update stream.
+    pub ping_interval_secs: u64,
+}
+
+impl Default for ClusterConfig {
+    fn default() -> Self {
+        Self {
+            role: ClusterRole::Standalone,
+            token: String::new(),
+            writer_url: String::new(),
+            replica_wait_ms: 1500,
+            reconnect_min_secs: 1,
+            reconnect_max_secs: 30,
+            ping_interval_secs: 15,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct CloudApiConfig {
+    /// Bearer tokens accepted on `/api/v2/cloud/*`. A non-empty list makes
+    /// the token mandatory; an empty list keeps the group open (logged at
+    /// startup) for pre-cluster deployments.
+    pub tokens: Vec<String>,
+}
+
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 pub struct RealtimeConfig {
@@ -233,6 +313,8 @@ pub struct Config {
     pub toolbox: ToolboxConfig,
     pub backend: BackendConfig,
     pub realtime: RealtimeConfig,
+    pub cluster: ClusterConfig,
+    pub cloud_api: CloudApiConfig,
     pub servers: HashMap<SekaiServerRegion, ServerConfig>,
     #[serde(rename = "sekai_api")]
     pub sekai_api: SekaiApiConfig,
@@ -328,6 +410,10 @@ mod tests {
     #[test]
     fn defaults_match_runtime_expectations() {
         let cfg = Config::default();
+        assert_eq!(cfg.cluster.role, ClusterRole::Standalone);
+        assert!(cfg.cluster.token.is_empty());
+        assert_eq!(cfg.cluster.replica_wait_ms, 1500);
+        assert!(cfg.cloud_api.tokens.is_empty());
         assert!(!cfg.api_cache.enabled);
         assert_eq!(cfg.api_cache.pool_size, 2);
         assert_eq!(cfg.api_cache.default_ttl_secs, 2);
@@ -359,6 +445,29 @@ servers:
         assert!(cfg.api_cache.enabled);
         assert!(cfg.servers[&SekaiServerRegion::Jp].enabled);
         std::fs::remove_file(&path).unwrap();
+
+        let cluster = temp_config(
+            "cluster",
+            r#"
+cluster:
+  role: reader
+  token: secret
+  writer_url: http://writer:8777
+  replica_wait_ms: 0
+cloud_api:
+  tokens: ["a", "b"]
+"#,
+        );
+        let cfg = load_from_file(&cluster).unwrap();
+        assert_eq!(cfg.cluster.role, ClusterRole::Reader);
+        assert!(cfg.cluster.role.is_reader());
+        assert!(cfg.cluster.role.serves_api());
+        assert!(!ClusterRole::Writer.serves_api());
+        assert_eq!(ClusterRole::Writer.as_str(), "writer");
+        assert_eq!(cfg.cluster.writer_url, "http://writer:8777");
+        assert_eq!(cfg.cluster.replica_wait_ms, 0);
+        assert_eq!(cfg.cloud_api.tokens, vec!["a", "b"]);
+        std::fs::remove_file(&cluster).unwrap();
 
         assert!(matches!(
             load_from_file(&path),

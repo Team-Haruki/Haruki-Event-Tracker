@@ -21,6 +21,9 @@ pub enum EngineError {
 pub struct DatabaseEngine {
     conn: DatabaseConnection,
     backend: DatabaseBackend,
+    /// Set on cluster readers: the database may be a streaming replica, so
+    /// lazy migrations must never issue DDL/DML through this engine.
+    read_only: bool,
 }
 
 impl DatabaseEngine {
@@ -52,7 +55,20 @@ impl DatabaseEngine {
         let conn = Database::connect(opts)
             .await
             .map_err(EngineError::Connect)?;
-        Ok(Self { conn, backend })
+        Ok(Self {
+            conn,
+            backend,
+            read_only: false,
+        })
+    }
+
+    pub fn with_read_only(mut self, read_only: bool) -> Self {
+        self.read_only = read_only;
+        self
+    }
+
+    pub fn is_read_only(&self) -> bool {
+        self.read_only
     }
 
     pub fn conn(&self) -> &DatabaseConnection {
@@ -65,7 +81,11 @@ impl DatabaseEngine {
 
     #[cfg(test)]
     pub(crate) fn from_connection(conn: DatabaseConnection, backend: DatabaseBackend) -> Self {
-        Self { conn, backend }
+        Self {
+            conn,
+            backend,
+            read_only: false,
+        }
     }
 
     pub async fn ping(&self) -> Result<(), DbErr> {

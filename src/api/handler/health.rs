@@ -8,6 +8,8 @@ use tokio::time;
 
 use crate::api::json::Json;
 use crate::api::state::AppState;
+use crate::cluster::ClusterLinkStatus;
+use crate::db::replication::replication_lag_secs;
 
 const DB_PING_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -17,17 +19,27 @@ pub struct LiveResponse {
 }
 
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ReadyResponse {
     status: &'static str,
+    role: &'static str,
     databases: Vec<DatabaseStatus>,
+    /// Reader only: state of the subscription to the writer. A dropped
+    /// link does not fail readiness — cache TTLs still bound staleness.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    updates: Option<ClusterLinkStatus>,
 }
 
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct DatabaseStatus {
     server: String,
     status: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
+    /// Reader on a streaming replica: seconds behind the primary.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    replication_lag_secs: Option<f64>,
 }
 
 pub async fn livez() -> Json<LiveResponse> {
@@ -35,17 +47,31 @@ pub async fn livez() -> Json<LiveResponse> {
 }
 
 pub async fn readyz(State(state): State<AppState>) -> Response {
+    let reader = state.role().is_reader();
     let checks = state.dbs().map(|(server, db)| async move {
         match time::timeout(DB_PING_TIMEOUT, db.ping()).await {
-            Ok(Ok(())) => DatabaseStatus {
-                server: server.to_string(),
-                status: "ok",
-                error: None,
-            },
+            Ok(Ok(())) => {
+                let replication_lag_secs = if reader {
+                    time::timeout(DB_PING_TIMEOUT, replication_lag_secs(&db))
+                        .await
+                        .ok()
+                        .and_then(Result::ok)
+                        .flatten()
+                } else {
+                    None
+                };
+                DatabaseStatus {
+                    server: server.to_string(),
+                    status: "ok",
+                    error: None,
+                    replication_lag_secs,
+                }
+            }
             Ok(Err(err)) => DatabaseStatus {
                 server: server.to_string(),
                 status: "error",
                 error: Some(err.to_string()),
+                replication_lag_secs: None,
             },
             Err(_) => DatabaseStatus {
                 server: server.to_string(),
@@ -54,6 +80,7 @@ pub async fn readyz(State(state): State<AppState>) -> Response {
                     "database ping timed out after {}s",
                     DB_PING_TIMEOUT.as_secs()
                 )),
+                replication_lag_secs: None,
             },
         }
     });
@@ -67,7 +94,9 @@ pub async fn readyz(State(state): State<AppState>) -> Response {
     };
     let body = Json(ReadyResponse {
         status: if ready { "ok" } else { "error" },
+        role: state.role().as_str(),
         databases,
+        updates: state.cluster_link().map(|link| link.status()),
     });
     (status, body).into_response()
 }

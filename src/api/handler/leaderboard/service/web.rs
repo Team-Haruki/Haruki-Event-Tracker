@@ -1,12 +1,14 @@
 use serde::Deserialize;
 
 use crate::api::error::ApiError;
-use crate::api::extract::{prepare_user_id_mode, resolve_region_engine};
+use crate::api::extract::{ApiAudience, prepare_audience_user_id_mode, resolve_region_engine};
 use crate::api::handler::web::{build_overview, build_world_bloom_overview, cached_overview_bytes};
 use crate::api::json::{EncodedJson, Json};
 use crate::api::state::AppState;
+use crate::db::query::user::resolve_unique_id_by_raw;
 use crate::model::api::{
-    LeaderboardOverviewSchema, WebRankDetailResponseSchema, WebUserDetailResponseSchema,
+    LeaderboardOverviewSchema, RecordedRankData, WebRankDetailResponseSchema, WebRankingItemSchema,
+    WebSubjectSchema, WebUserDetailResponseSchema,
 };
 
 use super::snapshot::{SnapshotBuildRequest, build_rank_snapshots_response};
@@ -20,7 +22,7 @@ pub struct OverviewQuery {
     at: Option<i64>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WebDetailQuery {
     interval: Option<i64>,
@@ -30,6 +32,23 @@ pub struct WebDetailQuery {
     include_profile: Option<bool>,
     cursor: Option<i64>,
     limit: Option<u64>,
+    /// `details/user/{id}` only: `unique` (default) or `uid` to look the
+    /// player up by raw upstream UID.
+    id_type: Option<String>,
+    /// `check-room` only: the raw upstream UID to look up.
+    user_id: Option<String>,
+}
+
+const MAX_RAW_UID_LEN: usize = 30;
+
+fn validate_raw_uid(raw: &str) -> Result<&str, ApiError> {
+    let raw = raw.trim();
+    if raw.is_empty() || raw.len() > MAX_RAW_UID_LEN || !raw.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(ApiError::BadRequest(
+            "userId must be a numeric upstream uid".into(),
+        ));
+    }
+    Ok(raw)
 }
 
 pub(crate) async fn web_overview_for_scope(
@@ -53,7 +72,9 @@ pub(crate) async fn web_overview_for_scope(
     let cache_server = server.clone();
     let fetch = async {
         let (region, engine) = resolve_region_engine(&state, &server)?;
-        let mode = prepare_user_id_mode(&state, &engine, region, event_id).await?;
+        let mode =
+            prepare_audience_user_id_mode(&state, &engine, region, event_id, ApiAudience::Web)
+                .await?;
         let overview = match character_id {
             Some(character_id) => {
                 build_world_bloom_overview(&engine, event_id, character_id, mode, interval, at)
@@ -105,6 +126,7 @@ pub(crate) async fn web_rank_detail_for_scope(
             interval,
             at,
             cache_prefix: "web:v2",
+            audience: ApiAudience::Web,
         },
     )
     .await?;
@@ -123,6 +145,7 @@ pub(crate) async fn web_rank_detail_for_scope(
             rank.to_string(),
             detail_trace_query(&query, "rank"),
             "web:v2",
+            ApiAudience::Web,
         )
         .await?
         .rank_data;
@@ -140,6 +163,7 @@ pub(crate) async fn web_rank_detail_for_scope(
             user_id,
             detail_trace_query(&query, "user"),
             "web:v2",
+            ApiAudience::Web,
         )
         .await?
         .rank_data;
@@ -158,7 +182,115 @@ pub(crate) async fn web_rank_detail_for_scope(
     }))
 }
 
+/// `details/user/{id}`: `id` is a public `unique_id` unless
+/// `idType=uid`, in which case it is a raw upstream UID and the response
+/// reveals that one player's raw UID (see `web_user_detail_by_raw_uid`).
 pub(crate) async fn web_user_detail_for_scope(
+    state: AppState,
+    server: String,
+    event_id: i64,
+    character_id: Option<i64>,
+    user_id: String,
+    query: WebDetailQuery,
+) -> Result<Json<WebUserDetailResponseSchema>, ApiError> {
+    match query.id_type.as_deref().map(str::trim) {
+        None | Some("") | Some("unique") => {
+            web_user_detail_by_unique_id(state, server, event_id, character_id, user_id, query)
+                .await
+        }
+        Some("uid") => {
+            web_user_detail_by_raw_uid(state, server, event_id, character_id, user_id, query).await
+        }
+        Some(other) => Err(ApiError::BadRequest(format!(
+            "idType must be unique or uid, got {other}"
+        ))),
+    }
+}
+
+/// `check-room?userId=<raw uid>`: the web counterpart of the cloud
+/// check-room, keyed by the exact upstream UID the caller typed.
+pub(crate) async fn web_check_room_for_scope(
+    state: AppState,
+    server: String,
+    event_id: i64,
+    character_id: Option<i64>,
+    query: WebDetailQuery,
+) -> Result<Json<WebUserDetailResponseSchema>, ApiError> {
+    let raw = query
+        .user_id
+        .clone()
+        .ok_or_else(|| ApiError::BadRequest("userId is required".into()))?;
+    web_user_detail_by_raw_uid(state, server, event_id, character_id, raw, query).await
+}
+
+/// Resolve the raw UID to its `unique_id`, serve the ordinary (cached,
+/// anonymized) user detail for it, then swap the raw UID back in for the
+/// subject only. Neighbours and the cache never see the raw value.
+async fn web_user_detail_by_raw_uid(
+    state: AppState,
+    server: String,
+    event_id: i64,
+    character_id: Option<i64>,
+    raw_user_id: String,
+    query: WebDetailQuery,
+) -> Result<Json<WebUserDetailResponseSchema>, ApiError> {
+    let raw = validate_raw_uid(&raw_user_id)?.to_owned();
+    let (region, engine) = resolve_region_engine(&state, &server)?;
+    prepare_audience_user_id_mode(&state, &engine, region, event_id, ApiAudience::Web).await?;
+    let unique_id = resolve_unique_id_by_raw(&engine, event_id, &raw)
+        .await?
+        .ok_or(ApiError::NotFound)?;
+    let Json(mut detail) = web_user_detail_by_unique_id(
+        state,
+        server,
+        event_id,
+        character_id,
+        unique_id.clone(),
+        query,
+    )
+    .await?;
+    reveal_subject(&mut detail, &unique_id, &raw);
+    detail.subject = Some(WebSubjectSchema {
+        user_id: raw,
+        unique_id,
+    });
+    Ok(Json(detail))
+}
+
+fn reveal_subject(detail: &mut WebUserDetailResponseSchema, unique_id: &str, raw: &str) {
+    if let Some(current) = detail.current.as_mut() {
+        reveal_item(current, unique_id, raw);
+    }
+    for row in &mut detail.player_trace {
+        reveal_rank_data(row, unique_id, raw);
+    }
+    if let Some(profile) = detail.profile.as_mut()
+        && profile.user_id == unique_id
+    {
+        profile.user_id = raw.to_owned();
+    }
+}
+
+fn reveal_item(item: &mut WebRankingItemSchema, unique_id: &str, raw: &str) {
+    reveal_rank_data(&mut item.rank_data, unique_id, raw);
+    if let Some(user) = item.user_data.as_mut()
+        && user.user_id == unique_id
+    {
+        user.user_id = raw.to_owned();
+    }
+}
+
+fn reveal_rank_data(data: &mut RecordedRankData, unique_id: &str, raw: &str) {
+    let user_id = match data {
+        RecordedRankData::Normal(row) => &mut row.user_id,
+        RecordedRankData::WorldBloom(row) => &mut row.user_id,
+    };
+    if user_id == unique_id {
+        *user_id = raw.to_owned();
+    }
+}
+
+async fn web_user_detail_by_unique_id(
     state: AppState,
     server: String,
     event_id: i64,
@@ -181,6 +313,7 @@ pub(crate) async fn web_user_detail_for_scope(
             limit: Some(1),
         },
         "web:v2",
+        ApiAudience::Web,
     )
     .await?;
     let current = trace.current;
@@ -200,6 +333,7 @@ pub(crate) async fn web_user_detail_for_scope(
             interval: interval_seconds(query.interval),
             at: positive_timestamp(query.at),
             cache_prefix: "web:v2",
+            audience: ApiAudience::Web,
         },
     )
     .await?;
@@ -217,6 +351,7 @@ pub(crate) async fn web_user_detail_for_scope(
             user_id,
             detail_trace_query(&query, "user"),
             "web:v2",
+            ApiAudience::Web,
         )
         .await?
         .rank_data
@@ -225,6 +360,7 @@ pub(crate) async fn web_user_detail_for_scope(
     };
     Ok(Json(WebUserDetailResponseSchema {
         meta: snapshot.meta,
+        subject: None,
         current: item.current,
         previous: item.previous,
         next: item.next,
@@ -283,11 +419,17 @@ mod tests {
             HashMap::from([(SekaiServerRegion::Jp, Arc::new(engine))]),
             None,
             ApiQueryLimiter::new(ApiQueryConfig::default(), [SekaiServerRegion::Jp]),
-            UidAnonymizer::disabled(),
+            UidAnonymizer::enabled("salt"),
             None,
             RealtimeHub::new(),
             WsTicketStore::default(),
         )
+    }
+
+    fn unique(state: &AppState, event_id: i64, raw: &str) -> String {
+        state
+            .anonymizer()
+            .public_user_id(SekaiServerRegion::Jp, event_id, raw)
     }
 
     fn detail_query() -> WebDetailQuery {
@@ -299,6 +441,7 @@ mod tests {
             include_profile: Some(true),
             cursor: None,
             limit: Some(10),
+            ..WebDetailQuery::default()
         }
     }
 
@@ -418,25 +561,27 @@ mod tests {
             "jp".into(),
             NORMAL_EVENT,
             None,
-            "100".into(),
+            unique(&state, NORMAL_EVENT, "100"),
             detail_query(),
         )
         .await
         .unwrap()
         .0;
         assert!(detail.current.is_some());
+        assert!(detail.subject.is_none());
         assert_eq!(detail.profile.unwrap().name, "Alpha");
         assert_eq!(detail.player_trace.len(), 2);
 
         let mut without_trace = detail_query();
         without_trace.include_trace = Some(false);
         without_trace.include_profile = Some(false);
+        let world_unique = unique(&state, WORLD_BLOOM_EVENT, "100");
         let world = web_user_detail_for_scope(
             state,
             "jp".into(),
             WORLD_BLOOM_EVENT,
             Some(17),
-            "100".into(),
+            world_unique,
             without_trace,
         )
         .await
@@ -445,6 +590,108 @@ mod tests {
         assert!(world.current.is_some());
         assert!(world.profile.is_none());
         assert!(world.player_trace.is_empty());
+    }
+
+    fn user_id_of(item: &WebRankingItemSchema) -> String {
+        user_id_of_rank_data(&item.rank_data).unwrap()
+    }
+
+    #[tokio::test]
+    async fn raw_uid_lookups_reveal_only_the_subject() {
+        let state = test_state().await;
+        let expected_unique = unique(&state, NORMAL_EVENT, "100");
+        let mut query = detail_query();
+        query.user_id = Some("100".into());
+        let detail =
+            web_check_room_for_scope(state.clone(), "jp".into(), NORMAL_EVENT, None, query)
+                .await
+                .unwrap()
+                .0;
+        let subject = detail.subject.clone().unwrap();
+        assert_eq!(subject.user_id, "100");
+        assert_eq!(subject.unique_id, expected_unique);
+        let current = detail.current.as_ref().unwrap();
+        assert_eq!(user_id_of(current), "100");
+        assert_eq!(current.user_data.as_ref().unwrap().user_id, "100");
+        assert_eq!(detail.profile.as_ref().unwrap().user_id, "100");
+        assert!(
+            detail
+                .player_trace
+                .iter()
+                .all(|row| { user_id_of_rank_data(row).as_deref() == Some("100") })
+        );
+        // Neighbours stay anonymized: never the raw form, never the subject.
+        for neighbour in [detail.previous.as_ref(), detail.next.as_ref()]
+            .into_iter()
+            .flatten()
+        {
+            let id = user_id_of(neighbour);
+            assert_ne!(id, "100");
+            assert!(!id.bytes().all(|b| b.is_ascii_digit()), "{id}");
+        }
+
+        // `details/user/{raw}?idType=uid` is the same lookup.
+        let mut by_type = detail_query();
+        by_type.id_type = Some("uid".into());
+        let via_detail = web_user_detail_for_scope(
+            state.clone(),
+            "jp".into(),
+            NORMAL_EVENT,
+            None,
+            "100".into(),
+            by_type,
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(via_detail.subject, detail.subject);
+
+        // World Bloom scope resolves through the same users table.
+        let mut world = detail_query();
+        world.user_id = Some("100".into());
+        let world_detail = web_check_room_for_scope(
+            state.clone(),
+            "jp".into(),
+            WORLD_BLOOM_EVENT,
+            Some(17),
+            world,
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(world_detail.subject.unwrap().user_id, "100");
+
+        // Validation and misses.
+        let mut missing = detail_query();
+        missing.user_id = Some("424242".into());
+        assert!(matches!(
+            web_check_room_for_scope(state.clone(), "jp".into(), NORMAL_EVENT, None, missing).await,
+            Err(ApiError::NotFound)
+        ));
+        let mut bad = detail_query();
+        bad.user_id = Some("not-a-uid".into());
+        assert!(matches!(
+            web_check_room_for_scope(state.clone(), "jp".into(), NORMAL_EVENT, None, bad).await,
+            Err(ApiError::BadRequest(_))
+        ));
+        assert!(matches!(
+            web_check_room_for_scope(
+                state.clone(),
+                "jp".into(),
+                NORMAL_EVENT,
+                None,
+                detail_query()
+            )
+            .await,
+            Err(ApiError::BadRequest(_))
+        ));
+        let mut bogus = detail_query();
+        bogus.id_type = Some("bogus".into());
+        assert!(matches!(
+            web_user_detail_for_scope(state, "jp".into(), NORMAL_EVENT, None, "100".into(), bogus)
+                .await,
+            Err(ApiError::BadRequest(_))
+        ));
     }
 
     #[test]
@@ -457,6 +704,7 @@ mod tests {
             include_profile: None,
             cursor: Some(1_786_726_540),
             limit: Some(5_000),
+            ..WebDetailQuery::default()
         };
 
         let trace_query = detail_trace_query(&query, "user");

@@ -36,6 +36,17 @@ GET .../leaderboards/world-bloom/{character_id}/details/user/{user_id}
 
 `{user_id}` is the public `unique_id`. Query params: `interval`, `at`, `includeTrace`, `includePlayerTrace`, `includeProfile`, `cursor`, `limit` (trace pages are cursor-paginated).
 
+### Exact UID Lookup (check-room)
+
+```text
+GET .../leaderboards/total/check-room?userId={raw_uid}
+GET .../leaderboards/world-bloom/{character_id}/check-room?userId={raw_uid}
+GET .../leaderboards/total/details/user/{raw_uid}?idType=uid
+GET .../leaderboards/world-bloom/{character_id}/details/user/{raw_uid}?idType=uid
+```
+
+The one deliberate exception to "web never accepts a raw UID": the caller types an exact upstream UID and gets that player's current rank with neighbours, using the same query params as the user detail. The response is the user detail shape plus a `subject` block (`{"userId": "<raw>", "uniqueId": "<unique_id>"}`); the subject's own `userId` fields (current row, trace rows, profile) are the raw UID, while `previous` / `next` and every other player stay `unique_id`. The raw UID is validated as a ≤30-digit number, resolved to `unique_id` with one indexed lookup, and never enters cache keys or tracing fields. 404 when the UID is not tracked in that event.
+
 ### Private Details (raw UID)
 
 ```text
@@ -149,7 +160,8 @@ Existing historical tables receive user/profile column lazy migration through th
 
 ## Privacy Defaults
 
-- Public website APIs should only accept and return `unique_id`.
+- Public website APIs should only accept and return `unique_id`; the exact-UID check-room above is the sole opt-in exception and reveals only the queried player.
+- `privacy.uid_anonymization.enabled` is mandatory on cluster writers so every user gets a `unique_id` at write time; the cloud group (`/api/v2/cloud/*`, bearer-token gated via `cloud_api.tokens`) keeps speaking raw UIDs regardless of that switch.
 - Raw UID remains internal database data for deduplication and maintenance.
 - `twitterId` should stay out of persistence and API responses unless a separate privacy review approves it.
 - Logs and cache keys for web endpoints should use public IDs and query filters only.
