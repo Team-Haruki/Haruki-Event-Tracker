@@ -5,7 +5,6 @@ use crate::api::extract::{ApiAudience, prepare_audience_user_id_mode, resolve_re
 use crate::api::handler::web::{build_overview, build_world_bloom_overview, cached_overview_bytes};
 use crate::api::json::{EncodedJson, Json};
 use crate::api::state::AppState;
-use crate::db::query::user::resolve_unique_id_by_raw;
 use crate::model::api::{
     LeaderboardOverviewSchema, RecordedRankData, WebRankDetailResponseSchema, WebRankingItemSchema,
     WebSubjectSchema, WebUserDetailResponseSchema,
@@ -40,6 +39,14 @@ pub struct WebDetailQuery {
 }
 
 const MAX_RAW_UID_LEN: usize = 30;
+
+fn looks_like_raw_uid(value: &str) -> bool {
+    let value = value.trim();
+    !value.is_empty()
+        && value.len() <= MAX_RAW_UID_LEN
+        && value.bytes().all(|b| b.is_ascii_digit())
+        && value.parse::<u128>().is_ok_and(|id| id > 0)
+}
 
 fn validate_raw_uid(raw: &str) -> Result<&str, ApiError> {
     let raw = raw.trim();
@@ -193,17 +200,22 @@ pub(crate) async fn web_user_detail_for_scope(
     user_id: String,
     query: WebDetailQuery,
 ) -> Result<Json<WebUserDetailResponseSchema>, ApiError> {
-    match query.id_type.as_deref().map(str::trim) {
-        None | Some("") | Some("unique") => {
-            web_user_detail_by_unique_id(state, server, event_id, character_id, user_id, query)
-                .await
+    let by_raw_uid = match query.id_type.as_deref().map(str::trim) {
+        // A bare numeric id can only be a game UID (unique_ids are hex
+        // digests), so it is treated as an explicit raw lookup.
+        None | Some("") => looks_like_raw_uid(&user_id),
+        Some("unique") => false,
+        Some("uid") => true,
+        Some(other) => {
+            return Err(ApiError::BadRequest(format!(
+                "idType must be unique or uid, got {other}"
+            )));
         }
-        Some("uid") => {
-            web_user_detail_by_raw_uid(state, server, event_id, character_id, user_id, query).await
-        }
-        Some(other) => Err(ApiError::BadRequest(format!(
-            "idType must be unique or uid, got {other}"
-        ))),
+    };
+    if by_raw_uid {
+        web_user_detail_by_raw_uid(state, server, event_id, character_id, user_id, query).await
+    } else {
+        web_user_detail_by_unique_id(state, server, event_id, character_id, user_id, query).await
     }
 }
 
@@ -223,9 +235,10 @@ pub(crate) async fn web_check_room_for_scope(
     web_user_detail_by_raw_uid(state, server, event_id, character_id, raw, query).await
 }
 
-/// Resolve the raw UID to its `unique_id`, serve the ordinary (cached,
-/// anonymized) user detail for it, then swap the raw UID back in for the
-/// subject only. Neighbours and the cache never see the raw value.
+/// Map the raw UID to its `unique_id` (the anonymizer is deterministic, so
+/// no lookup is needed), serve the ordinary cached anonymized user detail
+/// for it, then swap the raw UID back in for the subject only. Neighbours
+/// and the cache never see the raw value; an untracked UID is a plain 404.
 async fn web_user_detail_by_raw_uid(
     state: AppState,
     server: String,
@@ -235,11 +248,13 @@ async fn web_user_detail_by_raw_uid(
     query: WebDetailQuery,
 ) -> Result<Json<WebUserDetailResponseSchema>, ApiError> {
     let raw = validate_raw_uid(&raw_user_id)?.to_owned();
-    let (region, engine) = resolve_region_engine(&state, &server)?;
-    prepare_audience_user_id_mode(&state, &engine, region, event_id, ApiAudience::Web).await?;
-    let unique_id = resolve_unique_id_by_raw(&engine, event_id, &raw)
-        .await?
-        .ok_or(ApiError::NotFound)?;
+    let (region, _) = resolve_region_engine(&state, &server)?;
+    if !state.anonymizer().is_enabled() {
+        return Err(ApiError::BadRequest(
+            "web API requires privacy.uid_anonymization.enabled".into(),
+        ));
+    }
+    let unique_id = state.anonymizer().public_user_id(region, event_id, &raw);
     let Json(mut detail) = web_user_detail_by_unique_id(
         state,
         server,
@@ -406,6 +421,10 @@ mod tests {
     const WORLD_BLOOM_EVENT: i64 = 812;
 
     async fn test_state() -> AppState {
+        test_state_with_anonymizer(UidAnonymizer::enabled("salt")).await
+    }
+
+    async fn test_state_with_anonymizer(anonymizer: UidAnonymizer) -> AppState {
         let engine = sqlite_engine().await;
         create_event_tables(&engine, SekaiServerRegion::Jp, NORMAL_EVENT, false)
             .await
@@ -419,7 +438,7 @@ mod tests {
             HashMap::from([(SekaiServerRegion::Jp, Arc::new(engine))]),
             None,
             ApiQueryLimiter::new(ApiQueryConfig::default(), [SekaiServerRegion::Jp]),
-            UidAnonymizer::enabled("salt"),
+            anonymizer,
             None,
             RealtimeHub::new(),
             WsTicketStore::default(),
@@ -692,6 +711,44 @@ mod tests {
                 .await,
             Err(ApiError::BadRequest(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn bare_numeric_ids_are_game_uids_and_reveal_only_that_player() {
+        let state = test_state_with_anonymizer(UidAnonymizer::enabled("test-salt")).await;
+        for (event, chapter) in [(NORMAL_EVENT, None), (WORLD_BLOOM_EVENT, Some(17))] {
+            let public_id = state
+                .anonymizer()
+                .public_user_id(SekaiServerRegion::Jp, event, "100");
+            let by_uid = web_user_detail_for_scope(
+                state.clone(),
+                "jp".into(),
+                event,
+                chapter,
+                "100".into(),
+                detail_query(),
+            )
+            .await
+            .unwrap()
+            .0;
+            assert_eq!(by_uid.subject.as_ref().unwrap().unique_id, public_id);
+            assert_eq!(user_id_of(by_uid.current.as_ref().unwrap()), "100");
+            assert!(!by_uid.player_trace.is_empty());
+
+            let by_unique = web_user_detail_for_scope(
+                state.clone(),
+                "jp".into(),
+                event,
+                chapter,
+                public_id.clone(),
+                detail_query(),
+            )
+            .await
+            .unwrap()
+            .0;
+            assert!(by_unique.subject.is_none());
+            assert_eq!(user_id_of(by_unique.current.as_ref().unwrap()), public_id);
+        }
     }
 
     #[test]

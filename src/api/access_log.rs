@@ -80,14 +80,24 @@ impl ProxyTrust {
     }
 }
 
+fn logged_path(uri: &axum::http::Uri) -> String {
+    if let Some((prefix, _)) = uri.path().split_once("/details/user/") {
+        return format!("{prefix}/details/user/{{user_id}}");
+    }
+    // The web check-room carries the raw game UID in `userId=`; log the
+    // path only.
+    if uri.path().ends_with("/check-room") {
+        return uri.path().to_owned();
+    }
+    uri.path_and_query()
+        .map(|path| path.as_str().to_owned())
+        .unwrap_or_else(|| uri.path().to_owned())
+}
+
 pub async fn log(State(trust): State<Arc<ProxyTrust>>, req: Request, next: Next) -> Response {
     let started = Instant::now();
     let method = req.method().clone();
-    let path = req
-        .uri()
-        .path_and_query()
-        .map(|p| p.as_str().to_owned())
-        .unwrap_or_else(|| req.uri().path().to_owned());
+    let path = logged_path(req.uri());
 
     let ip = client_ip(&req, &trust);
 
@@ -163,6 +173,30 @@ fn should_log(status: u16, latency: Duration, sample_rate: f64, slow_threshold: 
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn user_detail_logs_omit_game_uid() {
+        let uri =
+            "/api/v2/web/events/jp/1/leaderboards/total/details/user/123456789?includeTrace=true"
+                .parse()
+                .unwrap();
+        assert_eq!(
+            super::logged_path(&uri),
+            "/api/v2/web/events/jp/1/leaderboards/total/details/user/{user_id}"
+        );
+        let overview = "/api/v2/web/events/jp/1/leaderboards/total/overview?interval=60"
+            .parse()
+            .unwrap();
+        assert_eq!(super::logged_path(&overview), overview.to_string());
+        let check_room: axum::http::Uri =
+            "/api/v2/web/events/jp/1/leaderboards/total/check-room?userId=123456789"
+                .parse()
+                .unwrap();
+        assert_eq!(
+            super::logged_path(&check_room),
+            "/api/v2/web/events/jp/1/leaderboards/total/check-room"
+        );
+    }
+
     use super::*;
     use axum::body::Body;
     use axum::http::{HeaderName, HeaderValue, Request as HttpRequest};

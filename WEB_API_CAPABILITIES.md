@@ -34,7 +34,7 @@ GET .../leaderboards/world-bloom/{character_id}/details/rank/{rank}
 GET .../leaderboards/world-bloom/{character_id}/details/user/{user_id}
 ```
 
-`{user_id}` is the public `unique_id`. Query params: `interval`, `at`, `includeTrace`, `includePlayerTrace`, `includeProfile`, `cursor`, `limit` (trace pages are cursor-paginated).
+`{user_id}` accepts either the public `unique_id` or a positive numeric game UID (a bare numeric id is always treated as a game UID; `idType=unique` / `idType=uid` force the interpretation). A game UID is mapped to the event-specific anonymous ID before querying, so detail cache keys still use anonymous IDs, but the response then reveals that one player's raw UID (see the next section). This lookup does not require a Toolbox binding. Query params: `interval`, `at`, `includeTrace`, `includePlayerTrace`, `includeProfile`, `cursor`, `limit` (trace pages are cursor-paginated).
 
 ### Exact UID Lookup (check-room)
 
@@ -45,7 +45,7 @@ GET .../leaderboards/total/details/user/{raw_uid}?idType=uid
 GET .../leaderboards/world-bloom/{character_id}/details/user/{raw_uid}?idType=uid
 ```
 
-The one deliberate exception to "web never accepts a raw UID": the caller types an exact upstream UID and gets that player's current rank with neighbours, using the same query params as the user detail. The response is the user detail shape plus a `subject` block (`{"userId": "<raw>", "uniqueId": "<unique_id>"}`); the subject's own `userId` fields (current row, trace rows, profile) are the raw UID, while `previous` / `next` and every other player stay `unique_id`. The raw UID is validated as a ≤30-digit number, resolved to `unique_id` with one indexed lookup, and never enters cache keys or tracing fields. 404 when the UID is not tracked in that event.
+The one deliberate exception to "web never accepts a raw UID": the caller types an exact upstream UID and gets that player's current rank with neighbours, using the same query params as the user detail. The response is the user detail shape plus a `subject` block (`{"userId": "<raw>", "uniqueId": "<unique_id>"}`); the subject's own `userId` fields (current row, trace rows, profile) are the raw UID, while `previous` / `next` and every other player stay `unique_id`. The raw UID is validated as a ≤30-digit number and mapped to `unique_id` by the anonymizer (no lookup), so it never enters cache keys, tracing fields, or the access log (the `check-room` query string is not logged). 404 when the UID is not tracked in that event.
 
 ### Private Details (raw UID)
 

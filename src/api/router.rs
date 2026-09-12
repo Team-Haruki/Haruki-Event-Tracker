@@ -344,10 +344,14 @@ mod tests {
                             "/api/v2/cloud/events/jp/{NORMAL_EVENT}/leaderboards/total/sk/trace?subject={user}"
                         );
                         assert_eq!(status(&router, &cloud_unique).await, StatusCode::NOT_FOUND);
+                        // A bare numeric id is a game UID lookup (revealed for
+                        // that player); forcing `idType=unique` on it is a miss.
                         let web_raw = format!(
                             "/api/v2/web/events/jp/{NORMAL_EVENT}/leaderboards/total/details/user/100"
                         );
-                        assert_eq!(status(&router, &web_raw).await, StatusCode::NOT_FOUND);
+                        assert_eq!(status(&router, &web_raw).await, StatusCode::OK);
+                        let web_forced_unique = format!("{web_raw}?idType=unique");
+                        assert_eq!(status(&router, &web_forced_unique).await, StatusCode::NOT_FOUND);
                         let _ = world_user;
 
                         let private = format!(
