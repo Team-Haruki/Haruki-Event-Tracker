@@ -111,6 +111,38 @@ realtime:
   push_min_interval_secs: 0 # 每个 (server, event) topic 的 updated 事件最小推送间隔（秒）；窗口内的多次更新合并为一条尾随推送（携带最新时间戳，不会漏掉最后一次变更）。0 表示每次落库都推（旧行为）
 
 # ============================================================================
+# 集群角色配置
+# ============================================================================
+# 用途：一个 writer 采集并写库，多个 reader 只提供 API；reader 通过 WebSocket 订阅
+#      writer 的 /internal/updates，收到更新后即时失效本机缓存并推送 WS updated。
+# 说明：
+#   - standalone（默认）：单机模式，采集与 API 在同一进程，行为与旧版本一致。
+#   - writer：要求 privacy.uid_anonymization.enabled = true（写入时为每个用户生成 unique_id）；
+#             不挂 cloud/web 路由，只暴露 /livez、/readyz、/internal/updates。
+#   - reader：忽略各区 tracker.enabled；数据库按只读处理（可以是流复制热备），
+#             绝不执行 DDL；缺列时报错并等待 writer 迁移。
+cluster:
+  role: standalone          # standalone | writer | reader
+  token: ""                 # /internal/* 的 bearer；writer 与所有 reader 必须一致；非空时同时开放
+                            # POST /internal/master-updated 供 master registry 的 subscribers 回调
+                            # （各区 master_data_dir 建议指向 registry：http://<registry>:9998/v1/master/<region>/files/）
+  writer_url: ""            # reader 必填，例如 http://100.76.159.97:8777（只支持 http）
+  replica_wait_ms: 1500     # reader：等待本机热备回放到通知里 LSN 的上限；读主库时设 0
+  reconnect_min_secs: 1     # reader：断线重连退避下限
+  reconnect_max_secs: 30    # reader：断线重连退避上限
+  ping_interval_secs: 15    # writer：更新流的心跳间隔
+
+# ============================================================================
+# Cloud API 鉴权
+# ============================================================================
+# 用途：/api/v2/cloud/* 的 bearer token 列表，每个消费方一枚便于单独轮换。
+# 注意：列表非空即强制校验（Authorization: Bearer <token>）；为空时保持开放并在启动时告警。
+#      Cloud 组始终使用原始 UID（不受匿名化开关影响）；Web 组始终返回 unique_id，
+#      仅 check-room?userId= 与 details/user/{uid}?idType=uid 对被查者本人回显原始 UID。
+cloud_api:
+  tokens: []
+
+# ============================================================================
 # Sekai API 配置
 # ============================================================================
 # 用途：从 Haruki Sekai API 获取排名数据

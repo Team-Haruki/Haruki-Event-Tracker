@@ -364,6 +364,7 @@ async fn web_user_detail_for_scope(
             character_id,
             fetched_at: chrono::Utc::now().timestamp(),
         },
+        subject: None,
         current,
         previous,
         next,

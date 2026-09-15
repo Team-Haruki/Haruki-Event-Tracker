@@ -73,6 +73,9 @@ redis = { version = "1.2", features = [
 # Scheduling
 tokio-cron-scheduler = "0.15"
 
+# Cluster update stream (reader -> writer WebSocket client)
+tokio-tungstenite = "0.30"
+
 # Logging / observability
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = [
@@ -102,7 +105,6 @@ opendal = { version = "0.57", default-features = false, features = ["services-fs
 
 [dev-dependencies]
 tokio = { version = "1.52", features = ["full", "test-util", "macros"] }
-tokio-tungstenite = "0.30"
 
 [profile.release]
 lto = "thin"

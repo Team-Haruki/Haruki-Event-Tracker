@@ -66,6 +66,32 @@ impl PublicUserIdMode {
     }
 }
 
+#[derive(Debug, FromQueryResult)]
+struct UniqueIdRow {
+    unique_id: Option<String>,
+}
+
+/// Map a raw upstream UID to its public `unique_id`. Skips tracing fields on
+/// purpose: the raw UID must not land in logs.
+pub async fn resolve_unique_id_by_raw(
+    engine: &DatabaseEngine,
+    event_id: i64,
+    raw_user_id: &str,
+) -> Result<Option<String>, DbErr> {
+    let table = Alias::new(intern(TableKind::EventUsers, event_id));
+    let stmt = Query::select()
+        .column(event_users::Column::UniqueId)
+        .from(table)
+        .and_where(Expr::col(event_users::Column::UserId).eq(raw_user_id))
+        .limit(1)
+        .to_owned();
+    let backend = engine.backend();
+    Ok(UniqueIdRow::find_by_statement(backend.build(&stmt))
+        .one(engine.conn())
+        .await?
+        .and_then(|row| row.unique_id))
+}
+
 #[tracing::instrument(skip(engine), fields(event_id, user_id = %user_id))]
 pub async fn get_user_data(
     engine: &DatabaseEngine,

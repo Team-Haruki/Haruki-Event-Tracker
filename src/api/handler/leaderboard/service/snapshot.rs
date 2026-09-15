@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::api::cache::CacheTtl;
 use crate::api::error::ApiError;
-use crate::api::extract::{prepare_user_id_mode, resolve_region_engine};
+use crate::api::extract::{ApiAudience, prepare_audience_user_id_mode, resolve_region_engine};
 use crate::api::state::AppState;
 use crate::db::engine::DatabaseEngine;
 use crate::db::query::growth::{
@@ -25,6 +25,7 @@ pub(super) struct SnapshotBuildRequest {
     pub(super) interval: i64,
     pub(super) at: Option<i64>,
     pub(super) cache_prefix: &'static str,
+    pub(super) audience: ApiAudience,
 }
 
 pub(super) async fn build_rank_snapshots_response(
@@ -41,6 +42,7 @@ pub(super) async fn build_rank_snapshots_response(
         interval,
         at,
         cache_prefix,
+        audience,
     } = request;
     let end_time = at.unwrap_or_else(|| chrono::Utc::now().timestamp());
     let mut requested = BTreeSet::new();
@@ -77,7 +79,8 @@ pub(super) async fn build_rank_snapshots_response(
     let cache_server = server.clone();
     let fetch = async {
         let (region, engine) = resolve_region_engine(&state, &server)?;
-        let mode = prepare_user_id_mode(&state, &engine, region, event_id).await?;
+        let mode =
+            prepare_audience_user_id_mode(&state, &engine, region, event_id, audience).await?;
         let current =
             fetch_snapshot_items(&engine, event_id, character_id, &all_ranks, mode, at).await?;
         let metrics = if include_metrics {

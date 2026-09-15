@@ -359,10 +359,21 @@ pub struct WebRankDetailResponseSchema {
     pub window_end: i64,
 }
 
+/// Present only when the caller looked a player up by raw upstream UID;
+/// carries both identifiers for that one player.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WebSubjectSchema {
+    pub user_id: String,
+    pub unique_id: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WebUserDetailResponseSchema {
     pub meta: LeaderboardMetaSchema,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub subject: Option<WebSubjectSchema>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub current: Option<WebRankingItemSchema>,
     #[serde(skip_serializing_if = "Option::is_none")]

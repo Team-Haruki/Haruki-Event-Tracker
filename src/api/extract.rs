@@ -30,20 +30,35 @@ pub fn resolve_region_engine(
         .ok_or_else(|| ApiError::InvalidServer(server.to_owned()))
 }
 
-pub async fn prepare_user_id_mode(
+/// Who a shared leaderboard builder is answering. The cloud group (bots)
+/// always speaks raw upstream UIDs; the web group always speaks
+/// `unique_id`. Both run in the same process, so the mode is a property of
+/// the route, never of the anonymization switch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApiAudience {
+    Cloud,
+    Web,
+}
+
+pub async fn prepare_audience_user_id_mode(
     state: &AppState,
     engine: &DatabaseEngine,
     server: SekaiServerRegion,
     event_id: i64,
+    audience: ApiAudience,
 ) -> Result<PublicUserIdMode, ApiError> {
+    if audience == ApiAudience::Web && !state.anonymizer().is_enabled() {
+        return Err(ApiError::BadRequest(
+            "web API requires privacy.uid_anonymization.enabled".into(),
+        ));
+    }
     state
         .ensure_user_table_extensions(engine, server, event_id)
         .await?;
-    if state.anonymizer().is_enabled() {
-        Ok(PublicUserIdMode::Unique)
-    } else {
-        Ok(PublicUserIdMode::Raw)
-    }
+    Ok(match audience {
+        ApiAudience::Cloud => PublicUserIdMode::Raw,
+        ApiAudience::Web => PublicUserIdMode::Unique,
+    })
 }
 
 pub async fn prepare_private_user_id_mode(

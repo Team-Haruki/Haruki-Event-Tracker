@@ -13,10 +13,13 @@ use crate::api::limiter::ApiQueryLimiter;
 use crate::api::private_lookup::PrivateLookupVerifier;
 use crate::api::realtime::RealtimeHub;
 use crate::api::ws_ticket::WsTicketStore;
+use crate::cluster::{ClusterLink, UpdateBus};
+use crate::config::ClusterRole;
 use crate::db::engine::DatabaseEngine;
 use crate::db::privacy::ensure_user_table_extensions;
 use crate::model::enums::SekaiServerRegion;
 use crate::privacy::UidAnonymizer;
+use crate::tracker::parser::EventDataParser;
 use sea_orm::DbErr;
 use tokio::sync::RwLock;
 
@@ -34,6 +37,22 @@ struct Inner {
     private_lookup: Option<PrivateLookupVerifier>,
     realtime: RealtimeHub,
     ws_tickets: WsTicketStore,
+    cluster: ClusterState,
+}
+
+/// Cluster wiring carried by the state so handlers and middleware can gate
+/// on role and tokens without a second extension layer.
+#[derive(Clone, Default)]
+pub struct ClusterState {
+    pub role: ClusterRole,
+    pub cluster_token: String,
+    pub cloud_tokens: Vec<String>,
+    pub ping_interval: Option<std::time::Duration>,
+    pub update_bus: Option<UpdateBus>,
+    pub link: Option<Arc<ClusterLink>>,
+    /// Master-data parsers of the tracker daemons running in this process,
+    /// so `POST /internal/master-updated` can drop their caches.
+    pub master_parsers: HashMap<SekaiServerRegion, EventDataParser>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -63,8 +82,49 @@ impl AppState {
                 private_lookup,
                 realtime,
                 ws_tickets,
+                cluster: ClusterState::default(),
             }),
         }
+    }
+
+    /// Attach cluster wiring. Must run before the state is cloned (i.e.
+    /// straight after `new`), which is the only place it is called.
+    pub fn with_cluster(mut self, cluster: ClusterState) -> Self {
+        Arc::get_mut(&mut self.inner)
+            .expect("with_cluster must be called before AppState is shared")
+            .cluster = cluster;
+        self
+    }
+
+    pub fn role(&self) -> ClusterRole {
+        self.inner.cluster.role
+    }
+
+    pub fn cluster_token(&self) -> &str {
+        &self.inner.cluster.cluster_token
+    }
+
+    pub fn cloud_tokens(&self) -> &[String] {
+        &self.inner.cluster.cloud_tokens
+    }
+
+    pub fn cluster_ping_interval(&self) -> std::time::Duration {
+        self.inner
+            .cluster
+            .ping_interval
+            .unwrap_or(std::time::Duration::from_secs(15))
+    }
+
+    pub fn update_bus(&self) -> Option<&UpdateBus> {
+        self.inner.cluster.update_bus.as_ref()
+    }
+
+    pub fn cluster_link(&self) -> Option<&Arc<ClusterLink>> {
+        self.inner.cluster.link.as_ref()
+    }
+
+    pub fn master_parser(&self, server: SekaiServerRegion) -> Option<&EventDataParser> {
+        self.inner.cluster.master_parsers.get(&server)
     }
 
     pub fn db(&self, server: SekaiServerRegion) -> Option<&Arc<DatabaseEngine>> {

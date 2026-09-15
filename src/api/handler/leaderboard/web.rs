@@ -3,8 +3,8 @@ use axum::http::HeaderMap;
 
 use crate::api::error::ApiError;
 use crate::api::handler::leaderboard::service::{
-    OverviewQuery, WebDetailQuery, web_overview_for_scope, web_rank_detail_for_scope,
-    web_user_detail_for_scope,
+    OverviewQuery, WebDetailQuery, web_check_room_for_scope, web_overview_for_scope,
+    web_rank_detail_for_scope, web_user_detail_for_scope,
 };
 use crate::api::handler::web::UserSearchQuery;
 use crate::api::json::{EncodedJson, Json, RawJson, accepts_gzip};
@@ -116,6 +116,24 @@ pub async fn world_bloom_user_detail(
     Query(query): Query<WebDetailQuery>,
 ) -> Result<Json<WebUserDetailResponseSchema>, ApiError> {
     web_user_detail_for_scope(state, server, event_id, Some(character_id), user_id, query).await
+}
+
+#[tracing::instrument(skip(state, query), fields(server, event_id))]
+pub async fn total_check_room(
+    State(state): State<AppState>,
+    Path((server, event_id)): Path<(String, i64)>,
+    Query(query): Query<WebDetailQuery>,
+) -> Result<Json<WebUserDetailResponseSchema>, ApiError> {
+    web_check_room_for_scope(state, server, event_id, None, query).await
+}
+
+#[tracing::instrument(skip(state, query), fields(server, event_id, character_id))]
+pub async fn world_bloom_check_room(
+    State(state): State<AppState>,
+    Path((server, event_id, character_id)): Path<(String, i64, i64)>,
+    Query(query): Query<WebDetailQuery>,
+) -> Result<Json<WebUserDetailResponseSchema>, ApiError> {
+    web_check_room_for_scope(state, server, event_id, Some(character_id), query).await
 }
 
 #[tracing::instrument(skip(state, query), fields(server, event_id, character_id))]

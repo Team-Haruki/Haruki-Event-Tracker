@@ -84,6 +84,11 @@ fn logged_path(uri: &axum::http::Uri) -> String {
     if let Some((prefix, _)) = uri.path().split_once("/details/user/") {
         return format!("{prefix}/details/user/{{user_id}}");
     }
+    // The web check-room carries the raw game UID in `userId=`; log the
+    // path only.
+    if uri.path().ends_with("/check-room") {
+        return uri.path().to_owned();
+    }
     uri.path_and_query()
         .map(|path| path.as_str().to_owned())
         .unwrap_or_else(|| uri.path().to_owned())
@@ -182,6 +187,14 @@ mod tests {
             .parse()
             .unwrap();
         assert_eq!(super::logged_path(&overview), overview.to_string());
+        let check_room: axum::http::Uri =
+            "/api/v2/web/events/jp/1/leaderboards/total/check-room?userId=123456789"
+                .parse()
+                .unwrap();
+        assert_eq!(
+            super::logged_path(&check_room),
+            "/api/v2/web/events/jp/1/leaderboards/total/check-room"
+        );
     }
 
     use super::*;

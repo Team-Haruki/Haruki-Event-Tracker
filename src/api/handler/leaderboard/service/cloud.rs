@@ -1,6 +1,7 @@
 use serde::Deserialize;
 
 use crate::api::error::ApiError;
+use crate::api::extract::ApiAudience;
 use crate::api::extract::parse_rank_query;
 use crate::api::json::Json;
 use crate::api::state::AppState;
@@ -52,6 +53,7 @@ pub(crate) async fn cloud_query_for_scope(
                 interval: interval_seconds(query.interval),
                 at: None,
                 cache_prefix: "cloud:v2",
+                audience: ApiAudience::Cloud,
             },
         )
         .await?
@@ -71,6 +73,7 @@ pub(crate) async fn cloud_query_for_scope(
                 limit: Some(1),
             },
             round_metrics::CLOUD_ROUND_METRICS_CACHE_PREFIX,
+            ApiAudience::Cloud,
         )
         .await?;
         let Some(current) = subject.current else {
@@ -89,6 +92,7 @@ pub(crate) async fn cloud_query_for_scope(
                 interval: interval_seconds(query.interval),
                 at: None,
                 cache_prefix: "cloud:v2",
+                audience: ApiAudience::Cloud,
             },
         )
         .await?
@@ -205,6 +209,7 @@ pub(crate) async fn cloud_speed_for_scope(
             interval,
             at: None,
             cache_prefix: "cloud:v2",
+            audience: ApiAudience::Cloud,
         },
     )
     .await?;
@@ -253,6 +258,7 @@ pub(crate) async fn cloud_trace_for_scope(
             limit: query.limit,
         },
         round_metrics::CLOUD_ROUND_METRICS_CACHE_PREFIX,
+        ApiAudience::Cloud,
     )
     .await?;
     let name = trace

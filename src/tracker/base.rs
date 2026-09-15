@@ -16,7 +16,6 @@ use std::sync::Arc;
 use chrono::Utc;
 use thiserror::Error;
 
-use crate::api::cache::{abort_event_update, begin_event_update, finish_event_update};
 use crate::db::engine::DatabaseEngine;
 use crate::db::privacy::ensure_user_table_extensions;
 use crate::db::query::batch::{
@@ -39,6 +38,7 @@ use crate::tracker::diff::{
     build_event_records, build_world_bloom_rows, diff_rank_based, extract_world_bloom_rankings,
     merge_rankings,
 };
+use crate::tracker::invalidation::CacheInvalidation;
 use crate::tracker::state::{
     check_event_ended_flag, load_rank_state, save_rank_state, set_event_ended_flag,
 };
@@ -99,7 +99,7 @@ pub struct EventTrackerBase {
     is_world_bloom_chapter_ended: HashMap<i64, bool>,
     db: Arc<DatabaseEngine>,
     redis: redis::aio::ConnectionManager,
-    api_cache_redis: Option<redis::aio::ConnectionManager>,
+    invalidation: CacheInvalidation,
     api: HarukiSekaiAPIClient,
     anonymizer: UidAnonymizer,
     tuning: TrackerTuning,
@@ -146,7 +146,7 @@ impl EventTrackerBase {
         is_event_ended: bool,
         db: Arc<DatabaseEngine>,
         redis: redis::aio::ConnectionManager,
-        api_cache_redis: Option<redis::aio::ConnectionManager>,
+        invalidation: CacheInvalidation,
         api: HarukiSekaiAPIClient,
         anonymizer: UidAnonymizer,
         tuning: TrackerTuning,
@@ -167,7 +167,7 @@ impl EventTrackerBase {
             is_world_bloom_chapter_ended,
             db,
             redis,
-            api_cache_redis,
+            invalidation,
             api,
             anonymizer,
             tuning,
@@ -306,11 +306,7 @@ impl EventTrackerBase {
             return Ok(changed);
         }
 
-        if let Some(conn) = self.api_cache_redis.as_mut()
-            && let Err(err) = begin_event_update(conn, self.server, self.event_id).await
-        {
-            tracing::warn!(%err, "failed to mark API cache dirty");
-        }
+        self.begin_cache_update(true).await;
 
         if let Err(err) = batch_upsert_event_users(
             &self.db,
@@ -321,19 +317,13 @@ impl EventTrackerBase {
         )
         .await
         {
-            if let Some(conn) = self.api_cache_redis.as_mut()
-                && let Err(redis_err) = abort_event_update(conn, self.server, self.event_id).await
-            {
-                tracing::warn!(%redis_err, "failed to clear API cache dirty after user refresh error");
-            }
+            self.abort_cache_update("failed to clear API cache dirty after user refresh error")
+                .await;
             return Err(err.into());
         }
 
-        if let Some(conn) = self.api_cache_redis.as_mut()
-            && let Err(err) = finish_event_update(conn, self.server, self.event_id).await
-        {
-            tracing::warn!(%err, "failed to bump API cache epoch after user refresh");
-        }
+        self.finish_cache_update("failed to bump API cache epoch after user refresh")
+            .await;
         self.last_post_end_user_refresh_at = Some(now);
         Ok(changed)
     }
@@ -607,11 +597,8 @@ impl EventTrackerBase {
     }
 
     async fn begin_cache_update(&mut self, will_write: bool) {
-        if will_write
-            && let Some(conn) = self.api_cache_redis.as_mut()
-            && let Err(err) = begin_event_update(conn, self.server, self.event_id).await
-        {
-            tracing::warn!(%err, "failed to mark API cache dirty");
+        if will_write {
+            self.invalidation.begin(self.server, self.event_id).await;
         }
     }
 
@@ -697,19 +684,16 @@ impl EventTrackerBase {
     }
 
     async fn abort_cache_update(&mut self, message: &'static str) {
-        if let Some(conn) = self.api_cache_redis.as_mut()
-            && let Err(err) = abort_event_update(conn, self.server, self.event_id).await
-        {
-            tracing::warn!(%err, "{message}");
-        }
+        self.invalidation
+            .abort(self.server, self.event_id, message)
+            .await;
     }
 
     async fn finish_cache_update(&mut self, message: &'static str) {
-        if let Some(conn) = self.api_cache_redis.as_mut()
-            && let Err(err) = finish_event_update(conn, self.server, self.event_id).await
-        {
-            tracing::warn!(%err, "{message}");
-        }
+        let db = self.db.clone();
+        self.invalidation
+            .finish(self.server, self.event_id, &db, message)
+            .await;
     }
 
     async fn handle_ranking_data(&mut self) -> Result<HandledRankingData, TrackerError> {
@@ -901,7 +885,7 @@ pub(crate) mod tests {
             false,
             db,
             redis.clone(),
-            Some(redis),
+            CacheInvalidation::LocalRedis(redis),
             HarukiSekaiAPIClient::new("http://127.0.0.1", "").unwrap(),
             UidAnonymizer::disabled(),
             TrackerTuning::default(),

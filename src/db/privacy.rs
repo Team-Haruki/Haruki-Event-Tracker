@@ -28,6 +28,10 @@ pub async fn ensure_user_unique_ids(
     ensure_user_table_extensions(engine, server, event_id, anonymizer).await
 }
 
+/// Lazily migrate a pre-existing `_users` table. On a read-only engine
+/// (cluster reader, possibly a streaming replica) this only *verifies* the
+/// columns are present: the writer owns every ALTER/backfill/index, and a
+/// missing column there means the writer has not migrated the event yet.
 pub async fn ensure_user_table_extensions(
     engine: &DatabaseEngine,
     server: SekaiServerRegion,
@@ -42,6 +46,9 @@ pub async fn ensure_user_table_extensions(
     }
 
     ensure_unique_id_column(engine, table).await?;
+    if engine.is_read_only() {
+        return Ok(());
+    }
     backfill_unique_ids(engine, server, event_id, table, anonymizer).await?;
     ensure_unique_id_index(engine, event_id, table).await?;
     Ok(())
@@ -81,6 +88,15 @@ async fn ensure_column(
     column: &str,
     ty: &str,
 ) -> Result<(), DbErr> {
+    if column_exists(engine, table, column).await? {
+        return Ok(());
+    }
+    if engine.is_read_only() {
+        return Err(DbErr::Custom(format!(
+            "column {table}.{column} is missing and this engine is read-only; \
+             the cluster writer must migrate the event first"
+        )));
+    }
     let backend = engine.backend();
     let stmt = Statement::from_string(
         backend,
@@ -100,6 +116,52 @@ async fn ensure_column(
     Ok(())
 }
 
+/// SQLite treats an unknown double-quoted identifier as a string literal,
+/// so a zero-row `SELECT "col"` probe cannot detect a missing column there;
+/// ask the catalog on every dialect instead.
+async fn column_exists(
+    engine: &DatabaseEngine,
+    table: &'static str,
+    column: &str,
+) -> Result<bool, DbErr> {
+    let backend = engine.backend();
+    let sql = match backend {
+        DatabaseBackend::Sqlite => {
+            let rows = engine
+                .conn()
+                .query_all_raw(Statement::from_string(
+                    backend,
+                    format!("PRAGMA table_info({})", quote_ident(backend, table)),
+                ))
+                .await?;
+            for row in rows {
+                let name: String = row.try_get("", "name")?;
+                if name.eq_ignore_ascii_case(column) {
+                    return Ok(true);
+                }
+            }
+            return Ok(false);
+        }
+        DatabaseBackend::MySql => format!(
+            "SELECT 1 AS present FROM information_schema.COLUMNS \
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = {} AND COLUMN_NAME = {} LIMIT 1",
+            quote_literal(table),
+            quote_literal(column),
+        ),
+        _ => format!(
+            "SELECT 1 AS present FROM information_schema.columns \
+             WHERE table_schema = current_schema() AND table_name = {} AND column_name = {} LIMIT 1",
+            quote_literal(table),
+            quote_literal(column),
+        ),
+    };
+    let row = engine
+        .conn()
+        .query_one_raw(Statement::from_string(backend, sql))
+        .await?;
+    Ok(row.is_some())
+}
+
 async fn ensure_text_column(
     engine: &DatabaseEngine,
     table: &'static str,
@@ -108,7 +170,7 @@ async fn ensure_text_column(
     ensure_column(engine, table, column, "TEXT").await?;
 
     let backend = engine.backend();
-    if !matches!(backend, DatabaseBackend::MySql) {
+    if !matches!(backend, DatabaseBackend::MySql) || engine.is_read_only() {
         return Ok(());
     }
 
@@ -259,6 +321,48 @@ mod tests {
     use crate::db::engine::DatabaseEngine;
     use crate::db::query::ranking::fetch_latest_ranking_by_rank;
     use crate::db::query::user::{PublicUserIdMode, get_user_data};
+    use crate::db::schema::create_event_tables;
+
+    #[tokio::test]
+    async fn read_only_engine_verifies_columns_but_never_alters() {
+        let conn = Database::connect("sqlite::memory:").await.unwrap();
+        let engine = DatabaseEngine::from_connection(conn, DatabaseBackend::Sqlite);
+        create_event_tables(&engine, SekaiServerRegion::Jp, 777, false)
+            .await
+            .unwrap();
+        let anonymizer = UidAnonymizer::enabled("pepper");
+        // Fresh tables carry every column, so a reader passes verification.
+        let reader = engine.with_read_only(true);
+        assert!(reader.is_read_only());
+        ensure_user_table_extensions(&reader, SekaiServerRegion::Jp, 777, &anonymizer)
+            .await
+            .unwrap();
+
+        // A legacy table missing a column must fail loudly on a reader
+        // instead of attempting DDL against a replica.
+        let conn = Database::connect("sqlite::memory:").await.unwrap();
+        let legacy =
+            DatabaseEngine::from_connection(conn, DatabaseBackend::Sqlite).with_read_only(true);
+        let users_tbl = intern(TableKind::EventUsers, 778);
+        legacy
+            .conn()
+            .execute_unprepared(&format!(
+                "CREATE TABLE {users_tbl} (
+                    user_id_key INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id VARCHAR(30) UNIQUE,
+                    name VARCHAR(300),
+                    cheerful_team_id BIGINT
+                )"
+            ))
+            .await
+            .unwrap();
+        let err = ensure_user_table_extensions(&legacy, SekaiServerRegion::Jp, 778, &anonymizer)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("read-only"), "{err}");
+        assert!(!column_exists(&legacy, users_tbl, "card_id").await.unwrap());
+        assert!(column_exists(&legacy, users_tbl, "name").await.unwrap());
+    }
 
     #[tokio::test]
     async fn lazy_migration_backfills_unique_ids_and_queries_by_public_id() {
