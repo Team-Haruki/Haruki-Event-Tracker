@@ -778,9 +778,10 @@ pub async fn search_ranking_rows(
             Expr::col((users_tbl, event_users::Column::UserIdKey)),
             filter,
         );
-        // `time_id` is monotone with `timestamp`, so ordering by the ranking
-        // table's own column lets the `(time_id, rank)` index provide the
-        // order without a join-then-sort (see the note in `ranking.rs`).
+        // `time_id` order == `timestamp` order is an invariant (see
+        // `ranking.rs`), so ordering by the ranking table's own column lets
+        // the `(time_id, rank)` index provide the order without a
+        // join-then-sort.
         stmt.order_by((event_tbl.clone(), event::Column::TimeId), Order::Desc)
             .order_by((event_tbl.clone(), event::Column::Rank), Order::Asc)
             .order_by((event_tbl, event::Column::UserIdKey), Order::Asc)
@@ -1335,6 +1336,23 @@ pub(crate) mod tests {
     use crate::db::query::growth::fetch_ranking_score_growths;
     use crate::db::schema::create_event_tables;
     use crate::model::enums::SekaiServerRegion;
+
+    pub(crate) fn rank_window(rank_min: i64, rank_max: i64) -> WebRankingFilter {
+        WebRankingFilter {
+            rank_min: Some(rank_min),
+            rank_max: Some(rank_max),
+            rank_in: None,
+            score_min: None,
+            score_max: None,
+            start_time: None,
+            end_time: None,
+            before: None,
+            after: None,
+            timestamp: None,
+            cursor: None,
+            limit: 10,
+        }
+    }
 
     #[test]
     fn ranking_cursor_round_trip_parts() {
@@ -1973,6 +1991,71 @@ pub(crate) mod tests {
                 "INSERT INTO {event_tbl} (time_id, user_id_key, score, rank) VALUES \
                 (1, 1, 1000, 1), (1, 2, 900, 2), \
                 (2, 2, 1600, 1), (2, 1, 1500, 2)"
+            ),
+        ] {
+            engine
+                .conn()
+                .execute_raw(Statement::from_string(DatabaseBackend::Sqlite, sql))
+                .await
+                .unwrap();
+        }
+    }
+
+    /// Three samples whose `time_id`s run opposite to their timestamps
+    /// (id 1 = +60s, id 2 = +0s, id 3 = +30s), as a historical merge or
+    /// the pre-fix writer could leave them. Input for the `db::repair`
+    /// tests; readers assume this never happens.
+    pub(crate) async fn seed_normal_event_with_inverted_time_ids(
+        engine: &DatabaseEngine,
+        event_id: i64,
+    ) {
+        let users_tbl = intern(TableKind::EventUsers, event_id);
+        let time_tbl = intern(TableKind::TimeId, event_id);
+        let event_tbl = intern(TableKind::Event, event_id);
+        for sql in [
+            format!(
+                "INSERT INTO {users_tbl} (user_id, unique_id, name) VALUES \
+                ('100', 'u-public-1', 'Alpha'), ('200', 'u-public-2', 'Beta')"
+            ),
+            format!(
+                "INSERT INTO {time_tbl} (time_id, timestamp, status) VALUES \
+                (1, 1710000060, 0), (2, 1710000000, 0), (3, 1710000030, 0)"
+            ),
+            format!(
+                "INSERT INTO {event_tbl} (time_id, user_id_key, score, rank) VALUES \
+                (1, 1, 1300, 1), (2, 1, 1000, 1), (3, 1, 1150, 1), \
+                (1, 2, 1200, 2), (2, 2, 900, 2), (3, 2, 1050, 2)"
+            ),
+        ] {
+            engine
+                .conn()
+                .execute_raw(Statement::from_string(DatabaseBackend::Sqlite, sql))
+                .await
+                .unwrap();
+        }
+    }
+
+    pub(crate) async fn seed_world_bloom_event_with_inverted_time_ids(
+        engine: &DatabaseEngine,
+        event_id: i64,
+    ) {
+        let users_tbl = intern(TableKind::EventUsers, event_id);
+        let time_tbl = intern(TableKind::TimeId, event_id);
+        let wl_tbl = intern(TableKind::WorldBloom, event_id);
+        for sql in [
+            format!(
+                "INSERT INTO {users_tbl} (user_id, unique_id, name) VALUES \
+                ('100', 'u-public-1', 'Alpha'), ('200', 'u-public-2', 'Beta')"
+            ),
+            format!(
+                "INSERT INTO {time_tbl} (time_id, timestamp, status) VALUES \
+                (1, 1710000060, 0), (2, 1710000000, 0), (3, 1710000030, 0)"
+            ),
+            format!(
+                "INSERT INTO {wl_tbl} (time_id, user_id_key, character_id, score, rank) VALUES \
+                (1, 1, 17, 2300, 1), (2, 1, 17, 2000, 1), (3, 1, 17, 2150, 1), \
+                (1, 2, 17, 2200, 2), (2, 2, 17, 1900, 2), (3, 2, 17, 2050, 2), \
+                (1, 1, 19, 9000, 1)"
             ),
         ] {
             engine

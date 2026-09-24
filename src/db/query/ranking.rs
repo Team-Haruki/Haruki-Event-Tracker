@@ -61,11 +61,11 @@ pub async fn fetch_latest_ranking(
 ) -> Result<Option<RecordedRankingSchema>, DbErr> {
     let users_tbl = Alias::new(intern(TableKind::EventUsers, event_id));
     let event_tbl = Alias::new(intern(TableKind::Event, event_id));
-    // `time_id` is autoincrement and monotone with `timestamp` (rows are
-    // only ever appended at tick time), so ordering by the event table's
-    // own column gives identical results while letting the
-    // `(user_id_key, time_id)` / `(rank, time_id)` indexes provide the
-    // order — no join-then-sort.
+    // `time_id` order == `timestamp` order is an invariant (the writer
+    // assigns `time_id = timestamp`; `db::repair` renumbers legacy rows),
+    // so ordering by the event table's own column gives identical results
+    // while letting the `(user_id_key, time_id)` / `(rank, time_id)`
+    // indexes provide the order — no join-then-sort.
     let stmt = ranking_select(event_id, mode)
         .and_where(Expr::col((users_tbl, mode.output_column())).eq(user_id))
         .order_by((event_tbl, event::Column::TimeId), Order::Desc)

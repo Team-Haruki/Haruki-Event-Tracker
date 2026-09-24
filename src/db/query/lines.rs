@@ -4,6 +4,8 @@
 //! All ranks are resolved in a single round trip: a `MAX(time_id) GROUP BY
 //! rank` subquery finds each rank's latest row on the `(rank, time_id)`
 //! index, and the outer select joins back for the score and timestamp.
+//! This relies on the invariant that `time_id` order == `timestamp` order
+//! (writer: `time_id = timestamp`; legacy rows: `db::repair`).
 //! Query errors are swallowed into an empty result — matching the Go
 //! reference, which discards goroutine errors and only collects rows that
 //! actually came back (and keeping pre-table-bootstrap events a 200).
