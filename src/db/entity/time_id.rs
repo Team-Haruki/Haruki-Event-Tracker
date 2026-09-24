@@ -5,13 +5,12 @@
 //! and `wl_*` tables. `status=0` means a real ranking sample, `status=1+`
 //! is a heartbeat written when the upstream API failed or nothing changed.
 //!
-//! `time_id` is an identity, not an order. Rows written by this tracker
-//! use [`time_id_for_timestamp`] (`time_id == timestamp`), so id order and
-//! sample order agree by construction for everything it writes; rows that
-//! predate that rule keep their auto-increment ids (all far below epoch
-//! seconds), and historical merges have produced tables where a later
-//! sample carries a smaller id. Readers that need "latest" therefore order
-//! by `timestamp`, never by `time_id`.
+//! Invariant: `time_id` order == `timestamp` order. Readers depend on it
+//! ("latest" is `MAX(time_id)` on the ranking-table indexes). Rows written
+//! by this tracker use [`time_id_for_timestamp`] (`time_id == timestamp`),
+//! so the invariant holds by construction for everything it writes; rows
+//! that predate that rule keep their sequence ids and are renumbered by
+//! `db::repair` where a merge left them out of order.
 //!
 //! Column names and types match the Go `TimeIDTable` (`utils/gorm/tables.go`).
 
@@ -21,7 +20,9 @@ use sea_orm::entity::prelude::*;
 /// (epoch seconds). Deterministic and order-preserving, so coalesced
 /// flushes, the separate main / World Bloom batches, heartbeats and retries
 /// can never allocate ids out of timestamp order, whatever order their
-/// statements reach the database in.
+/// statements reach the database in. The column's identity sequence is
+/// left unused; a binary predating this rule would resume it and break the
+/// invariant (see AGENTS.md, "rollback trap").
 pub fn time_id_for_timestamp(timestamp: i64) -> i64 {
     timestamp
 }

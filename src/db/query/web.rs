@@ -37,6 +37,14 @@ impl WebRankingFilter {
     fn is_rank_window(&self) -> bool {
         self.rank_min.is_some() || self.rank_max.is_some() || self.rank_in.is_some()
     }
+
+    fn has_time_filter(&self) -> bool {
+        self.start_time.is_some()
+            || self.end_time.is_some()
+            || self.before.is_some()
+            || self.after.is_some()
+            || self.timestamp.is_some()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -513,8 +521,6 @@ fn latest_rank_window_select(
     let users_tbl = Alias::new(intern(TableKind::EventUsers, event_id));
     let latest_tbl = Alias::new("latest_rank");
 
-    // Latest sample per rank by `timestamp` (unique per event), never by
-    // `time_id`: the id is an identity, not an order — see `lines.rs`.
     let mut latest = Query::select();
     latest
         .expr_as(
@@ -522,20 +528,26 @@ fn latest_rank_window_select(
             Alias::new("rank"),
         )
         .expr_as(
-            Expr::col((time_tbl.clone(), time_id::Column::Timestamp)).max(),
-            Alias::new("timestamp"),
+            Expr::col((event_tbl.clone(), event::Column::TimeId)).max(),
+            Alias::new("time_id"),
         )
-        .from(event_tbl.clone())
-        .inner_join(
+        .from(event_tbl.clone());
+    // The time table is only needed to translate time filters into
+    // `time_id`s; without them, `MAX(time_id) GROUP BY rank` runs entirely
+    // on the `(rank, time_id)` index instead of probing the time table for
+    // every history row in the rank range.
+    if filter.has_time_filter() {
+        latest.inner_join(
             time_tbl.clone(),
             Expr::col((event_tbl.clone(), event::Column::TimeId))
                 .equals((time_tbl.clone(), time_id::Column::TimeId)),
         );
-    apply_rank_window_time_filters(
-        &mut latest,
-        Expr::col((time_tbl.clone(), time_id::Column::Timestamp)),
-        filter,
-    );
+        apply_rank_window_time_filters(
+            &mut latest,
+            Expr::col((time_tbl.clone(), time_id::Column::Timestamp)),
+            filter,
+        );
+    }
     if let Some(rank_min) = filter.rank_min {
         latest.and_where(Expr::col((event_tbl.clone(), event::Column::Rank)).gte(rank_min));
     }
@@ -589,8 +601,8 @@ fn latest_rank_window_select(
             Expr::col((event_tbl.clone(), event::Column::Rank))
                 .equals((latest_tbl.clone(), Alias::new("rank")))
                 .and(
-                    Expr::col((time_tbl.clone(), time_id::Column::Timestamp))
-                        .equals((latest_tbl, Alias::new("timestamp"))),
+                    Expr::col((event_tbl.clone(), event::Column::TimeId))
+                        .equals((latest_tbl, Alias::new("time_id"))),
                 ),
         )
         .inner_join(
@@ -630,21 +642,23 @@ fn latest_world_bloom_rank_window_select(
             Alias::new("rank"),
         )
         .expr_as(
-            Expr::col((time_tbl.clone(), time_id::Column::Timestamp)).max(),
-            Alias::new("timestamp"),
+            Expr::col((wl_tbl.clone(), world_bloom::Column::TimeId)).max(),
+            Alias::new("time_id"),
         )
         .from(wl_tbl.clone())
-        .inner_join(
+        .and_where(Expr::col((wl_tbl.clone(), world_bloom::Column::CharacterId)).eq(character_id));
+    if filter.has_time_filter() {
+        latest.inner_join(
             time_tbl.clone(),
             Expr::col((wl_tbl.clone(), world_bloom::Column::TimeId))
                 .equals((time_tbl.clone(), time_id::Column::TimeId)),
-        )
-        .and_where(Expr::col((wl_tbl.clone(), world_bloom::Column::CharacterId)).eq(character_id));
-    apply_rank_window_time_filters(
-        &mut latest,
-        Expr::col((time_tbl.clone(), time_id::Column::Timestamp)),
-        filter,
-    );
+        );
+        apply_rank_window_time_filters(
+            &mut latest,
+            Expr::col((time_tbl.clone(), time_id::Column::Timestamp)),
+            filter,
+        );
+    }
     if let Some(rank_min) = filter.rank_min {
         latest.and_where(Expr::col((wl_tbl.clone(), world_bloom::Column::Rank)).gte(rank_min));
     }
@@ -702,8 +716,8 @@ fn latest_world_bloom_rank_window_select(
             Expr::col((wl_tbl.clone(), world_bloom::Column::Rank))
                 .equals((latest_tbl.clone(), Alias::new("rank")))
                 .and(
-                    Expr::col((time_tbl.clone(), time_id::Column::Timestamp))
-                        .equals((latest_tbl, Alias::new("timestamp"))),
+                    Expr::col((wl_tbl.clone(), world_bloom::Column::TimeId))
+                        .equals((latest_tbl, Alias::new("time_id"))),
                 ),
         )
         .inner_join(
@@ -764,9 +778,10 @@ pub async fn search_ranking_rows(
             Expr::col((users_tbl, event_users::Column::UserIdKey)),
             filter,
         );
-        // `time_id` is monotone with `timestamp`, so ordering by the ranking
-        // table's own column lets the `(time_id, rank)` index provide the
-        // order without a join-then-sort (see the note in `ranking.rs`).
+        // `time_id` order == `timestamp` order is an invariant (see
+        // `ranking.rs`), so ordering by the ranking table's own column lets
+        // the `(time_id, rank)` index provide the order without a
+        // join-then-sort.
         stmt.order_by((event_tbl.clone(), event::Column::TimeId), Order::Desc)
             .order_by((event_tbl.clone(), event::Column::Rank), Order::Asc)
             .order_by((event_tbl, event::Column::UserIdKey), Order::Asc)
@@ -1319,11 +1334,10 @@ pub(crate) mod tests {
 
     use crate::db::engine::DatabaseEngine;
     use crate::db::query::growth::fetch_ranking_score_growths;
-    use crate::db::query::lines::{fetch_ranking_lines, fetch_world_bloom_ranking_lines};
     use crate::db::schema::create_event_tables;
     use crate::model::enums::SekaiServerRegion;
 
-    fn rank_window(rank_min: i64, rank_max: i64) -> WebRankingFilter {
+    pub(crate) fn rank_window(rank_min: i64, rank_max: i64) -> WebRankingFilter {
         WebRankingFilter {
             rank_min: Some(rank_min),
             rank_max: Some(rank_max),
@@ -1338,133 +1352,6 @@ pub(crate) mod tests {
             cursor: None,
             limit: 10,
         }
-    }
-
-    // The inversion seeds below give the *newest* sample the *smallest*
-    // `time_id` (ids 1/2/3 carry +60s/+0s/+30s), so anything that orders by
-    // id instead of timestamp returns the +30s row.
-
-    #[tokio::test]
-    async fn web_ranking_window_picks_latest_by_timestamp_not_time_id() {
-        let engine = sqlite_engine().await;
-        let event_id = 561;
-        create_event_tables(&engine, SekaiServerRegion::Jp, event_id, false)
-            .await
-            .unwrap();
-        seed_normal_event_with_inverted_time_ids(&engine, event_id).await;
-
-        let (items, cursor) = search_rankings(
-            &engine,
-            event_id,
-            &rank_window(1, 2),
-            PublicUserIdMode::Unique,
-        )
-        .await
-        .unwrap();
-        assert!(cursor.is_none());
-        let rows: Vec<(i64, i64, i64)> = items
-            .into_iter()
-            .map(|item| match item.rank_data {
-                RecordedRankData::Normal(row) => (row.rank, row.timestamp, row.score),
-                RecordedRankData::WorldBloom(_) => panic!("expected normal ranking"),
-            })
-            .collect();
-        assert_eq!(
-            rows,
-            vec![(1, 1_710_000_060, 1300), (2, 1_710_000_060, 1200)]
-        );
-    }
-
-    #[tokio::test]
-    async fn ranking_lines_pick_latest_by_timestamp_not_time_id() {
-        let engine = sqlite_engine().await;
-        let event_id = 562;
-        create_event_tables(&engine, SekaiServerRegion::Jp, event_id, false)
-            .await
-            .unwrap();
-        seed_normal_event_with_inverted_time_ids(&engine, event_id).await;
-
-        let lines = fetch_ranking_lines(&engine, event_id, &[1, 2, 3], None)
-            .await
-            .unwrap();
-        let rows: Vec<_> = lines
-            .iter()
-            .map(|line| (line.rank, line.timestamp, line.score))
-            .collect();
-        assert_eq!(
-            rows,
-            vec![(1, 1_710_000_060, 1300), (2, 1_710_000_060, 1200)]
-        );
-
-        // A cutoff still resolves to the newest sample at or before it.
-        let lines = fetch_ranking_lines(&engine, event_id, &[1], Some(1_710_000_030))
-            .await
-            .unwrap();
-        assert_eq!((lines[0].timestamp, lines[0].score), (1_710_000_030, 1150));
-    }
-
-    #[tokio::test]
-    async fn ranking_score_growths_take_edges_by_timestamp_not_time_id() {
-        let engine = sqlite_engine().await;
-        let event_id = 563;
-        create_event_tables(&engine, SekaiServerRegion::Jp, event_id, false)
-            .await
-            .unwrap();
-        seed_normal_event_with_inverted_time_ids(&engine, event_id).await;
-
-        let growths = fetch_ranking_score_growths(&engine, event_id, &[1], 1_710_000_000, None)
-            .await
-            .unwrap();
-        assert_eq!(growths.len(), 1);
-        assert_eq!(growths[0].timestamp_earlier, Some(1_710_000_000));
-        assert_eq!(growths[0].score_earlier, Some(1000));
-        assert_eq!(growths[0].timestamp_latest, 1_710_000_060);
-        assert_eq!(growths[0].score_latest, 1300);
-        assert_eq!(growths[0].growth, Some(300));
-        assert_eq!(growths[0].time_diff, Some(60));
-    }
-
-    #[tokio::test]
-    async fn web_world_bloom_window_picks_latest_by_timestamp_not_time_id() {
-        let engine = sqlite_engine().await;
-        let event_id = 564;
-        create_event_tables(&engine, SekaiServerRegion::Jp, event_id, true)
-            .await
-            .unwrap();
-        seed_world_bloom_event_with_inverted_time_ids(&engine, event_id).await;
-
-        let (items, _) = search_world_bloom_rankings(
-            &engine,
-            event_id,
-            17,
-            &rank_window(1, 2),
-            PublicUserIdMode::Unique,
-        )
-        .await
-        .unwrap();
-        let rows: Vec<(i64, i64, i64)> = items
-            .into_iter()
-            .map(|item| match item.rank_data {
-                RecordedRankData::WorldBloom(row) => (row.rank, row.timestamp, row.score),
-                RecordedRankData::Normal(_) => panic!("expected world bloom ranking"),
-            })
-            .collect();
-        assert_eq!(
-            rows,
-            vec![(1, 1_710_000_060, 2300), (2, 1_710_000_060, 2200)]
-        );
-
-        let lines = fetch_world_bloom_ranking_lines(&engine, event_id, 17, &[1, 2], None)
-            .await
-            .unwrap();
-        let rows: Vec<_> = lines
-            .iter()
-            .map(|line| (line.rank, line.timestamp, line.score))
-            .collect();
-        assert_eq!(
-            rows,
-            vec![(1, 1_710_000_060, 2300), (2, 1_710_000_060, 2200)]
-        );
     }
 
     #[test]
@@ -2116,7 +2003,8 @@ pub(crate) mod tests {
 
     /// Three samples whose `time_id`s run opposite to their timestamps
     /// (id 1 = +60s, id 2 = +0s, id 3 = +30s), as a historical merge or
-    /// the pre-fix writer could leave them.
+    /// the pre-fix writer could leave them. Input for the `db::repair`
+    /// tests; readers assume this never happens.
     pub(crate) async fn seed_normal_event_with_inverted_time_ids(
         engine: &DatabaseEngine,
         event_id: i64,

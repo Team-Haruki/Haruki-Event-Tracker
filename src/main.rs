@@ -6,12 +6,18 @@ use axum_server::Handle;
 use axum_server::accept::NoDelayAcceptor;
 use axum_server::tls_rustls::{RustlsAcceptor, RustlsConfig};
 
+use haruki_event_tracker::db::engine::DatabaseEngine;
+use haruki_event_tracker::db::repair::repair_time_ids;
+use haruki_event_tracker::model::enums::SekaiServerRegion;
 use haruki_event_tracker::{api, app, config, logger, shutdown};
 
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
 
 #[tokio::main]
 async fn main() -> ExitCode {
+    if std::env::args().nth(1).as_deref() == Some(REPAIR_TIME_IDS) {
+        return repair_time_ids_cli(std::env::args().skip(2)).await;
+    }
     let cfg_location = config::config_location_from_args_env();
     let cfg = match config::load_from_location(&cfg_location).await {
         Ok(c) => c,
@@ -135,6 +141,91 @@ async fn main() -> ExitCode {
     shutdown::run(ctx.scheduler, ctx.trackers, ctx.dbs, ctx.state).await;
     tracing::info!("bye");
     ExitCode::SUCCESS
+}
+
+const REPAIR_TIME_IDS: &str = "repair-time-ids";
+const REPAIR_USAGE: &str = "usage: haruki-event-tracker repair-time-ids --region <jp|en|tw|kr|cn> --event <id> [--dry-run] [--config <uri>]";
+
+/// `repair-time-ids`: restore `time_id` order == `timestamp` order for one
+/// event (see `db::repair`). Runs against the region's configured DB, in
+/// one transaction; `--dry-run` only reports.
+async fn repair_time_ids_cli(args: impl Iterator<Item = String>) -> ExitCode {
+    let mut region = None;
+    let mut event_id = None;
+    let mut dry_run = false;
+    let mut cfg_location = None;
+    let mut args = args.peekable();
+    while let Some(arg) = args.next() {
+        let (key, inline) = match arg.split_once('=') {
+            Some((k, v)) => (k.to_owned(), Some(v.to_owned())),
+            None => (arg, None),
+        };
+        let mut value = || inline.clone().or_else(|| args.next());
+        match key.as_str() {
+            "--region" => region = value().and_then(|v| SekaiServerRegion::parse(&v)),
+            "--event" => event_id = value().and_then(|v| v.parse::<i64>().ok()),
+            "--config" => cfg_location = value(),
+            "--dry-run" => dry_run = true,
+            _ => {
+                eprintln!("unknown argument {key}\n{REPAIR_USAGE}");
+                return ExitCode::from(2);
+            }
+        }
+    }
+    let (Some(region), Some(event_id)) = (region, event_id) else {
+        eprintln!("{REPAIR_USAGE}");
+        return ExitCode::from(2);
+    };
+    let cfg_location = cfg_location.unwrap_or_else(config::config_location_from_env);
+    let cfg = match config::load_from_location(&cfg_location).await {
+        Ok(c) => c,
+        Err(err) => {
+            eprintln!("failed to load {cfg_location}: {err}");
+            return ExitCode::from(1);
+        }
+    };
+    let Some(server_cfg) = cfg.servers.get(&region) else {
+        eprintln!("region {region} is not configured in {cfg_location}");
+        return ExitCode::from(1);
+    };
+    let engine = match DatabaseEngine::connect(&server_cfg.db).await {
+        Ok(engine) => engine,
+        Err(err) => {
+            eprintln!("failed to connect {region} database: {err}");
+            return ExitCode::from(1);
+        }
+    };
+    let result = repair_time_ids(&engine, event_id, dry_run).await;
+    let _ = engine.close().await;
+    match result {
+        Ok(report) => {
+            println!(
+                "{region} event {event_id}: inversions={} drifted_time_rows={} \
+                 orphan_ranking_rows={} orphan_world_bloom_rows={}",
+                report.inversions,
+                report.drifted_time_rows,
+                report.orphan_ranking_rows,
+                report.orphan_world_bloom_rows
+            );
+            if report.applied {
+                println!(
+                    "renumbered: time_rows={} ranking_rows={} world_bloom_rows={}",
+                    report.renumbered_time_rows,
+                    report.renumbered_ranking_rows,
+                    report.renumbered_world_bloom_rows
+                );
+            } else if dry_run && report.inversions > 0 {
+                println!("dry run: nothing changed");
+            } else {
+                println!("no inversions: nothing to do");
+            }
+            ExitCode::SUCCESS
+        }
+        Err(err) => {
+            eprintln!("repair failed: {err}");
+            ExitCode::from(1)
+        }
+    }
 }
 
 async fn resolve_addr(target: &str) -> Result<SocketAddr, ()> {

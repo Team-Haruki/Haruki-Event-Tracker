@@ -64,9 +64,9 @@ pub async fn fetch_latest_world_bloom_ranking(
 ) -> Result<Option<RecordedWorldBloomRankingSchema>, DbErr> {
     let users_tbl = Alias::new(intern(TableKind::EventUsers, event_id));
     let wl_tbl = Alias::new(intern(TableKind::WorldBloom, event_id));
-    // Ordering by the World Bloom table's own `time_id` (monotone with
-    // `timestamp`) keeps the `(character_id, *, time_id)` indexes able to
-    // provide the order — see the same note in `ranking.rs`.
+    // Ordering by the World Bloom table's own `time_id` (an invariant keeps
+    // it in `timestamp` order — see `ranking.rs`) lets the
+    // `(character_id, *, time_id)` indexes provide the order.
     let stmt = wl_select(event_id, mode)
         .and_where(Expr::col((users_tbl, mode.output_column())).eq(user_id))
         .and_where(Expr::col((wl_tbl.clone(), world_bloom::Column::CharacterId)).eq(character_id))

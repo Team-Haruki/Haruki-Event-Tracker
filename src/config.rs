@@ -389,6 +389,10 @@ pub fn config_location_from_args_env() -> String {
         }
     }
 
+    config_location_from_env()
+}
+
+pub fn config_location_from_env() -> String {
     env::var(CONFIG_URI_ENV)
         .or_else(|_| env::var(LEGACY_CONFIG_ENV))
         .unwrap_or_else(|_| DEFAULT_CONFIG_FILE.to_owned())
