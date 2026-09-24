@@ -17,6 +17,7 @@ use sea_orm::{
 };
 
 use crate::db::engine::DatabaseEngine;
+use crate::db::entity::time_id::time_id_for_timestamp;
 use crate::db::entity::{event, event_users, time_id, world_bloom};
 use crate::db::table_name::{TableKind, intern};
 use crate::model::enums::SekaiServerRegion;
@@ -57,6 +58,14 @@ type ExistingUserState<'a> = (HashMap<String, i64>, Vec<DirtyUser<'a>>);
 /// Look up `time_id` per timestamp, inserting new rows with `status` for
 /// timestamps not yet present. Returns a `timestamp -> time_id` map.
 ///
+/// New rows get `time_id_for_timestamp` as their id rather than the
+/// sequence: a coalesced flush carries a whole window of timestamps, the
+/// main and World Bloom batches allocate separately, and a heartbeat can
+/// land while earlier samples are still buffered — with sequence ids each
+/// of those could hand a later sample a smaller id. Existing rows (legacy
+/// sequence ids included) are reused as-is, which is why the map is still
+/// read back rather than derived.
+///
 /// One coalesced flush carries a whole window of per-second timestamps, so
 /// this runs as three set-based statements (select existing, multi-row
 /// conflict-ignoring insert, re-select) instead of up to three statements
@@ -92,7 +101,7 @@ pub(crate) async fn batch_get_or_create_time_ids(
         out.insert(row.timestamp, row.time_id);
     }
 
-    let missing: Vec<i64> = timestamps
+    let mut missing: Vec<i64> = timestamps
         .iter()
         .copied()
         .filter(|ts| !out.contains_key(ts))
@@ -100,12 +109,16 @@ pub(crate) async fn batch_get_or_create_time_ids(
     if missing.is_empty() {
         return Ok(out);
     }
+    missing.sort_unstable();
 
     let mut ins = Query::insert();
-    ins.into_table(Alias::new(table_name))
-        .columns([time_id::Column::Timestamp, time_id::Column::Status]);
+    ins.into_table(Alias::new(table_name)).columns([
+        time_id::Column::TimeId,
+        time_id::Column::Timestamp,
+        time_id::Column::Status,
+    ]);
     for &ts in &missing {
-        ins.values_panic([ts.into(), status.into()]);
+        ins.values_panic([time_id_for_timestamp(ts).into(), ts.into(), status.into()]);
     }
     ins.on_conflict(
         OnConflict::column(time_id::Column::Timestamp)
@@ -735,11 +748,13 @@ fn unwrap_tx_err(e: TransactionError<DbErr>) -> DbErr {
 
 #[cfg(test)]
 mod tests {
-    use sea_orm::sea_query::{Alias, Expr, Func, Query};
-    use sea_orm::{Database, DatabaseBackend, FromQueryResult};
+    use sea_orm::sea_query::{Alias, Expr, Func, Order, Query};
+    use sea_orm::{Database, DatabaseBackend, FromQueryResult, Statement};
 
     use super::*;
     use crate::db::engine::DatabaseEngine;
+    use crate::db::query::heartbeat::write_heartbeat;
+    use crate::db::query::lines::fetch_ranking_lines;
     use crate::db::query::user::{PublicUserIdMode, get_user_data};
     use crate::db::schema::create_event_tables;
     use crate::model::sekai::{UserCard, UserPlayerFrame, UserProfileHonor};
@@ -748,6 +763,167 @@ mod tests {
     #[derive(FromQueryResult)]
     struct CountRow {
         n: i64,
+    }
+
+    fn record(
+        timestamp: i64,
+        user_id: &str,
+        rank: i64,
+        score: i64,
+    ) -> PlayerEventRankingRecordSchema {
+        PlayerEventRankingRecordSchema {
+            timestamp,
+            user_id: user_id.into(),
+            name: format!("player-{user_id}"),
+            score,
+            rank,
+            cheerful_team_id: None,
+            profile: PlayerProfileSchema::default(),
+        }
+    }
+
+    async fn time_rows_by_id(engine: &DatabaseEngine, event_id: i64) -> Vec<(i64, i64)> {
+        let stmt = Query::select()
+            .expr_as(Expr::col(time_id::Column::TimeId), Alias::new("time_id"))
+            .expr_as(
+                Expr::col(time_id::Column::Timestamp),
+                Alias::new("timestamp"),
+            )
+            .from(Alias::new(intern(TableKind::TimeId, event_id)))
+            .order_by(time_id::Column::TimeId, Order::Asc)
+            .to_owned();
+        TimeIdRow::find_by_statement(engine.backend().build(&stmt))
+            .all(engine.conn())
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| (row.time_id, row.timestamp))
+            .collect()
+    }
+
+    /// Reproduces every allocation path the writer has — a coalesced main
+    /// flush carrying several timestamps, a heartbeat written while older
+    /// samples are still buffered, a World Bloom batch landing after a main
+    /// batch with newer timestamps — and checks id order can't diverge from
+    /// timestamp order, so `MAX(time_id)` and "latest by timestamp" agree.
+    #[tokio::test]
+    async fn time_ids_follow_timestamps_whatever_the_insert_order() {
+        let conn = Database::connect("sqlite::memory:").await.unwrap();
+        let engine = DatabaseEngine::from_connection(conn, DatabaseBackend::Sqlite);
+        let event_id = 7171;
+        create_event_tables(&engine, SekaiServerRegion::Jp, event_id, true)
+            .await
+            .unwrap();
+        let t = 1_710_000_000;
+        let anonymizer = UidAnonymizer::disabled();
+
+        batch_insert_event_rankings(
+            &engine,
+            SekaiServerRegion::Jp,
+            event_id,
+            &anonymizer,
+            &[
+                record(t + 3, "100", 1, 1_300),
+                record(t + 1, "100", 1, 1_100),
+            ],
+        )
+        .await
+        .unwrap();
+        write_heartbeat(&engine, event_id, t + 5, 1).await.unwrap();
+        let wl = PlayerWorldBloomRankingRecordSchema {
+            base: record(t + 2, "100", 1, 500),
+            character_id: 19,
+        };
+        batch_insert_world_bloom_rankings(
+            &engine,
+            SekaiServerRegion::Jp,
+            event_id,
+            &anonymizer,
+            &[wl],
+            &mut HashMap::new(),
+            &mut HashMap::new(),
+        )
+        .await
+        .unwrap();
+        batch_insert_event_rankings(
+            &engine,
+            SekaiServerRegion::Jp,
+            event_id,
+            &anonymizer,
+            &[record(t + 4, "100", 1, 1_400)],
+        )
+        .await
+        .unwrap();
+
+        let rows = time_rows_by_id(&engine, event_id).await;
+        assert_eq!(
+            rows,
+            vec![
+                (t + 1, t + 1),
+                (t + 2, t + 2),
+                (t + 3, t + 3),
+                (t + 4, t + 4),
+                (t + 5, t + 5),
+            ]
+        );
+        let lines = fetch_ranking_lines(&engine, event_id, &[1], None)
+            .await
+            .unwrap();
+        assert_eq!((lines[0].timestamp, lines[0].score), (t + 4, 1_400));
+    }
+
+    #[tokio::test]
+    async fn existing_time_id_rows_are_reused_not_reallocated() {
+        let conn = Database::connect("sqlite::memory:").await.unwrap();
+        let engine = DatabaseEngine::from_connection(conn, DatabaseBackend::Sqlite);
+        let event_id = 7272;
+        create_event_tables(&engine, SekaiServerRegion::Jp, event_id, false)
+            .await
+            .unwrap();
+        let t = 1_710_000_000;
+        // A legacy sequence-numbered row, as written before ids followed
+        // timestamps.
+        engine
+            .conn()
+            .execute_raw(Statement::from_string(
+                DatabaseBackend::Sqlite,
+                format!(
+                    "INSERT INTO {} (timestamp, status) VALUES ({t}, 0)",
+                    intern(TableKind::TimeId, event_id)
+                ),
+            ))
+            .await
+            .unwrap();
+
+        batch_insert_event_rankings(
+            &engine,
+            SekaiServerRegion::Jp,
+            event_id,
+            &UidAnonymizer::disabled(),
+            &[record(t, "100", 1, 1_000), record(t + 1, "100", 1, 1_001)],
+        )
+        .await
+        .unwrap();
+        write_heartbeat(&engine, event_id, t, 1).await.unwrap();
+
+        assert_eq!(
+            time_rows_by_id(&engine, event_id).await,
+            vec![(1, t), (t + 1, t + 1)]
+        );
+        let stmt = Query::select()
+            .expr_as(
+                Func::count(Expr::col(event::Column::TimeId)),
+                Alias::new("n"),
+            )
+            .from(Alias::new(intern(TableKind::Event, event_id)))
+            .and_where(Expr::col(event::Column::TimeId).eq(1))
+            .to_owned();
+        let count = CountRow::find_by_statement(engine.backend().build(&stmt))
+            .one(engine.conn())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(count.n, 1);
     }
 
     #[tokio::test]

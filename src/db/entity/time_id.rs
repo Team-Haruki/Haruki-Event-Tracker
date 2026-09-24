@@ -5,9 +5,26 @@
 //! and `wl_*` tables. `status=0` means a real ranking sample, `status=1+`
 //! is a heartbeat written when the upstream API failed or nothing changed.
 //!
+//! `time_id` is an identity, not an order. Rows written by this tracker
+//! use [`time_id_for_timestamp`] (`time_id == timestamp`), so id order and
+//! sample order agree by construction for everything it writes; rows that
+//! predate that rule keep their auto-increment ids (all far below epoch
+//! seconds), and historical merges have produced tables where a later
+//! sample carries a smaller id. Readers that need "latest" therefore order
+//! by `timestamp`, never by `time_id`.
+//!
 //! Column names and types match the Go `TimeIDTable` (`utils/gorm/tables.go`).
 
 use sea_orm::entity::prelude::*;
+
+/// The `time_id` this tracker assigns to a new sample at `timestamp`
+/// (epoch seconds). Deterministic and order-preserving, so coalesced
+/// flushes, the separate main / World Bloom batches, heartbeats and retries
+/// can never allocate ids out of timestamp order, whatever order their
+/// statements reach the database in.
+pub fn time_id_for_timestamp(timestamp: i64) -> i64 {
+    timestamp
+}
 
 #[derive(Copy, Clone, Default, Debug, DeriveEntity)]
 pub struct Entity {

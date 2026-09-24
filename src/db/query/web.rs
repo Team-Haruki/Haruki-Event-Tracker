@@ -37,14 +37,6 @@ impl WebRankingFilter {
     fn is_rank_window(&self) -> bool {
         self.rank_min.is_some() || self.rank_max.is_some() || self.rank_in.is_some()
     }
-
-    fn has_time_filter(&self) -> bool {
-        self.start_time.is_some()
-            || self.end_time.is_some()
-            || self.before.is_some()
-            || self.after.is_some()
-            || self.timestamp.is_some()
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -521,6 +513,8 @@ fn latest_rank_window_select(
     let users_tbl = Alias::new(intern(TableKind::EventUsers, event_id));
     let latest_tbl = Alias::new("latest_rank");
 
+    // Latest sample per rank by `timestamp` (unique per event), never by
+    // `time_id`: the id is an identity, not an order — see `lines.rs`.
     let mut latest = Query::select();
     latest
         .expr_as(
@@ -528,26 +522,20 @@ fn latest_rank_window_select(
             Alias::new("rank"),
         )
         .expr_as(
-            Expr::col((event_tbl.clone(), event::Column::TimeId)).max(),
-            Alias::new("time_id"),
+            Expr::col((time_tbl.clone(), time_id::Column::Timestamp)).max(),
+            Alias::new("timestamp"),
         )
-        .from(event_tbl.clone());
-    // The time table is only needed to translate time filters into
-    // `time_id`s; without them, `MAX(time_id) GROUP BY rank` runs entirely
-    // on the `(rank, time_id)` index instead of probing the time table for
-    // every history row in the rank range.
-    if filter.has_time_filter() {
-        latest.inner_join(
+        .from(event_tbl.clone())
+        .inner_join(
             time_tbl.clone(),
             Expr::col((event_tbl.clone(), event::Column::TimeId))
                 .equals((time_tbl.clone(), time_id::Column::TimeId)),
         );
-        apply_rank_window_time_filters(
-            &mut latest,
-            Expr::col((time_tbl.clone(), time_id::Column::Timestamp)),
-            filter,
-        );
-    }
+    apply_rank_window_time_filters(
+        &mut latest,
+        Expr::col((time_tbl.clone(), time_id::Column::Timestamp)),
+        filter,
+    );
     if let Some(rank_min) = filter.rank_min {
         latest.and_where(Expr::col((event_tbl.clone(), event::Column::Rank)).gte(rank_min));
     }
@@ -601,8 +589,8 @@ fn latest_rank_window_select(
             Expr::col((event_tbl.clone(), event::Column::Rank))
                 .equals((latest_tbl.clone(), Alias::new("rank")))
                 .and(
-                    Expr::col((event_tbl.clone(), event::Column::TimeId))
-                        .equals((latest_tbl, Alias::new("time_id"))),
+                    Expr::col((time_tbl.clone(), time_id::Column::Timestamp))
+                        .equals((latest_tbl, Alias::new("timestamp"))),
                 ),
         )
         .inner_join(
@@ -642,23 +630,21 @@ fn latest_world_bloom_rank_window_select(
             Alias::new("rank"),
         )
         .expr_as(
-            Expr::col((wl_tbl.clone(), world_bloom::Column::TimeId)).max(),
-            Alias::new("time_id"),
+            Expr::col((time_tbl.clone(), time_id::Column::Timestamp)).max(),
+            Alias::new("timestamp"),
         )
         .from(wl_tbl.clone())
-        .and_where(Expr::col((wl_tbl.clone(), world_bloom::Column::CharacterId)).eq(character_id));
-    if filter.has_time_filter() {
-        latest.inner_join(
+        .inner_join(
             time_tbl.clone(),
             Expr::col((wl_tbl.clone(), world_bloom::Column::TimeId))
                 .equals((time_tbl.clone(), time_id::Column::TimeId)),
-        );
-        apply_rank_window_time_filters(
-            &mut latest,
-            Expr::col((time_tbl.clone(), time_id::Column::Timestamp)),
-            filter,
-        );
-    }
+        )
+        .and_where(Expr::col((wl_tbl.clone(), world_bloom::Column::CharacterId)).eq(character_id));
+    apply_rank_window_time_filters(
+        &mut latest,
+        Expr::col((time_tbl.clone(), time_id::Column::Timestamp)),
+        filter,
+    );
     if let Some(rank_min) = filter.rank_min {
         latest.and_where(Expr::col((wl_tbl.clone(), world_bloom::Column::Rank)).gte(rank_min));
     }
@@ -716,8 +702,8 @@ fn latest_world_bloom_rank_window_select(
             Expr::col((wl_tbl.clone(), world_bloom::Column::Rank))
                 .equals((latest_tbl.clone(), Alias::new("rank")))
                 .and(
-                    Expr::col((wl_tbl.clone(), world_bloom::Column::TimeId))
-                        .equals((latest_tbl, Alias::new("time_id"))),
+                    Expr::col((time_tbl.clone(), time_id::Column::Timestamp))
+                        .equals((latest_tbl, Alias::new("timestamp"))),
                 ),
         )
         .inner_join(
@@ -1333,8 +1319,153 @@ pub(crate) mod tests {
 
     use crate::db::engine::DatabaseEngine;
     use crate::db::query::growth::fetch_ranking_score_growths;
+    use crate::db::query::lines::{fetch_ranking_lines, fetch_world_bloom_ranking_lines};
     use crate::db::schema::create_event_tables;
     use crate::model::enums::SekaiServerRegion;
+
+    fn rank_window(rank_min: i64, rank_max: i64) -> WebRankingFilter {
+        WebRankingFilter {
+            rank_min: Some(rank_min),
+            rank_max: Some(rank_max),
+            rank_in: None,
+            score_min: None,
+            score_max: None,
+            start_time: None,
+            end_time: None,
+            before: None,
+            after: None,
+            timestamp: None,
+            cursor: None,
+            limit: 10,
+        }
+    }
+
+    // The inversion seeds below give the *newest* sample the *smallest*
+    // `time_id` (ids 1/2/3 carry +60s/+0s/+30s), so anything that orders by
+    // id instead of timestamp returns the +30s row.
+
+    #[tokio::test]
+    async fn web_ranking_window_picks_latest_by_timestamp_not_time_id() {
+        let engine = sqlite_engine().await;
+        let event_id = 561;
+        create_event_tables(&engine, SekaiServerRegion::Jp, event_id, false)
+            .await
+            .unwrap();
+        seed_normal_event_with_inverted_time_ids(&engine, event_id).await;
+
+        let (items, cursor) = search_rankings(
+            &engine,
+            event_id,
+            &rank_window(1, 2),
+            PublicUserIdMode::Unique,
+        )
+        .await
+        .unwrap();
+        assert!(cursor.is_none());
+        let rows: Vec<(i64, i64, i64)> = items
+            .into_iter()
+            .map(|item| match item.rank_data {
+                RecordedRankData::Normal(row) => (row.rank, row.timestamp, row.score),
+                RecordedRankData::WorldBloom(_) => panic!("expected normal ranking"),
+            })
+            .collect();
+        assert_eq!(
+            rows,
+            vec![(1, 1_710_000_060, 1300), (2, 1_710_000_060, 1200)]
+        );
+    }
+
+    #[tokio::test]
+    async fn ranking_lines_pick_latest_by_timestamp_not_time_id() {
+        let engine = sqlite_engine().await;
+        let event_id = 562;
+        create_event_tables(&engine, SekaiServerRegion::Jp, event_id, false)
+            .await
+            .unwrap();
+        seed_normal_event_with_inverted_time_ids(&engine, event_id).await;
+
+        let lines = fetch_ranking_lines(&engine, event_id, &[1, 2, 3], None)
+            .await
+            .unwrap();
+        let rows: Vec<_> = lines
+            .iter()
+            .map(|line| (line.rank, line.timestamp, line.score))
+            .collect();
+        assert_eq!(
+            rows,
+            vec![(1, 1_710_000_060, 1300), (2, 1_710_000_060, 1200)]
+        );
+
+        // A cutoff still resolves to the newest sample at or before it.
+        let lines = fetch_ranking_lines(&engine, event_id, &[1], Some(1_710_000_030))
+            .await
+            .unwrap();
+        assert_eq!((lines[0].timestamp, lines[0].score), (1_710_000_030, 1150));
+    }
+
+    #[tokio::test]
+    async fn ranking_score_growths_take_edges_by_timestamp_not_time_id() {
+        let engine = sqlite_engine().await;
+        let event_id = 563;
+        create_event_tables(&engine, SekaiServerRegion::Jp, event_id, false)
+            .await
+            .unwrap();
+        seed_normal_event_with_inverted_time_ids(&engine, event_id).await;
+
+        let growths = fetch_ranking_score_growths(&engine, event_id, &[1], 1_710_000_000, None)
+            .await
+            .unwrap();
+        assert_eq!(growths.len(), 1);
+        assert_eq!(growths[0].timestamp_earlier, Some(1_710_000_000));
+        assert_eq!(growths[0].score_earlier, Some(1000));
+        assert_eq!(growths[0].timestamp_latest, 1_710_000_060);
+        assert_eq!(growths[0].score_latest, 1300);
+        assert_eq!(growths[0].growth, Some(300));
+        assert_eq!(growths[0].time_diff, Some(60));
+    }
+
+    #[tokio::test]
+    async fn web_world_bloom_window_picks_latest_by_timestamp_not_time_id() {
+        let engine = sqlite_engine().await;
+        let event_id = 564;
+        create_event_tables(&engine, SekaiServerRegion::Jp, event_id, true)
+            .await
+            .unwrap();
+        seed_world_bloom_event_with_inverted_time_ids(&engine, event_id).await;
+
+        let (items, _) = search_world_bloom_rankings(
+            &engine,
+            event_id,
+            17,
+            &rank_window(1, 2),
+            PublicUserIdMode::Unique,
+        )
+        .await
+        .unwrap();
+        let rows: Vec<(i64, i64, i64)> = items
+            .into_iter()
+            .map(|item| match item.rank_data {
+                RecordedRankData::WorldBloom(row) => (row.rank, row.timestamp, row.score),
+                RecordedRankData::Normal(_) => panic!("expected world bloom ranking"),
+            })
+            .collect();
+        assert_eq!(
+            rows,
+            vec![(1, 1_710_000_060, 2300), (2, 1_710_000_060, 2200)]
+        );
+
+        let lines = fetch_world_bloom_ranking_lines(&engine, event_id, 17, &[1, 2], None)
+            .await
+            .unwrap();
+        let rows: Vec<_> = lines
+            .iter()
+            .map(|line| (line.rank, line.timestamp, line.score))
+            .collect();
+        assert_eq!(
+            rows,
+            vec![(1, 1_710_000_060, 2300), (2, 1_710_000_060, 2200)]
+        );
+    }
 
     #[test]
     fn ranking_cursor_round_trip_parts() {
@@ -1973,6 +2104,70 @@ pub(crate) mod tests {
                 "INSERT INTO {event_tbl} (time_id, user_id_key, score, rank) VALUES \
                 (1, 1, 1000, 1), (1, 2, 900, 2), \
                 (2, 2, 1600, 1), (2, 1, 1500, 2)"
+            ),
+        ] {
+            engine
+                .conn()
+                .execute_raw(Statement::from_string(DatabaseBackend::Sqlite, sql))
+                .await
+                .unwrap();
+        }
+    }
+
+    /// Three samples whose `time_id`s run opposite to their timestamps
+    /// (id 1 = +60s, id 2 = +0s, id 3 = +30s), as a historical merge or
+    /// the pre-fix writer could leave them.
+    pub(crate) async fn seed_normal_event_with_inverted_time_ids(
+        engine: &DatabaseEngine,
+        event_id: i64,
+    ) {
+        let users_tbl = intern(TableKind::EventUsers, event_id);
+        let time_tbl = intern(TableKind::TimeId, event_id);
+        let event_tbl = intern(TableKind::Event, event_id);
+        for sql in [
+            format!(
+                "INSERT INTO {users_tbl} (user_id, unique_id, name) VALUES \
+                ('100', 'u-public-1', 'Alpha'), ('200', 'u-public-2', 'Beta')"
+            ),
+            format!(
+                "INSERT INTO {time_tbl} (time_id, timestamp, status) VALUES \
+                (1, 1710000060, 0), (2, 1710000000, 0), (3, 1710000030, 0)"
+            ),
+            format!(
+                "INSERT INTO {event_tbl} (time_id, user_id_key, score, rank) VALUES \
+                (1, 1, 1300, 1), (2, 1, 1000, 1), (3, 1, 1150, 1), \
+                (1, 2, 1200, 2), (2, 2, 900, 2), (3, 2, 1050, 2)"
+            ),
+        ] {
+            engine
+                .conn()
+                .execute_raw(Statement::from_string(DatabaseBackend::Sqlite, sql))
+                .await
+                .unwrap();
+        }
+    }
+
+    pub(crate) async fn seed_world_bloom_event_with_inverted_time_ids(
+        engine: &DatabaseEngine,
+        event_id: i64,
+    ) {
+        let users_tbl = intern(TableKind::EventUsers, event_id);
+        let time_tbl = intern(TableKind::TimeId, event_id);
+        let wl_tbl = intern(TableKind::WorldBloom, event_id);
+        for sql in [
+            format!(
+                "INSERT INTO {users_tbl} (user_id, unique_id, name) VALUES \
+                ('100', 'u-public-1', 'Alpha'), ('200', 'u-public-2', 'Beta')"
+            ),
+            format!(
+                "INSERT INTO {time_tbl} (time_id, timestamp, status) VALUES \
+                (1, 1710000060, 0), (2, 1710000000, 0), (3, 1710000030, 0)"
+            ),
+            format!(
+                "INSERT INTO {wl_tbl} (time_id, user_id_key, character_id, score, rank) VALUES \
+                (1, 1, 17, 2300, 1), (2, 1, 17, 2000, 1), (3, 1, 17, 2150, 1), \
+                (1, 2, 17, 2200, 2), (2, 2, 17, 1900, 2), (3, 2, 17, 2050, 2), \
+                (1, 1, 19, 9000, 1)"
             ),
         ] {
             engine

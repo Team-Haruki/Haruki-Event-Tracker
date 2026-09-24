@@ -830,8 +830,13 @@ fn should_write_status_heartbeat(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use sea_orm::{Database, DatabaseBackend};
+    use sea_orm::sea_query::{Alias, Expr, Order, Query};
+    use sea_orm::{Database, DatabaseBackend, FromQueryResult};
     use std::sync::atomic::{AtomicI64, Ordering};
+
+    use crate::db::entity::time_id;
+    use crate::db::query::lines::fetch_ranking_lines;
+    use crate::db::table_name::{TableKind, intern};
 
     static NEXT_EVENT_ID: AtomicI64 = AtomicI64::new(950_000);
 
@@ -1049,6 +1054,80 @@ pub(crate) mod tests {
         );
         assert!(!tracker.pending_hot);
         assert!(tracker.pending_records.is_empty());
+    }
+
+    /// The flush path that used to invert ids: samples buffered across a
+    /// window, an API-error heartbeat written in between, then the coalesced
+    /// flush. Ids must still follow timestamps so the latest-per-rank reads
+    /// agree with the newest sample.
+    #[tokio::test]
+    async fn coalesced_flush_after_error_heartbeat_keeps_ids_in_timestamp_order() {
+        let Some(mut tracker) = tracker_fixture(SekaiEventType::Marathon).await else {
+            return;
+        };
+        tracker.tuning.flush_interval_secs = 300;
+        let t = 1_700_000_200;
+        let sample = |ts: i64, score: i64| HandledRankingData {
+            record_time: ts,
+            rankings: vec![ranking(50, 300, score)],
+            world_bloom_rankings: HashMap::new(),
+            border_cache: None,
+        };
+
+        for (offset, score) in [(0, 1_000), (1, 1_100)] {
+            assert!(
+                !tracker
+                    .persist_ranking_data(
+                        &sample(t + offset, score),
+                        false,
+                        false,
+                        false,
+                        t + offset
+                    )
+                    .await
+                    .unwrap()
+            );
+        }
+        assert_eq!(tracker.pending_records.len(), 2);
+        // Upstream failure while the two samples are still buffered.
+        tracker.write_status_heartbeat(t + 2, 1).await.unwrap();
+        assert!(
+            tracker
+                .persist_ranking_data(&sample(t + 3, 1_200), false, true, false, t + 3)
+                .await
+                .unwrap()
+        );
+
+        #[derive(FromQueryResult)]
+        struct Row {
+            time_id: i64,
+            timestamp: i64,
+        }
+        let stmt = Query::select()
+            .expr_as(Expr::col(time_id::Column::TimeId), Alias::new("time_id"))
+            .expr_as(
+                Expr::col(time_id::Column::Timestamp),
+                Alias::new("timestamp"),
+            )
+            .from(Alias::new(intern(TableKind::TimeId, tracker.event_id)))
+            .order_by(time_id::Column::TimeId, Order::Asc)
+            .to_owned();
+        let rows: Vec<(i64, i64)> = Row::find_by_statement(tracker.db.backend().build(&stmt))
+            .all(tracker.db.conn())
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| (row.time_id, row.timestamp))
+            .collect();
+        assert_eq!(
+            rows,
+            vec![(t, t), (t + 1, t + 1), (t + 2, t + 2), (t + 3, t + 3)]
+        );
+
+        let lines = fetch_ranking_lines(&tracker.db, tracker.event_id, &[50], None)
+            .await
+            .unwrap();
+        assert_eq!((lines[0].timestamp, lines[0].score), (t + 3, 1_200));
     }
 
     #[tokio::test]

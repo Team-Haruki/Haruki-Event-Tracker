@@ -11,6 +11,7 @@ use sea_orm::{ConnectionTrait, DatabaseBackend, DbErr, ExprTrait, FromQueryResul
 
 use crate::db::engine::DatabaseEngine;
 use crate::db::entity::time_id;
+use crate::db::entity::time_id::time_id_for_timestamp;
 use crate::db::table_name::{TableKind, intern};
 
 #[derive(FromQueryResult)]
@@ -44,13 +45,23 @@ pub async fn write_heartbeat(
     status: i16,
 ) -> Result<(), DbErr> {
     let table = intern(TableKind::TimeId, event_id);
-    // The caller never reads the generated `time_id` back, so a single
+    // The caller never reads the `time_id` back, so a single
     // conflict-ignoring insert replaces the SELECT/INSERT/re-SELECT
-    // transaction this used to share with the batch writer.
+    // transaction this used to share with the batch writer. The id follows
+    // the same timestamp-derived rule as sample rows, so a heartbeat written
+    // while earlier samples are still buffered can't outrun them.
     let ins = Query::insert()
         .into_table(Alias::new(table))
-        .columns([time_id::Column::Timestamp, time_id::Column::Status])
-        .values_panic([timestamp.into(), status.into()])
+        .columns([
+            time_id::Column::TimeId,
+            time_id::Column::Timestamp,
+            time_id::Column::Status,
+        ])
+        .values_panic([
+            time_id_for_timestamp(timestamp).into(),
+            timestamp.into(),
+            status.into(),
+        ])
         .on_conflict(
             OnConflict::column(time_id::Column::Timestamp)
                 .do_nothing_on([time_id::Column::Timestamp])

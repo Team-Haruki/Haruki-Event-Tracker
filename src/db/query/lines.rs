@@ -1,12 +1,16 @@
 //! Per-rank "latest score" lookups for the `/ranking-lines` endpoint
 //! (Go: `FetchRankingLines`, `FetchWorldBloomRankingLines`).
 //!
-//! All ranks are resolved in a single round trip: a `MAX(time_id) GROUP BY
-//! rank` subquery finds each rank's latest row on the `(rank, time_id)`
-//! index, and the outer select joins back for the score and timestamp.
-//! Query errors are swallowed into an empty result — matching the Go
-//! reference, which discards goroutine errors and only collects rows that
-//! actually came back (and keeping pre-table-bootstrap events a 200).
+//! All ranks are resolved in a single round trip: a `MAX(timestamp) GROUP
+//! BY rank` subquery over the ranking ↔ time-id join finds each rank's
+//! latest sample, and the outer select joins back for the score. The edge
+//! is taken on `timestamp`, never on `time_id`: `time_id` is only an
+//! identity, and historical merges have left tables where a later sample
+//! carries a smaller id (`timestamp` is unique per event, so the edge
+//! resolves to exactly one row). Query errors are swallowed into an empty
+//! result — matching the Go reference, which discards goroutine errors and
+//! only collects rows that actually came back (and keeping
+//! pre-table-bootstrap events a 200).
 
 use std::collections::HashMap;
 
@@ -46,35 +50,29 @@ pub(crate) fn rank_edge_select(
     let rank_col = Alias::new("rank");
     let score_col = Alias::new("score");
     let tid_col = Alias::new("time_id");
+    let edge_ts_col = Alias::new("edge_ts");
     let character_col = Alias::new("character_id");
+    let ts_col = || Expr::col((time_tbl.clone(), time_id::Column::Timestamp));
+    let time_join = || {
+        Expr::col((tbl.clone(), tid_col.clone()))
+            .equals((time_tbl.clone(), time_id::Column::TimeId))
+    };
 
     let mut edge_sub = Query::select();
     edge_sub.expr_as(Expr::col((tbl.clone(), rank_col.clone())), rank_col.clone());
     let edge_expr = match edge {
-        RankEdge::Earliest => Expr::col((tbl.clone(), tid_col.clone())).min(),
-        RankEdge::Latest => Expr::col((tbl.clone(), tid_col.clone())).max(),
+        RankEdge::Earliest => ts_col().min(),
+        RankEdge::Latest => ts_col().max(),
     };
     edge_sub
-        .expr_as(edge_expr, tid_col.clone())
-        .from(tbl.clone());
-    // The time table is only needed to translate time bounds into
-    // `time_id`s; without them the grouped edge runs entirely on the
-    // `(rank, time_id)` index.
-    if start_time.is_some() || end_time.is_some() {
-        edge_sub.inner_join(
-            time_tbl.clone(),
-            Expr::col((tbl.clone(), tid_col.clone()))
-                .equals((time_tbl.clone(), time_id::Column::TimeId)),
-        );
-        if let Some(start_time) = start_time {
-            edge_sub.and_where(
-                Expr::col((time_tbl.clone(), time_id::Column::Timestamp)).gte(start_time),
-            );
-        }
-        if let Some(end_time) = end_time {
-            edge_sub
-                .and_where(Expr::col((time_tbl.clone(), time_id::Column::Timestamp)).lte(end_time));
-        }
+        .expr_as(edge_expr, edge_ts_col.clone())
+        .from(tbl.clone())
+        .inner_join(time_tbl.clone(), time_join());
+    if let Some(start_time) = start_time {
+        edge_sub.and_where(ts_col().gte(start_time));
+    }
+    if let Some(end_time) = end_time {
+        edge_sub.and_where(ts_col().lte(end_time));
     }
     edge_sub.and_where(Expr::col((tbl.clone(), rank_col.clone())).is_in(ranks.iter().copied()));
     if let Some(character_id) = spec.character_id {
@@ -83,28 +81,22 @@ pub(crate) fn rank_edge_select(
     edge_sub.group_by_col((tbl.clone(), rank_col.clone()));
 
     let mut stmt = Query::select();
-    stmt.expr_as(
-        Expr::col((time_tbl.clone(), time_id::Column::Timestamp)),
-        Alias::new("timestamp"),
-    )
-    .expr_as(Expr::col((tbl.clone(), score_col)), Alias::new("score"))
-    .expr_as(
-        Expr::col((tbl.clone(), rank_col.clone())),
-        Alias::new("rank"),
-    )
-    .from(tbl.clone())
-    .join_subquery(
-        JoinType::InnerJoin,
-        edge_sub.to_owned(),
-        edge_tbl.clone(),
-        Expr::col((tbl.clone(), rank_col.clone()))
-            .equals((edge_tbl.clone(), rank_col.clone()))
-            .and(Expr::col((tbl.clone(), tid_col.clone())).equals((edge_tbl, tid_col.clone()))),
-    )
-    .inner_join(
-        time_tbl.clone(),
-        Expr::col((tbl.clone(), tid_col)).equals((time_tbl, time_id::Column::TimeId)),
-    );
+    stmt.expr_as(ts_col(), Alias::new("timestamp"))
+        .expr_as(Expr::col((tbl.clone(), score_col)), Alias::new("score"))
+        .expr_as(
+            Expr::col((tbl.clone(), rank_col.clone())),
+            Alias::new("rank"),
+        )
+        .from(tbl.clone())
+        .inner_join(time_tbl.clone(), time_join())
+        .join_subquery(
+            JoinType::InnerJoin,
+            edge_sub.to_owned(),
+            edge_tbl.clone(),
+            Expr::col((tbl.clone(), rank_col.clone()))
+                .equals((edge_tbl.clone(), rank_col.clone()))
+                .and(ts_col().equals((edge_tbl, edge_ts_col))),
+        );
     if let Some(character_id) = spec.character_id {
         stmt.and_where(Expr::col((tbl.clone(), character_col)).eq(character_id));
     }
