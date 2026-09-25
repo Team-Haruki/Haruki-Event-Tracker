@@ -6,7 +6,8 @@
 //! is a heartbeat written when the upstream API failed or nothing changed.
 //!
 //! Invariant: `time_id` order == `timestamp` order. Readers depend on it
-//! ("latest" is `MAX(time_id)` on the ranking-table indexes). Rows written
+//! ("latest" is the highest `time_id` on the ranking-table indexes, and
+//! time windows become `time_id` ranges; see `db::query::edge`). Rows written
 //! by this tracker use [`time_id_for_timestamp`] (`time_id == timestamp`),
 //! so the invariant holds by construction for everything it writes; rows
 //! that predate that rule keep their sequence ids and are renumbered by

@@ -3,9 +3,10 @@
 //! `FetchWorldBloomRankingScoreGrowths`).
 //!
 //! Each rank only needs the earliest and latest row in the window. Both
-//! edges are resolved for all ranks at once — one `MIN(time_id)` and one
-//! `MAX(time_id)` grouped subquery joined back to the ranking table — so
-//! the whole endpoint costs two round trips instead of two per rank.
+//! edges are resolved for all ranks at once — one earliest and one latest
+//! per-rank edge probe (`db::query::edge`) joined back to the ranking
+//! table — so the whole endpoint costs two round trips instead of two per
+//! rank, and neither grows with the table.
 //! Ranks with fewer than two rows are skipped. Errors are silently
 //! dropped to mirror the Go goroutines.
 
