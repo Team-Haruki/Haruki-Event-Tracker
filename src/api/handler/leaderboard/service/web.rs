@@ -10,9 +10,11 @@ use crate::model::api::{
     WebSubjectSchema, WebUserDetailResponseSchema,
 };
 
-use super::snapshot::{SnapshotBuildRequest, build_rank_snapshots_response};
+use super::snapshot::{
+    SnapshotBuildRequest, build_rank_snapshots_response, resolve_rank_cut, resolve_user_rank,
+};
 use super::trace::{SubjectTraceQuery, build_subject_trace_response};
-use super::util::{interval_seconds, meta, positive_timestamp, rank_of_item, user_id_of_rank_data};
+use super::util::{interval_seconds, meta, positive_timestamp, user_id_of_rank_data};
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -70,24 +72,36 @@ pub(crate) async fn web_overview_for_scope(
     let interval = interval_seconds(query.interval);
     let at = positive_timestamp(query.at);
     let end_time = at.unwrap_or_else(|| chrono::Utc::now().timestamp());
+    let (region, engine) = resolve_region_engine(&state, &server)?;
+    let cut = Box::pin(resolve_rank_cut(
+        &state,
+        &server,
+        &engine,
+        event_id,
+        character_id,
+        at,
+    ))
+    .await?;
+    let cut_key = cut.as_of_time_id;
     let suffix = match character_id {
-        Some(character_id) => {
-            format!("{cache_prefix}:wb:{character_id}:overview:interval={interval}:at={at:?}")
+        Some(character_id) => format!(
+            "{cache_prefix}:wb:{character_id}:overview:interval={interval}:at={at:?}:cut={cut_key:?}"
+        ),
+        None => {
+            format!("{cache_prefix}:total:overview:interval={interval}:at={at:?}:cut={cut_key:?}")
         }
-        None => format!("{cache_prefix}:total:overview:interval={interval}:at={at:?}"),
     };
     let cache_server = server.clone();
     let fetch = async {
-        let (region, engine) = resolve_region_engine(&state, &server)?;
         let mode =
             prepare_audience_user_id_mode(&state, &engine, region, event_id, ApiAudience::Web)
                 .await?;
         let overview = match character_id {
             Some(character_id) => {
-                build_world_bloom_overview(&engine, event_id, character_id, mode, interval, at)
+                build_world_bloom_overview(&engine, event_id, character_id, mode, interval, cut)
                     .await?
             }
-            None => build_overview(&engine, event_id, mode, interval, at).await?,
+            None => build_overview(&engine, event_id, mode, interval, cut).await?,
         };
         Ok(LeaderboardOverviewSchema {
             meta: meta(&server, event_id, character_id, end_time),
@@ -134,6 +148,7 @@ pub(crate) async fn web_rank_detail_for_scope(
             at,
             cache_prefix: "web:v2",
             audience: ApiAudience::Web,
+            cut: None,
         },
     )
     .await?;
@@ -313,30 +328,18 @@ async fn web_user_detail_by_unique_id(
     user_id: String,
     query: WebDetailQuery,
 ) -> Result<Json<WebUserDetailResponseSchema>, ApiError> {
-    let trace = build_subject_trace_response(
-        state.clone(),
-        server.clone(),
+    let at = positive_timestamp(query.at);
+    let (rank, cut) = Box::pin(resolve_user_rank(
+        &state,
+        &server,
         event_id,
         character_id,
-        user_id.clone(),
-        SubjectTraceQuery {
-            subject_type: Some("user".to_owned()),
-            include_current: Some(true),
-            start_time: None,
-            end_time: None,
-            cursor: None,
-            limit: Some(1),
-        },
-        "web:v2",
+        &user_id,
+        at,
         ApiAudience::Web,
-    )
+    ))
     .await?;
-    let current = trace.current;
-    let rank = current
-        .as_ref()
-        .and_then(rank_of_item)
-        .ok_or(ApiError::NotFound)?;
-    let snapshot = build_rank_snapshots_response(
+    let snapshot = Box::pin(build_rank_snapshots_response(
         state.clone(),
         server.clone(),
         event_id,
@@ -346,17 +349,41 @@ async fn web_user_detail_by_unique_id(
             include_adjacent: true,
             include_metrics: false,
             interval: interval_seconds(query.interval),
-            at: positive_timestamp(query.at),
+            at,
             cache_prefix: "web:v2",
             audience: ApiAudience::Web,
+            cut: Some(cut),
         },
-    )
+    ))
     .await?;
     let item = snapshot
         .items
         .into_iter()
         .find(|item| item.rank == rank)
         .ok_or(ApiError::NotFound)?;
+    let profile = if query.include_profile.unwrap_or(false) {
+        build_subject_trace_response(
+            state.clone(),
+            server.clone(),
+            event_id,
+            character_id,
+            user_id.clone(),
+            SubjectTraceQuery {
+                subject_type: Some("user".to_owned()),
+                include_current: Some(true),
+                start_time: None,
+                end_time: None,
+                cursor: None,
+                limit: Some(1),
+            },
+            "web:v2",
+            ApiAudience::Web,
+        )
+        .await?
+        .user_data
+    } else {
+        None
+    };
     let player_trace = if query.include_trace.unwrap_or(false) {
         build_subject_trace_response(
             state,
@@ -380,11 +407,7 @@ async fn web_user_detail_by_unique_id(
         previous: item.previous,
         next: item.next,
         player_trace,
-        profile: query
-            .include_profile
-            .unwrap_or(false)
-            .then_some(trace.user_data)
-            .flatten(),
+        profile,
     }))
 }
 

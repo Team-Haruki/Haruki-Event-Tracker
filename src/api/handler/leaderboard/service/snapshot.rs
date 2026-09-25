@@ -10,12 +10,14 @@ use crate::db::query::growth::{
 };
 use crate::db::query::user::PublicUserIdMode;
 use crate::db::query::web::{
-    WebRankingFilter, search_ranking_rows, search_world_bloom_ranking_rows,
+    RankSnapshotCut, latest_rank_cut, rank_snapshot_rows, user_rank_as_of,
+    world_bloom_rank_snapshot_rows,
 };
 use crate::model::api::{
     RankSnapshotSchema, RankSnapshotsResponseSchema, RankingScoreGrowthSchema, WebRankingItemSchema,
 };
 
+use super::trace::hashed_subject;
 use super::util::{join_ranks, meta, rank_of_item};
 
 pub(super) struct SnapshotBuildRequest {
@@ -26,6 +28,9 @@ pub(super) struct SnapshotBuildRequest {
     pub(super) at: Option<i64>,
     pub(super) cache_prefix: &'static str,
     pub(super) audience: ApiAudience,
+    /// A cut the caller already read other data at (see
+    /// [`resolve_user_rank`]); resolved here when `None`.
+    pub(super) cut: Option<RankSnapshotCut>,
 }
 
 pub(super) async fn build_rank_snapshots_response(
@@ -43,6 +48,7 @@ pub(super) async fn build_rank_snapshots_response(
         at,
         cache_prefix,
         audience,
+        cut,
     } = request;
     let end_time = at.unwrap_or_else(|| chrono::Utc::now().timestamp());
     let mut requested = BTreeSet::new();
@@ -56,33 +62,41 @@ pub(super) async fn build_rank_snapshots_response(
         }
     }
     let all_ranks = requested.into_iter().collect::<Vec<_>>();
-    let suffix = match character_id {
-        Some(character_id) => format!(
-            "{cache_prefix}:wb:{character_id}:snapshots:ranks={}:adj={include_adjacent}:metrics={include_metrics}:interval={interval}:at={at:?}:{}",
-            join_ranks(&ranks),
-            if include_metrics {
-                "lineMetrics=v1"
-            } else {
-                "lineMetrics=none"
-            }
-        ),
-        None => format!(
-            "{cache_prefix}:total:snapshots:ranks={}:adj={include_adjacent}:metrics={include_metrics}:interval={interval}:at={at:?}:{}",
-            join_ranks(&ranks),
-            if include_metrics {
-                "lineMetrics=v1"
-            } else {
-                "lineMetrics=none"
-            }
-        ),
+    let (region, engine) = resolve_region_engine(&state, &server)?;
+    let cut = match cut {
+        Some(cut) => cut,
+        None => {
+            Box::pin(resolve_rank_cut(
+                &state,
+                &server,
+                &engine,
+                event_id,
+                character_id,
+                at,
+            ))
+            .await?
+        }
     };
+    let scope = match character_id {
+        Some(character_id) => format!("wb:{character_id}"),
+        None => "total".to_owned(),
+    };
+    let suffix = format!(
+        "{cache_prefix}:{scope}:snapshots:ranks={}:adj={include_adjacent}:metrics={include_metrics}:interval={interval}:at={at:?}:cut={:?}:{}",
+        join_ranks(&ranks),
+        cut.as_of_time_id,
+        if include_metrics {
+            "lineMetrics=v1"
+        } else {
+            "lineMetrics=none"
+        }
+    );
     let cache_server = server.clone();
     let fetch = async {
-        let (region, engine) = resolve_region_engine(&state, &server)?;
         let mode =
             prepare_audience_user_id_mode(&state, &engine, region, event_id, audience).await?;
         let current =
-            fetch_snapshot_items(&engine, event_id, character_id, &all_ranks, mode, at).await?;
+            fetch_snapshot_items(&engine, event_id, character_id, &all_ranks, mode, cut).await?;
         let metrics = if include_metrics {
             fetch_snapshot_metrics(
                 &engine,
@@ -133,54 +147,143 @@ async fn fetch_snapshot_items(
     character_id: Option<i64>,
     ranks: &[i64],
     mode: PublicUserIdMode,
-    at: Option<i64>,
+    cut: RankSnapshotCut,
 ) -> Result<BTreeMap<i64, WebRankingItemSchema>, ApiError> {
-    if ranks.is_empty() {
-        return Ok(BTreeMap::new());
-    }
-    let filter = WebRankingFilter {
-        rank_min: None,
-        rank_max: None,
-        rank_in: Some(ranks.to_vec()),
-        score_min: None,
-        score_max: None,
-        start_time: None,
-        end_time: None,
-        before: None,
-        after: None,
-        timestamp: at,
-        cursor: None,
-        limit: ranks.len() as u64,
-    };
-    let wanted = ranks.iter().copied().collect::<BTreeSet<_>>();
-    let mut out = BTreeMap::new();
-    match character_id {
+    let items: Vec<WebRankingItemSchema> = match character_id {
         Some(character_id) => {
-            let (rows, _) =
-                search_world_bloom_ranking_rows(engine, event_id, character_id, &filter, mode)
-                    .await?;
-            for row in rows {
-                let item = row.into_web_item();
-                if let Some(rank) = rank_of_item(&item)
-                    && wanted.contains(&rank)
-                {
-                    out.insert(rank, item);
-                }
-            }
+            world_bloom_rank_snapshot_rows(engine, event_id, character_id, ranks, cut, mode)
+                .await?
+                .into_iter()
+                .map(|row| row.into_web_item())
+                .collect()
         }
-        None => {
-            let (rows, _) = search_ranking_rows(engine, event_id, &filter, mode).await?;
-            for row in rows {
-                let item = row.into_web_item();
-                if let Some(rank) = rank_of_item(&item)
-                    && wanted.contains(&rank)
-                {
-                    out.insert(rank, item);
-                }
-            }
-        }
+        None => rank_snapshot_rows(engine, event_id, ranks, cut, mode)
+            .await?
+            .into_iter()
+            .map(|row| row.into_web_item())
+            .collect(),
+    };
+    Ok(items
+        .into_iter()
+        .filter_map(|item| rank_of_item(&item).map(|rank| (rank, item)))
+        .collect())
+}
+
+/// The as-of cut every "current" rank view of `(server, event, chapter)`
+/// should read. An explicit `at` is its own cut (replays are immutable);
+/// otherwise it is [`latest_rank_cut`], cached under the event's API-cache
+/// epoch so that all requests answered within one epoch — an overview, the
+/// rank-N and rank-N±1 lookups a bot issues separately, split endpoints —
+/// read the same fully-flushed state even while the replica is already
+/// replaying the next flush. Callers put `as_of_time_id` into their own
+/// cache keys so a result is never served under another cut.
+pub(crate) async fn resolve_rank_cut(
+    state: &AppState,
+    server: &str,
+    engine: &DatabaseEngine,
+    event_id: i64,
+    character_id: Option<i64>,
+    at: Option<i64>,
+) -> Result<RankSnapshotCut, ApiError> {
+    if at.is_some() {
+        return Ok(RankSnapshotCut {
+            at,
+            as_of_time_id: None,
+        });
     }
-    Ok(out)
+    // A missing table (event not bootstrapped yet) is not this lookup's
+    // error to report: without a cut the caller's own query answers as before.
+    let fetch = async {
+        Ok::<_, ApiError>(
+            latest_rank_cut(engine, event_id, character_id)
+                .await
+                .inspect_err(|err| tracing::debug!(%err, "rank cut lookup failed"))
+                .ok()
+                .flatten(),
+        )
+    };
+    let as_of_time_id = match state.cache() {
+        Some(cache) => {
+            let suffix = match character_id {
+                Some(character_id) => format!("rankCut:v1:wb:{character_id}"),
+                None => "rankCut:v1:total".to_owned(),
+            };
+            cache
+                .get_or_fetch(
+                    server,
+                    event_id,
+                    suffix,
+                    cache.ttl(CacheTtl::LatestRank),
+                    fetch,
+                )
+                .await?
+        }
+        None => fetch.await?,
+    };
+    Ok(RankSnapshotCut {
+        at: None,
+        as_of_time_id,
+    })
+}
+
+/// The rank `user_id` holds at the current cut (or at `at`), together with
+/// that cut, so the caller can build the snapshot around it from the same
+/// state — a rank looked up from an older state could put another player
+/// in `current` and this one beside it.
+pub(super) async fn resolve_user_rank(
+    state: &AppState,
+    server: &str,
+    event_id: i64,
+    character_id: Option<i64>,
+    user_id: &str,
+    at: Option<i64>,
+    audience: ApiAudience,
+) -> Result<(i64, RankSnapshotCut), ApiError> {
+    let (region, engine) = resolve_region_engine(state, server)?;
+    let cut = Box::pin(resolve_rank_cut(
+        state,
+        server,
+        &engine,
+        event_id,
+        character_id,
+        at,
+    ))
+    .await?;
+    let fetch = async {
+        let mode =
+            prepare_audience_user_id_mode(state, &engine, region, event_id, audience).await?;
+        user_rank_as_of(&engine, event_id, character_id, user_id, cut, mode)
+            .await?
+            .ok_or(ApiError::NotFound)
+    };
+    let rank = match state.cache() {
+        Some(cache) => {
+            // Cloud subjects are raw UIDs: hashed out of the Redis keyspace.
+            let subject = match audience {
+                ApiAudience::Cloud => hashed_subject(user_id),
+                ApiAudience::Web => user_id.to_owned(),
+            };
+            let scope = match character_id {
+                Some(character_id) => format!("wb:{character_id}"),
+                None => "total".to_owned(),
+            };
+            let suffix = format!(
+                "userRank:v1:{audience:?}:{scope}:{subject}:at={at:?}:cut={:?}",
+                cut.as_of_time_id
+            );
+            cache
+                .get_or_fetch(
+                    server,
+                    event_id,
+                    suffix,
+                    cache.ttl(CacheTtl::LatestRank),
+                    fetch,
+                )
+                .await?
+        }
+        None => fetch.await?,
+    };
+    Ok((rank, cut))
 }
 
 async fn fetch_snapshot_metrics(

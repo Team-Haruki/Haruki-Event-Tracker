@@ -11,9 +11,9 @@ use crate::model::api::{
     RankSnapshotsResponseSchema, RankingScoreGrowthSchema, RecordedRankData, WebRankingItemSchema,
 };
 
-use super::snapshot::{SnapshotBuildRequest, build_rank_snapshots_response};
+use super::snapshot::{SnapshotBuildRequest, build_rank_snapshots_response, resolve_user_rank};
 use super::trace::{SubjectTraceQuery, build_subject_trace_response};
-use super::util::{interval_seconds, rank_of_item};
+use super::util::interval_seconds;
 use crate::api::handler::leaderboard::round_metrics;
 
 #[derive(Debug, Deserialize)]
@@ -54,32 +54,23 @@ pub(crate) async fn cloud_query_for_scope(
                 at: None,
                 cache_prefix: "cloud:v2",
                 audience: ApiAudience::Cloud,
+                cut: None,
             },
         )
         .await?
     } else if let Some(user_id) = query.user_id.as_deref().filter(|id| !id.trim().is_empty()) {
-        let subject = build_subject_trace_response(
-            state.clone(),
-            server.clone(),
+        // Rank and neighbours come from the same cut, so the user's row is
+        // the one the snapshot shows at that rank.
+        let (rank, cut) = resolve_user_rank(
+            &state,
+            &server,
             event_id,
             character_id,
-            user_id.to_owned(),
-            SubjectTraceQuery {
-                subject_type: Some("user".to_owned()),
-                include_current: Some(true),
-                start_time: None,
-                end_time: None,
-                cursor: None,
-                limit: Some(1),
-            },
-            round_metrics::CLOUD_ROUND_METRICS_CACHE_PREFIX,
+            user_id,
+            None,
             ApiAudience::Cloud,
         )
         .await?;
-        let Some(current) = subject.current else {
-            return Err(ApiError::NotFound);
-        };
-        let rank = rank_of_item(&current).ok_or(ApiError::NotFound)?;
         build_rank_snapshots_response(
             state.clone(),
             server.clone(),
@@ -93,6 +84,7 @@ pub(crate) async fn cloud_query_for_scope(
                 at: None,
                 cache_prefix: "cloud:v2",
                 audience: ApiAudience::Cloud,
+                cut: Some(cut),
             },
         )
         .await?
@@ -210,6 +202,7 @@ pub(crate) async fn cloud_speed_for_scope(
             at: None,
             cache_prefix: "cloud:v2",
             audience: ApiAudience::Cloud,
+            cut: None,
         },
     )
     .await?;

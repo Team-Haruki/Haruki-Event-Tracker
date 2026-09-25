@@ -17,10 +17,10 @@ use crate::db::query::heartbeat::fetch_latest_heartbeat_before;
 use crate::db::query::lines::{fetch_ranking_lines, fetch_world_bloom_ranking_lines};
 use crate::db::query::user::PublicUserIdMode;
 use crate::db::query::web::{
-    WebRankingCursor, WebRankingFilter, WebTraceFilter, WebUserSearchFilter,
-    fetch_top_player_growths, fetch_world_bloom_top_player_growths, search_ranking_rows,
-    search_rankings, search_user_trace, search_users, search_world_bloom_ranking_rows,
-    search_world_bloom_rankings, search_world_bloom_user_trace,
+    RankSnapshotCut, WebRankingCursor, WebRankingFilter, WebTraceFilter, WebUserSearchFilter,
+    fetch_top_player_growths, fetch_world_bloom_top_player_growths, rank_snapshot_rows,
+    search_rankings, search_user_trace, search_users, search_world_bloom_rankings,
+    search_world_bloom_user_trace, world_bloom_rank_snapshot_rows,
 };
 use crate::model::api::{
     EventStatusResponseSchema, RecordedRankData, UserAllRankingDataQueryResponseSchema,
@@ -129,7 +129,17 @@ pub async fn overview(
     let fetch = async {
         let (region, engine) = resolve_region_engine(&state, &server)?;
         let mode = prepare_web_user_id_mode(&state, &engine, region, event_id).await?;
-        build_overview(&engine, event_id, mode, interval, at).await
+        build_overview(
+            &engine,
+            event_id,
+            mode,
+            interval,
+            RankSnapshotCut {
+                at,
+                as_of_time_id: None,
+            },
+        )
+        .await
     };
     cached_overview_bytes(
         &state,
@@ -178,7 +188,18 @@ pub async fn world_bloom_overview(
     let fetch = async {
         let (region, engine) = resolve_region_engine(&state, &server)?;
         let mode = prepare_web_user_id_mode(&state, &engine, region, event_id).await?;
-        build_world_bloom_overview(&engine, event_id, character_id, mode, interval, at).await
+        build_world_bloom_overview(
+            &engine,
+            event_id,
+            character_id,
+            mode,
+            interval,
+            RankSnapshotCut {
+                at,
+                as_of_time_id: None,
+            },
+        )
+        .await
     };
     cached_overview_bytes(
         &state,
@@ -273,10 +294,10 @@ pub async fn build_overview(
     event_id: i64,
     mode: PublicUserIdMode,
     interval: i64,
-    at: Option<i64>,
+    cut: RankSnapshotCut,
 ) -> Result<WebOverviewSchema, ApiError> {
-    let filter = top_rank_filter(at);
-    let (top_rows, _) = search_ranking_rows(engine, event_id, &filter, mode).await?;
+    let at = cut.at;
+    let top_rows = rank_snapshot_rows(engine, event_id, &top_ranks(), cut, mode).await?;
     let end_time = at.unwrap_or_else(|| Utc::now().timestamp());
     let start_time = end_time - interval;
     let growth_ranks = overview_growth_ranks(SEKAI_EVENT_RANKING_LINES_NORMAL);
@@ -324,11 +345,12 @@ pub async fn build_world_bloom_overview(
     character_id: i64,
     mode: PublicUserIdMode,
     interval: i64,
-    at: Option<i64>,
+    cut: RankSnapshotCut,
 ) -> Result<WebOverviewSchema, ApiError> {
-    let filter = top_rank_filter(at);
-    let (top_rows, _) =
-        search_world_bloom_ranking_rows(engine, event_id, character_id, &filter, mode).await?;
+    let at = cut.at;
+    let top_rows =
+        world_bloom_rank_snapshot_rows(engine, event_id, character_id, &top_ranks(), cut, mode)
+            .await?;
     let end_time = at.unwrap_or_else(|| Utc::now().timestamp());
     let start_time = end_time - interval;
     let growth_ranks = overview_growth_ranks(SEKAI_EVENT_RANKING_LINES_WORLD_BLOOM);
@@ -385,21 +407,8 @@ pub async fn build_world_bloom_overview(
     })
 }
 
-fn top_rank_filter(timestamp: Option<i64>) -> WebRankingFilter {
-    WebRankingFilter {
-        rank_min: Some(1),
-        rank_max: Some(TOP_RANK_LIMIT),
-        rank_in: None,
-        score_min: None,
-        score_max: None,
-        start_time: None,
-        end_time: None,
-        before: None,
-        after: None,
-        timestamp,
-        cursor: None,
-        limit: TOP_RANK_LIMIT as u64,
-    }
+fn top_ranks() -> Vec<i64> {
+    (1..=TOP_RANK_LIMIT).collect()
 }
 
 fn border_ranks(ranks: &'static [i64]) -> &'static [i64] {
@@ -491,6 +500,7 @@ impl RankingSearchQuery {
             before: self.before,
             after: self.after,
             timestamp: self.timestamp,
+            as_of_time_id: None,
             cursor: parse_ranking_cursor(self.cursor.as_deref())?,
             limit: clamp_limit(self.limit, DEFAULT_PAGE_LIMIT, MAX_PAGE_LIMIT),
         })

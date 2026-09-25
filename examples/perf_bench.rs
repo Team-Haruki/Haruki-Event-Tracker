@@ -131,6 +131,7 @@ fn ranking_filter(limit: u64, rank_max: Option<i64>) -> WebRankingFilter {
         before: None,
         after: None,
         timestamp: None,
+        as_of_time_id: None,
         cursor: None,
         limit,
     }

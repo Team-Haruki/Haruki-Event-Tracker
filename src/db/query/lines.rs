@@ -57,6 +57,7 @@ pub(crate) fn rank_edge_select(
         window: TimeWindow::new(start_time, end_time),
         score_min: None,
         score_max: None,
+        max_time_id: None,
     });
     join_rank_edge(spec, edge_sub)
 }

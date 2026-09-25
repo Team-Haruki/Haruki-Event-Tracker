@@ -453,10 +453,10 @@ mod tests {
                 RecordedRankData::WorldBloom(_) => panic!("expected normal ranking"),
             })
             .collect();
-        assert_eq!(
-            rows,
-            vec![(1, 1_710_000_090, 1400), (2, 1_710_000_060, 1200)]
-        );
+        // Rank 2's newest row (+60s) belongs to the player who moved to rank
+        // 1 at +90s, so the rank window leaves the stale rank out instead of
+        // listing that player twice.
+        assert_eq!(rows, vec![(1, 1_710_000_090, 1400)]);
 
         // Idempotent: nothing left to do.
         let again = repair_time_ids(&engine, event_id, false).await.unwrap();
