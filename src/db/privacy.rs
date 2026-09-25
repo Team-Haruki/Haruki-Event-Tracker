@@ -135,10 +135,10 @@ async fn table_exists(engine: &DatabaseEngine, table: &'static str) -> Result<bo
              WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = {} LIMIT 1",
             quote_literal(table),
         ),
+        // Resolve through search_path like the unqualified queries do.
         _ => format!(
-            "SELECT 1 AS present FROM information_schema.tables \
-             WHERE table_schema = current_schema() AND table_name = {} LIMIT 1",
-            quote_literal(table),
+            "SELECT 1 AS present WHERE to_regclass({}) IS NOT NULL",
+            quote_literal(&quote_ident(backend, table)),
         ),
     };
     let row = engine

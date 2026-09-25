@@ -741,7 +741,7 @@ impl EventTrackerBase {
                 border
             }
             Err(err) => {
-                self.note_border_failure(now, &err);
+                self.note_border_failure(Utc::now().timestamp(), &err);
                 return Ok(self.top100_only_data(top100));
             }
         };
