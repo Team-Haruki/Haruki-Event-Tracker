@@ -151,7 +151,7 @@ pub(super) async fn build_subject_trace_response(
     cached_trace(&state, &cache_server, event_id, suffix, fetch).await
 }
 
-fn hashed_subject(subject: &str) -> String {
+pub(super) fn hashed_subject(subject: &str) -> String {
     use sha2::{Digest, Sha256};
     let digest = Sha256::digest(subject.as_bytes());
     let mut out = String::with_capacity(16);

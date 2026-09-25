@@ -269,6 +269,7 @@ async fn bench_overview_queries_on_postgres() {
         before: None,
         after: None,
         timestamp: None,
+        as_of_time_id: None,
         cursor: None,
         limit: 100,
     };
@@ -289,6 +290,21 @@ async fn bench_overview_queries_on_postgres() {
     assert_eq!(key(&r_old), key(&r_new));
     report.add("   top-100 latest window", t_old, t_new);
     explain(&engine, "top-100 window (new)", &new).await;
+
+    let started = Instant::now();
+    let cut = crate::db::query::web::latest_rank_cut(&engine, EVENT_ID, None)
+        .await
+        .unwrap();
+    println!("   rank cut lookup {:.2} ms", ms(started.elapsed()));
+    let pinned = WebRankingFilter {
+        as_of_time_id: cut,
+        ..top.clone()
+    };
+    let at_cut = crate::db::query::web::latest_rank_window_select(EVENT_ID, &pinned, mode);
+    let (t_cut, r_cut) = time::<RankingPageRow>(&engine, &at_cut).await;
+    assert_eq!(key(&r_new), key(&r_cut));
+    report.add("   top-100 window vs pinned cut", t_new, t_cut);
+    explain(&engine, "top-100 window at cut", &at_cut).await;
 
     let user_keys: Vec<i64> = r_new.iter().map(RankingPageRow::user_id_key).collect();
     let tbl = intern(TableKind::Event, EVENT_ID);

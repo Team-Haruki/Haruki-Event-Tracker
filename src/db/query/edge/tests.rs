@@ -404,6 +404,7 @@ fn random_window_filter(rng: &mut Rng, fx: &Fixture) -> WebRankingFilter {
         timestamp: rng
             .chance(30)
             .then(|| rng.range(fx.first_ts(), fx.last_ts() + 5)),
+        as_of_time_id: None,
         cursor: rng.chance(20).then(|| WebRankingCursor {
             timestamp: 0,
             rank: rng.range(1, TOP_RANKS),
@@ -664,7 +665,7 @@ async fn run_equivalence(engine: &DatabaseEngine, first_event_id: i64, seeds: u6
 /// Statement logging off: thousands of statements would otherwise go
 /// through whatever global subscriber another test installed (the logger
 /// test asserts that its bounded file sink drops nothing).
-pub(super) async fn quiet_connect(url: &str, backend: DatabaseBackend) -> DatabaseEngine {
+pub(crate) async fn quiet_connect(url: &str, backend: DatabaseBackend) -> DatabaseEngine {
     let mut opts = ConnectOptions::new(url.to_owned());
     opts.sqlx_logging(false);
     if backend == DatabaseBackend::Sqlite {

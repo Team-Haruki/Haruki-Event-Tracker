@@ -8,7 +8,7 @@ use sea_orm::{DbErr, ExprTrait, FromQueryResult};
 use crate::db::engine::DatabaseEngine;
 use crate::db::entity::{event, event_users, time_id, world_bloom};
 use crate::db::query::edge::{
-    Edge, EdgeSpec, TimeWindow, and_where_time_id_within, edge_keys_select,
+    Edge, EdgeSpec, TimeWindow, and_where_time_id_within, edge_keys_select, time_id_upper_bound,
 };
 use crate::db::query::user::PublicUserIdMode;
 use crate::db::table_name::{TableKind, intern};
@@ -32,6 +32,10 @@ pub struct WebRankingFilter {
     pub before: Option<i64>,
     pub after: Option<i64>,
     pub timestamp: Option<i64>,
+    /// Commit cut for rank windows: rows with a larger `time_id` are
+    /// ignored, as if not yet written (see [`latest_rank_cut`]). `None`
+    /// means unpinned, not a version.
+    pub as_of_time_id: Option<i64>,
     pub cursor: Option<WebRankingCursor>,
     pub limit: u64,
 }
@@ -555,6 +559,56 @@ fn limit_rank_window(filter: &WebRankingFilter) -> u64 {
     filter.limit + 1
 }
 
+/// Drops a rank's latest row when its player has a newer row (at another
+/// rank) inside the same cut, i.e. the rank's occupant is stale.
+///
+/// The writer stores only changed ranks, so "latest row per rank" can name
+/// a player who has since moved: the rank that player left is rewritten
+/// only once the diff sees its new occupant. Showing the stale identity
+/// would list one player on two ranks, so the rank is omitted instead —
+/// callers already treat a missing rank as unknown. One
+/// `(user_id_key, time_id)` index probe per returned row. The check ignores
+/// `score_min` / `score_max`: with a score filter, a rank whose player has
+/// since moved is dropped even when the newer row is outside the score
+/// range (before this, such searches could return the stale occupant).
+fn and_where_not_superseded(
+    stmt: &mut SelectStatement,
+    event_id: i64,
+    tbl: &'static str,
+    character_id: Option<i64>,
+    filter: &WebRankingFilter,
+) {
+    let outer = Alias::new(tbl);
+    let newer = Alias::new("superseding");
+    let time_id_col = Alias::new("time_id");
+    let user_col = Alias::new("user_id_key");
+    let mut probe = Query::select();
+    probe
+        .expr(Expr::val(1i64))
+        .from_as(Alias::new(tbl), newer.clone())
+        .and_where(Expr::col((newer.clone(), user_col.clone())).equals((outer.clone(), user_col)))
+        .and_where(
+            Expr::col((newer.clone(), time_id_col.clone()))
+                .gt(Expr::col((outer.clone(), time_id_col.clone()))),
+        );
+    if character_id.is_some() {
+        let character_col = Alias::new("character_id");
+        probe.and_where(
+            Expr::col((newer.clone(), character_col.clone())).equals((outer, character_col)),
+        );
+    }
+    if let Some(cut) = filter.as_of_time_id {
+        probe.and_where(Expr::col((newer.clone(), time_id_col.clone())).lte(cut));
+    }
+    if let Some(end) = rank_window_time_window(filter).end {
+        probe.and_where(Expr::col((newer, time_id_col)).lte(time_id_upper_bound(
+            intern(TableKind::TimeId, event_id),
+            end,
+        )));
+    }
+    stmt.and_where(Expr::exists(probe.to_owned()).not());
+}
+
 pub(crate) fn latest_rank_window_select(
     event_id: i64,
     filter: &WebRankingFilter,
@@ -571,6 +625,7 @@ pub(crate) fn latest_rank_window_select(
             window: rank_window_time_window(filter),
             score_min: filter.score_min,
             score_max: filter.score_max,
+            max_time_id: filter.as_of_time_id,
         }),
         None => grouped_latest_rank(event_id, filter, true),
     };
@@ -633,6 +688,9 @@ pub(crate) fn grouped_latest_rank(
         latest.and_where(
             Expr::col((event_tbl.clone(), event::Column::Rank)).is_in(ranks.iter().copied()),
         );
+    }
+    if let Some(cut) = filter.as_of_time_id {
+        latest.and_where(Expr::col((event_tbl.clone(), event::Column::TimeId)).lte(cut));
     }
     apply_rank_window_score_filters(
         &mut latest,
@@ -699,6 +757,13 @@ pub(crate) fn latest_rank_window_join(
                 .equals((users_tbl.clone(), event_users::Column::UserIdKey)),
         );
 
+    and_where_not_superseded(
+        &mut stmt,
+        event_id,
+        intern(TableKind::Event, event_id),
+        None,
+        filter,
+    );
     apply_rank_window_outer_filters(
         &mut stmt,
         Expr::col((event_tbl.clone(), event::Column::Score)),
@@ -729,6 +794,7 @@ fn latest_world_bloom_rank_window_select(
             window: rank_window_time_window(filter),
             score_min: filter.score_min,
             score_max: filter.score_max,
+            max_time_id: filter.as_of_time_id,
         }),
         None => grouped_latest_world_bloom_rank(event_id, character_id, filter, true),
     };
@@ -785,6 +851,9 @@ pub(crate) fn grouped_latest_world_bloom_rank(
         latest.and_where(
             Expr::col((wl_tbl.clone(), world_bloom::Column::Rank)).is_in(ranks.iter().copied()),
         );
+    }
+    if let Some(cut) = filter.as_of_time_id {
+        latest.and_where(Expr::col((wl_tbl.clone(), world_bloom::Column::TimeId)).lte(cut));
     }
     apply_rank_window_score_filters(
         &mut latest,
@@ -857,6 +926,13 @@ pub(crate) fn latest_world_bloom_rank_window_join(
         )
         .and_where(Expr::col((wl_tbl.clone(), world_bloom::Column::CharacterId)).eq(character_id));
 
+    and_where_not_superseded(
+        &mut stmt,
+        event_id,
+        intern(TableKind::WorldBloom, event_id),
+        Some(character_id),
+        filter,
+    );
     apply_rank_window_outer_filters(
         &mut stmt,
         Expr::col((wl_tbl.clone(), world_bloom::Column::Score)),
@@ -1006,6 +1082,206 @@ pub async fn search_world_bloom_ranking_rows(
     Ok((rows, next_cursor))
 }
 
+/// The commit cut a set of "current" rank views should share: the newest
+/// `time_id` in the ranking table (World Bloom: in the chapter).
+///
+/// A flush commits its whole buffer in one transaction and every later
+/// flush only carries later samples, so no row at or below this id can
+/// still be on its way: queries bounded by it read one fully-flushed state
+/// no matter when they run. Pinning it per cache epoch
+/// (`api::handler::leaderboard::service::snapshot::resolve_rank_cut`)
+/// makes separate requests agree on that state. `None` for an empty table.
+#[tracing::instrument(skip(engine), fields(event_id, character_id))]
+pub async fn latest_rank_cut(
+    engine: &DatabaseEngine,
+    event_id: i64,
+    character_id: Option<i64>,
+) -> Result<Option<i64>, DbErr> {
+    #[derive(FromQueryResult)]
+    struct CutRow {
+        time_id: Option<i64>,
+    }
+    let (tbl, time_col) = match character_id {
+        Some(_) => (
+            Alias::new(intern(TableKind::WorldBloom, event_id)),
+            Alias::new("time_id"),
+        ),
+        None => (
+            Alias::new(intern(TableKind::Event, event_id)),
+            Alias::new("time_id"),
+        ),
+    };
+    let mut stmt = Query::select();
+    stmt.expr_as(
+        Expr::col((tbl.clone(), time_col)).max(),
+        Alias::new("time_id"),
+    )
+    .from(tbl.clone());
+    if let Some(character_id) = character_id {
+        stmt.and_where(Expr::col((tbl, world_bloom::Column::CharacterId)).eq(character_id));
+    }
+    let row = CutRow::find_by_statement(engine.backend().build(&stmt))
+        .one(engine.conn())
+        .await?;
+    Ok(row.and_then(|row| row.time_id))
+}
+
+/// Which state of the ranking a rank snapshot reads.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RankSnapshotCut {
+    /// Replay point: rows sampled after this timestamp are ignored.
+    pub at: Option<i64>,
+    /// Commit cut from [`latest_rank_cut`]. `None` (no rows yet, table not
+    /// created, or a replay `at`) means the read is unpinned: callers may
+    /// key caches on it but must not present it as a data version or ETag.
+    pub as_of_time_id: Option<i64>,
+}
+
+/// `true` for "table does not exist" on PostgreSQL, SQLite and MySQL — an
+/// event whose tables the tracker has not created yet.
+pub fn is_missing_table_error(err: &DbErr) -> bool {
+    let msg = err.to_string().to_ascii_lowercase();
+    msg.contains("no such table")
+        || (msg.contains("relation") && msg.contains("does not exist"))
+        || msg.contains("42p01")
+        || (msg.contains("1146") && msg.contains("doesn't exist"))
+}
+
+fn rank_snapshot_filter(ranks: &[i64], cut: RankSnapshotCut) -> WebRankingFilter {
+    WebRankingFilter {
+        rank_min: None,
+        rank_max: None,
+        rank_in: Some(ranks.to_vec()),
+        score_min: None,
+        score_max: None,
+        start_time: None,
+        end_time: None,
+        before: None,
+        after: None,
+        timestamp: cut.at,
+        as_of_time_id: cut.as_of_time_id,
+        cursor: None,
+        limit: ranks.len() as u64,
+    }
+}
+
+/// Keeps one row per rank and per player. The query already guarantees
+/// both (a player's row is dropped unless it is their newest), so this only
+/// guards against same-`(rank, time_id)` pairs a pre-fix writer could have
+/// stored; rows arrive ordered by rank, and the first one wins.
+fn dedupe_snapshot<R>(rows: Vec<R>, rank: impl Fn(&R) -> i64, user: impl Fn(&R) -> i64) -> Vec<R> {
+    let mut ranks = std::collections::HashSet::with_capacity(rows.len());
+    let mut users = std::collections::HashSet::with_capacity(rows.len());
+    rows.into_iter()
+        .filter(|row| {
+            let (rank, user) = (rank(row), user(row));
+            if ranks.contains(&rank) || users.contains(&user) {
+                return false;
+            }
+            ranks.insert(rank);
+            users.insert(user);
+            true
+        })
+        .collect()
+}
+
+/// The ranking at one consistent cut: for each requested rank, its latest
+/// row within `cut`, unless that row's player has a newer row elsewhere
+/// (then the rank is left out rather than show the player twice). Ranks
+/// without rows are absent too. Ordered by rank.
+#[tracing::instrument(skip(engine, ranks), fields(event_id, n = ranks.len()))]
+pub async fn rank_snapshot_rows(
+    engine: &DatabaseEngine,
+    event_id: i64,
+    ranks: &[i64],
+    cut: RankSnapshotCut,
+    mode: PublicUserIdMode,
+) -> Result<Vec<RankingPageRow>, DbErr> {
+    if ranks.is_empty() {
+        return Ok(Vec::new());
+    }
+    let filter = rank_snapshot_filter(ranks, cut);
+    let stmt = latest_rank_window_select(event_id, &filter, mode);
+    let rows = RankingPageRow::find_by_statement(engine.backend().build(&stmt))
+        .all(engine.conn())
+        .await?;
+    Ok(dedupe_snapshot(rows, |row| row.rank, |row| row.user_id_key))
+}
+
+/// [`rank_snapshot_rows`] for one World Bloom chapter.
+#[tracing::instrument(skip(engine, ranks), fields(event_id, character_id, n = ranks.len()))]
+pub async fn world_bloom_rank_snapshot_rows(
+    engine: &DatabaseEngine,
+    event_id: i64,
+    character_id: i64,
+    ranks: &[i64],
+    cut: RankSnapshotCut,
+    mode: PublicUserIdMode,
+) -> Result<Vec<WorldBloomRankingPageRow>, DbErr> {
+    if ranks.is_empty() {
+        return Ok(Vec::new());
+    }
+    let filter = rank_snapshot_filter(ranks, cut);
+    let stmt = latest_world_bloom_rank_window_select(event_id, character_id, &filter, mode);
+    let rows = WorldBloomRankingPageRow::find_by_statement(engine.backend().build(&stmt))
+        .all(engine.conn())
+        .await?;
+    Ok(dedupe_snapshot(rows, |row| row.rank, |row| row.user_id_key))
+}
+
+/// The rank of `user_id`'s newest row within `cut` (World Bloom: in the
+/// chapter), resolved on the `(…, user_id_key, time_id)` index — the lookup
+/// that pairs with [`rank_snapshot_rows`] at the same cut.
+#[tracing::instrument(skip(engine), fields(event_id, character_id))]
+pub async fn user_rank_as_of(
+    engine: &DatabaseEngine,
+    event_id: i64,
+    character_id: Option<i64>,
+    user_id: &str,
+    cut: RankSnapshotCut,
+    mode: PublicUserIdMode,
+) -> Result<Option<i64>, DbErr> {
+    #[derive(FromQueryResult)]
+    struct RankRow {
+        rank: i64,
+    }
+    let tbl = Alias::new(match character_id {
+        Some(_) => intern(TableKind::WorldBloom, event_id),
+        None => intern(TableKind::Event, event_id),
+    });
+    let users_tbl = Alias::new(intern(TableKind::EventUsers, event_id));
+    let time_id_col = Alias::new("time_id");
+    let mut stmt = Query::select();
+    stmt.expr_as(
+        Expr::col((tbl.clone(), Alias::new("rank"))),
+        Alias::new("rank"),
+    )
+    .from(tbl.clone())
+    .inner_join(
+        users_tbl.clone(),
+        Expr::col((tbl.clone(), Alias::new("user_id_key")))
+            .equals((users_tbl.clone(), event_users::Column::UserIdKey)),
+    )
+    .and_where(Expr::col((users_tbl, mode.output_column())).eq(user_id));
+    if let Some(character_id) = character_id {
+        stmt.and_where(Expr::col((tbl.clone(), Alias::new("character_id"))).eq(character_id));
+    }
+    if let Some(as_of) = cut.as_of_time_id {
+        stmt.and_where(Expr::col((tbl.clone(), time_id_col.clone())).lte(as_of));
+    }
+    if let Some(at) = cut.at {
+        stmt.and_where(
+            Expr::col((tbl.clone(), time_id_col.clone()))
+                .lte(time_id_upper_bound(intern(TableKind::TimeId, event_id), at)),
+        );
+    }
+    stmt.order_by((tbl, time_id_col), Order::Desc).limit(1);
+    let row = RankRow::find_by_statement(engine.backend().build(&stmt))
+        .one(engine.conn())
+        .await?;
+    Ok(row.map(|row| row.rank))
+}
+
 /// Each top player's earliest row in `[start_time, end_time]`: one
 /// `(user_id_key, time_id)` edge probe per player (`db::query::edge`) joined
 /// back for the score and timestamp. Only the earliest row is used by the
@@ -1031,6 +1307,7 @@ pub(crate) fn earliest_player_rows_select(
         window: TimeWindow::new(Some(start_time), end_time),
         score_min: None,
         score_max: None,
+        max_time_id: None,
     });
     let rows = Alias::new(tbl);
     let times = Alias::new(time_tbl);
@@ -1574,6 +1851,9 @@ where
 }
 
 #[cfg(test)]
+mod snapshot_tests;
+
+#[cfg(test)]
 pub(crate) mod tests {
     use super::*;
     use sea_orm::{ConnectionTrait, Database, DatabaseBackend, Statement};
@@ -1595,6 +1875,7 @@ pub(crate) mod tests {
             before: None,
             after: None,
             timestamp: None,
+            as_of_time_id: None,
             cursor: None,
             limit: 10,
         }
@@ -1632,6 +1913,7 @@ pub(crate) mod tests {
             before: None,
             after: None,
             timestamp: Some(1_710_000_000),
+            as_of_time_id: None,
             cursor: None,
             limit: 1,
         };
@@ -1676,6 +1958,7 @@ pub(crate) mod tests {
             before: None,
             after: None,
             timestamp: None,
+            as_of_time_id: None,
             cursor: None,
             limit: 10,
         };
@@ -1734,6 +2017,7 @@ pub(crate) mod tests {
             before: None,
             after: None,
             timestamp: None,
+            as_of_time_id: None,
             cursor: None,
             limit: 10,
         };
@@ -1908,6 +2192,7 @@ pub(crate) mod tests {
             before: None,
             after: None,
             timestamp: Some(1_710_000_030),
+            as_of_time_id: None,
             cursor: None,
             limit: 10,
         };
@@ -1959,6 +2244,7 @@ pub(crate) mod tests {
             before: None,
             after: None,
             timestamp: None,
+            as_of_time_id: None,
             cursor: None,
             limit: 10,
         };
@@ -2018,6 +2304,7 @@ pub(crate) mod tests {
             before: None,
             after: None,
             timestamp: None,
+            as_of_time_id: None,
             cursor: None,
             limit: 10,
         };
@@ -2076,6 +2363,7 @@ pub(crate) mod tests {
             before: None,
             after: None,
             timestamp: Some(1_710_000_030),
+            as_of_time_id: None,
             cursor: None,
             limit: 10,
         };

@@ -108,6 +108,9 @@ pub(crate) struct EdgeSpec<'a> {
     pub window: TimeWindow,
     pub score_min: Option<i64>,
     pub score_max: Option<i64>,
+    /// Commit cut: only rows with `time_id <= max_time_id` exist for this
+    /// probe (see `db::query::web::latest_rank_cut`).
+    pub max_time_id: Option<i64>,
 }
 
 /// `(SELECT time_id FROM <time> WHERE timestamp >= start ORDER BY timestamp
@@ -231,6 +234,9 @@ pub(crate) fn edge_keys_select(spec: &EdgeSpec<'_>) -> SelectStatement {
             spec.window,
         );
     }
+    if let Some(max_time_id) = spec.max_time_id {
+        probe.and_where(Expr::col((e.clone(), tid_col.clone())).lte(max_time_id));
+    }
     let score = Expr::col((e.clone(), Alias::new("score")));
     if let Some(score_min) = spec.score_min {
         probe.and_where(score.clone().gte(score_min));
@@ -262,7 +268,7 @@ pub(crate) fn edge_keys_select(spec: &EdgeSpec<'_>) -> SelectStatement {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 #[cfg(test)]
 mod bench;

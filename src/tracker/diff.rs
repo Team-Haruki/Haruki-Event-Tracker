@@ -52,16 +52,30 @@ pub fn extract_player_profile(r: &PlayerRankingSchema) -> PlayerProfileSchema {
 ///
 /// Rows missing any of `rank` / `score` / `user_id` are silently skipped —
 /// matches Go's `if r.Rank == nil || r.Score == nil || r.UserID == nil`.
+///
+/// A player listed twice in one sample (the border page is fetched
+/// separately from the top 100 and can lag it; upstream pages can briefly
+/// overlap during a swap) keeps only the first listing — top 100 before
+/// border. The later rank is left out of both outputs rather than recorded
+/// in the state without a row: `build_event_records` could only store one
+/// row per player per sample anyway, and advancing the state for the
+/// dropped rank would keep its stale occupant in the table until that rank
+/// changed again. Readers drop such a stale occupant
+/// (`db::query::web::rank_snapshot_rows`); the next sample retries the rank.
 pub fn diff_rank_based(
     rankings: &[PlayerRankingSchema],
     prev_rank_state: &HashMap<i64, RankState>,
 ) -> (Vec<usize>, HashMap<i64, RankState>) {
     let mut changed_idx = Vec::new();
     let mut changed_ranks = HashMap::new();
+    let mut seen_users = HashSet::with_capacity(rankings.len());
     for (i, r) in rankings.iter().enumerate() {
         let (Some(rank), Some(score), Some(uid)) = (r.rank, r.score, r.user_id) else {
             continue;
         };
+        if !seen_users.insert(uid) {
+            continue;
+        }
         // Compare before allocating: in steady state most ranks are
         // unchanged, and stored ids are canonical decimal (ours and Go's),
         // so parsing back is an exact equality check.
@@ -232,10 +246,16 @@ pub fn build_world_bloom_rows(
 ) -> Vec<PlayerWorldBloomRankingRecordSchema> {
     let mut out = Vec::new();
     for (&character_id, rankings) in per_char {
+        // One row per (chapter, player) and sample, first listing wins — see
+        // `diff_rank_based`; a second row would collide on the primary key.
+        let mut seen_users = HashSet::with_capacity(rankings.len());
         for r in rankings {
             let (Some(rank), Some(score), Some(uid)) = (r.rank, r.score, r.user_id) else {
                 continue;
             };
+            if !seen_users.insert(uid) {
+                continue;
+            }
             if skip_unchanged(character_id, uid, score, rank) {
                 continue;
             }
@@ -351,6 +371,43 @@ mod tests {
         let (changed, deltas) = diff_rank_based(&[ranking(1, 999, 1000, "x")], &state);
         assert_eq!(changed, vec![0]);
         assert_eq!(deltas[&1].user_id, "999");
+    }
+
+    #[test]
+    fn diff_keeps_one_listing_per_player() {
+        // 100 moved 2 -> 1 in the top 100 (unchanged there since the last
+        // sample), while a lagging border page still lists it at 200.
+        let mut state = HashMap::new();
+        let (_, deltas) = diff_rank_based(
+            &[ranking(1, 100, 1000, "a"), ranking(200, 300, 50, "c")],
+            &state,
+        );
+        state.extend(deltas);
+        let sample = vec![
+            ranking(1, 100, 1000, "a"),
+            ranking(2, 200, 900, "b"),
+            ranking(200, 100, 1000, "a"),
+        ];
+        let (changed, deltas) = diff_rank_based(&sample, &state);
+        assert_eq!(changed, vec![1]);
+        assert!(
+            !deltas.contains_key(&200),
+            "stale duplicate must not move the state"
+        );
+        let diffed: Vec<_> = changed.iter().map(|&i| &sample[i]).collect();
+        let records = build_event_records(1, &diffed);
+        assert_eq!(records.len(), deltas.len());
+    }
+
+    #[test]
+    fn world_bloom_rows_keep_one_listing_per_player() {
+        let per_char = HashMap::from([(
+            19,
+            vec![ranking(5, 100, 555, "a"), ranking(6, 100, 555, "a")],
+        )]);
+        let rows = build_world_bloom_rows(1, &per_char, |_, _, _, _| false);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].base.rank, 5);
     }
 
     #[test]
