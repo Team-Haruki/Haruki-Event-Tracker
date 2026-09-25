@@ -18,8 +18,8 @@ use crate::model::api::{
 use crate::model::enums::SekaiServerRegion;
 
 use super::snapshot::{
-    SnapshotBuildRequest, build_rank_snapshots_response, ensure_current_is_user, resolve_rank_cut,
-    resolve_user_rank,
+    SnapshotBuildRequest, build_rank_snapshots_response, resolve_rank_cut, resolve_user_rank,
+    snapshot_shows_user,
 };
 use super::trace::{SubjectTraceQuery, build_subject_trace_response};
 use super::util::{interval_seconds, meta, positive_timestamp, user_id_of_rank_data};
@@ -444,36 +444,38 @@ pub(crate) async fn web_rank_detail_for_scope(
         .ok_or(ApiError::NotFound)?;
     let mut rank_trace = Vec::new();
     if query.include_trace.unwrap_or(false) {
-        rank_trace = build_subject_trace_response(
-            state.clone(),
-            server.clone(),
-            event_id,
-            character_id,
-            rank.to_string(),
-            detail_trace_query(&query, "rank"),
-            "web:v2",
-            ApiAudience::Web,
-        )
-        .await?
-        .rank_data;
+        rank_trace = detail_trace(
+            build_subject_trace_response(
+                state.clone(),
+                server.clone(),
+                event_id,
+                character_id,
+                rank.to_string(),
+                detail_trace_query(&query, "rank"),
+                "web:v2",
+                ApiAudience::Web,
+            )
+            .await,
+        )?;
     }
     let mut player_trace = Vec::new();
     if query.include_player_trace.unwrap_or(false)
         && let Some(current) = item.current.as_ref()
         && let Some(user_id) = user_id_of_rank_data(&current.rank_data)
     {
-        player_trace = build_subject_trace_response(
-            state.clone(),
-            server.clone(),
-            event_id,
-            character_id,
-            user_id,
-            detail_trace_query(&query, "user"),
-            "web:v2",
-            ApiAudience::Web,
-        )
-        .await?
-        .rank_data;
+        player_trace = detail_trace(
+            build_subject_trace_response(
+                state.clone(),
+                server.clone(),
+                event_id,
+                character_id,
+                user_id,
+                detail_trace_query(&query, "user"),
+                "web:v2",
+                ApiAudience::Web,
+            )
+            .await,
+        )?;
     }
     Ok(Json(WebRankDetailResponseSchema {
         meta: snapshot.meta,
@@ -629,14 +631,17 @@ async fn web_user_detail_by_unique_id(
         },
     ))
     .await?;
-    ensure_current_is_user(&snapshot, rank, &user_id)?;
-    let item = snapshot
-        .items
-        .into_iter()
-        .find(|item| item.rank == rank)
-        .ok_or(ApiError::NotFound)?;
+    // A player seen in this event who has since left the tracked ranks is
+    // "not ranked": their last row's rank now belongs to someone else, so
+    // that occupant is never shown as `current` (nor its neighbours).
+    let ranked = snapshot_shows_user(&snapshot, rank, &user_id);
+    let item = if ranked {
+        snapshot.items.into_iter().find(|item| item.rank == rank)
+    } else {
+        None
+    };
     let profile = if query.include_profile.unwrap_or(false) {
-        build_subject_trace_response(
+        match build_subject_trace_response(
             state.clone(),
             server.clone(),
             event_id,
@@ -653,36 +658,58 @@ async fn web_user_detail_by_unique_id(
             "web:v2",
             ApiAudience::Web,
         )
-        .await?
-        .user_data
+        .await
+        {
+            Ok(trace) => trace.user_data,
+            Err(ApiError::NotFound) => None,
+            Err(err) => return Err(err),
+        }
     } else {
         None
     };
     let player_trace = if query.include_trace.unwrap_or(false) {
-        build_subject_trace_response(
-            state,
-            server,
-            event_id,
-            character_id,
-            user_id,
-            detail_trace_query(&query, "user"),
-            "web:v2",
-            ApiAudience::Web,
-        )
-        .await?
-        .rank_data
+        detail_trace(
+            build_subject_trace_response(
+                state,
+                server,
+                event_id,
+                character_id,
+                user_id,
+                detail_trace_query(&query, "user"),
+                "web:v2",
+                ApiAudience::Web,
+            )
+            .await,
+        )?
     } else {
         Vec::new()
+    };
+    let (current, previous, next) = match item {
+        Some(item) => (item.current, item.previous, item.next),
+        None => (None, None, None),
     };
     Ok(Json(WebUserDetailResponseSchema {
         meta: snapshot.meta,
         subject: None,
-        current: item.current,
-        previous: item.previous,
-        next: item.next,
+        ranked,
+        current,
+        previous,
+        next,
         player_trace,
         profile,
     }))
+}
+
+/// A detail's trace is optional content: no rows in the window (typically
+/// a `cursor` poll with nothing newer) is an empty increment, not a 404.
+fn detail_trace(
+    trace: Result<crate::model::api::SubjectTraceResponseSchema, ApiError>,
+) -> Result<Vec<RecordedRankData>, ApiError> {
+    match trace {
+        Ok(trace) => Ok(trace.rank_data),
+        Err(ApiError::NotFound) => Ok(Vec::new()),
+        Err(err) => Err(err),
+    }
 }
 
 fn detail_trace_query(query: &WebDetailQuery, subject_type: &str) -> SubjectTraceQuery {
@@ -705,7 +732,8 @@ mod tests {
     use crate::api::ws_ticket::WsTicketStore;
     use crate::config::ApiQueryConfig;
     use crate::db::query::web::tests::{
-        seed_normal_event_with_history, seed_world_bloom_event_with_history, sqlite_engine,
+        seed_normal_event_with_history, seed_player_pushed_out,
+        seed_world_bloom_event_with_history, sqlite_engine,
     };
     use crate::db::schema::create_event_tables;
     use crate::model::enums::SekaiServerRegion;
@@ -746,6 +774,13 @@ mod tests {
         state
             .anonymizer()
             .public_user_id(SekaiServerRegion::Jp, event_id, raw)
+    }
+
+    fn live_query() -> WebDetailQuery {
+        WebDetailQuery {
+            at: None,
+            ..detail_query()
+        }
     }
 
     fn detail_query() -> WebDetailQuery {
@@ -906,6 +941,153 @@ mod tests {
         assert!(world.current.is_some());
         assert!(world.profile.is_none());
         assert!(world.player_trace.is_empty());
+    }
+
+    #[tokio::test]
+    async fn user_details_of_players_who_left_the_ranks_keep_their_history() {
+        let state = test_state().await;
+        let (_, engine) = resolve_region_engine(&state, "jp").unwrap();
+        seed_player_pushed_out(&engine, NORMAL_EVENT, None, 3).await;
+        seed_player_pushed_out(&engine, WORLD_BLOOM_EVENT, Some(17), 3).await;
+        for (event, chapter) in [(NORMAL_EVENT, None), (WORLD_BLOOM_EVENT, Some(17))] {
+            let gamma = unique(&state, event, "300");
+            let detail = web_user_detail_for_scope(
+                state.clone(),
+                "jp".into(),
+                event,
+                chapter,
+                gamma.clone(),
+                live_query(),
+            )
+            .await
+            .unwrap()
+            .0;
+            // Never Delta, who holds Gamma's last rank now.
+            assert!(!detail.ranked);
+            assert!(detail.current.is_none());
+            assert!(detail.previous.is_none());
+            assert!(detail.next.is_none());
+            assert_eq!(detail.player_trace.len(), 2);
+            assert!(
+                detail
+                    .player_trace
+                    .iter()
+                    .all(|row| user_id_of_rank_data(row).as_deref() == Some(gamma.as_str()))
+            );
+            assert_eq!(detail.profile.as_ref().unwrap().name, "Gamma");
+
+            let json = sonic_rs::to_string(&detail).unwrap();
+            assert!(json.contains("\"ranked\":false"), "{json}");
+            assert!(!json.contains("\"current\""), "{json}");
+
+            // Raw-UID lookups resolve the same way.
+            let by_uid = web_user_detail_for_scope(
+                state.clone(),
+                "jp".into(),
+                event,
+                chapter,
+                "300".into(),
+                live_query(),
+            )
+            .await
+            .unwrap()
+            .0;
+            assert!(!by_uid.ranked);
+            assert!(by_uid.current.is_none());
+            assert_eq!(by_uid.subject.unwrap().user_id, "300");
+
+            let delta = web_user_detail_for_scope(
+                state.clone(),
+                "jp".into(),
+                event,
+                chapter,
+                unique(&state, event, "400"),
+                live_query(),
+            )
+            .await
+            .unwrap()
+            .0;
+            assert!(delta.ranked);
+            assert_eq!(
+                delta
+                    .current
+                    .as_ref()
+                    .and_then(super::super::util::rank_of_item),
+                Some(3)
+            );
+
+            // A player never seen in the event is still a 404.
+            assert!(matches!(
+                web_user_detail_for_scope(
+                    state.clone(),
+                    "jp".into(),
+                    event,
+                    chapter,
+                    unique(&state, event, "999"),
+                    live_query(),
+                )
+                .await,
+                Err(ApiError::NotFound)
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn detail_cursor_polls_without_new_rows_are_empty_increments() {
+        let state = test_state().await;
+        for (event, chapter) in [(NORMAL_EVENT, None), (WORLD_BLOOM_EVENT, Some(17))] {
+            let mut query = detail_query();
+            query.include_player_trace = Some(true);
+            query.cursor = Some(1_710_000_060);
+            let rank =
+                web_rank_detail_for_scope(state.clone(), "jp".into(), event, chapter, 1, query)
+                    .await
+                    .unwrap()
+                    .0;
+            assert!(rank.current.is_some());
+            assert!(rank.rank_trace.is_empty());
+            assert!(rank.player_trace.is_empty());
+
+            let mut query = detail_query();
+            query.cursor = Some(1_710_000_060);
+            let user = web_user_detail_for_scope(
+                state.clone(),
+                "jp".into(),
+                event,
+                chapter,
+                unique(&state, event, "100"),
+                query,
+            )
+            .await
+            .unwrap()
+            .0;
+            assert!(user.ranked);
+            assert!(user.current.is_some());
+            assert!(user.player_trace.is_empty());
+
+            // Rows after an older cursor still come back.
+            let mut query = detail_query();
+            query.cursor = Some(1_710_000_000);
+            let user = web_user_detail_for_scope(
+                state.clone(),
+                "jp".into(),
+                event,
+                chapter,
+                unique(&state, event, "100"),
+                query,
+            )
+            .await
+            .unwrap()
+            .0;
+            assert_eq!(user.player_trace.len(), 1);
+        }
+
+        // A rank nobody has held is still a 404.
+        assert!(matches!(
+            web_rank_detail_for_scope(state, "jp".into(), NORMAL_EVENT, None, 999, detail_query())
+                .await,
+            Err(ApiError::NotFound)
+        ));
     }
 
     fn user_id_of(item: &WebRankingItemSchema) -> String {

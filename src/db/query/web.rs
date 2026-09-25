@@ -2639,6 +2639,47 @@ pub(crate) mod tests {
         }
     }
 
+    /// On top of a `*_with_history` seed: a new sample at `+120s` where a
+    /// new player, Delta (`400`), takes `rank`. The previous holder gets no
+    /// new row, so their last row still claims `rank` — they left the
+    /// tracked ranks. `character_id` picks the World Bloom table.
+    pub(crate) async fn seed_player_pushed_out(
+        engine: &DatabaseEngine,
+        event_id: i64,
+        character_id: Option<i64>,
+        rank: i64,
+    ) {
+        let rows = match character_id {
+            Some(character_id) => format!(
+                "INSERT INTO {} (time_id, user_id_key, character_id, score, rank) \
+                VALUES (1710000120, 4, {character_id}, 99999, {rank})",
+                intern(TableKind::WorldBloom, event_id)
+            ),
+            None => format!(
+                "INSERT INTO {} (time_id, user_id_key, score, rank) \
+                VALUES (1710000120, 4, 99999, {rank})",
+                intern(TableKind::Event, event_id)
+            ),
+        };
+        for sql in [
+            format!(
+                "INSERT INTO {} (user_id, unique_id, name) VALUES ('400', 'u-public-4', 'Delta')",
+                intern(TableKind::EventUsers, event_id)
+            ),
+            format!(
+                "INSERT INTO {} (time_id, timestamp, status) VALUES (1710000120, 1710000120, 0)",
+                intern(TableKind::TimeId, event_id)
+            ),
+            rows,
+        ] {
+            engine
+                .conn()
+                .execute_raw(Statement::from_string(DatabaseBackend::Sqlite, sql))
+                .await
+                .unwrap();
+        }
+    }
+
     pub(crate) async fn seed_world_bloom_event_with_rank_changes(
         engine: &DatabaseEngine,
         event_id: i64,

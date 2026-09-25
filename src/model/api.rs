@@ -374,6 +374,11 @@ pub struct WebUserDetailResponseSchema {
     pub meta: LeaderboardMetaSchema,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub subject: Option<WebSubjectSchema>,
+    /// `false` when the player was tracked in this event but no longer
+    /// holds a tracked rank: `current`, `previous` and `next` are then
+    /// absent while `playerTrace` and `profile` still describe them.
+    #[serde(default = "ranked_by_default")]
+    pub ranked: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub current: Option<WebRankingItemSchema>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -384,6 +389,10 @@ pub struct WebUserDetailResponseSchema {
     pub player_trace: Vec<RecordedRankData>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub profile: Option<RecordedUserNameSchema>,
+}
+
+fn ranked_by_default() -> bool {
+    true
 }
 
 #[cfg(test)]

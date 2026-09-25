@@ -288,6 +288,93 @@ mod tests {
             .unwrap();
     }
 
+    async fn get(router: &Router, uri: &str) -> axum::response::Response {
+        router
+            .clone()
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+    }
+
+    #[test]
+    fn details_answer_unranked_players_and_empty_cursor_polls_with_200() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(async {
+                        let state = test_state(true).await;
+                        let (_, engine) =
+                            crate::api::extract::resolve_region_engine(&state, "jp").unwrap();
+                        crate::db::query::web::tests::seed_player_pushed_out(
+                            &engine,
+                            NORMAL_EVENT,
+                            None,
+                            3,
+                        )
+                        .await;
+                        let gamma = state.anonymizer().public_user_id(
+                            SekaiServerRegion::Jp,
+                            NORMAL_EVENT,
+                            "300",
+                        );
+                        let never_seen = state.anonymizer().public_user_id(
+                            SekaiServerRegion::Jp,
+                            NORMAL_EVENT,
+                            "999",
+                        );
+                        let router = build_router(state, trust());
+                        let web = format!("/api/v2/web/events/jp/{NORMAL_EVENT}/leaderboards/total");
+
+                        // Per-request details are never immutable, even with `v`.
+                        for path in [
+                            format!("{web}/details/user/{gamma}?includeTrace=true&v=7"),
+                            format!("{web}/details/rank/3?includeTrace=true&includePlayerTrace=false&cursor=1710000120&limit=5000&v=7"),
+                            format!("{web}/details/user/{gamma}?includeTrace=true&cursor=1710000120"),
+                        ] {
+                            let response = get(&router, &path).await;
+                            assert_eq!(response.status(), StatusCode::OK, "{path}");
+                            assert_eq!(
+                                response.headers()[axum::http::header::CACHE_CONTROL],
+                                crate::api::http_cache::LIVE_CACHE_CONTROL,
+                                "{path}"
+                            );
+                        }
+                        let body = axum::body::to_bytes(
+                            get(&router, &format!("{web}/details/user/{gamma}?includeTrace=true"))
+                                .await
+                                .into_body(),
+                            usize::MAX,
+                        )
+                        .await
+                        .unwrap();
+                        let body = std::str::from_utf8(&body).unwrap();
+                        assert!(body.contains("\"ranked\":false"), "{body}");
+                        assert!(!body.contains("\"current\""), "{body}");
+
+                        assert_eq!(
+                            status(&router, &format!("{web}/details/user/{never_seen}")).await,
+                            StatusCode::NOT_FOUND
+                        );
+                        // Cloud keeps "not in the tracked ranks" as a 404.
+                        assert_eq!(
+                            status(
+                                &router,
+                                &format!("/api/v2/cloud/events/jp/{NORMAL_EVENT}/leaderboards/total/sk/query?userId=300"),
+                            )
+                            .await,
+                            StatusCode::NOT_FOUND
+                        );
+                    });
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
     #[tokio::test]
     async fn writer_role_exposes_only_health_and_the_update_stream() {
         let state = test_state(true).await.with_cluster(ClusterState {
