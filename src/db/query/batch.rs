@@ -474,36 +474,6 @@ async fn select_user_rows<C: ConnectionTrait>(
     Ok(rows)
 }
 
-/// Owned per-record fields we move into the transaction closure. Avoids the
-/// HRTB lifetime trap where `for<'c> FnOnce(&'c Tx) -> ... + 'c` would force
-/// any captured borrow to outlive `'static`.
-struct OwnedRecord {
-    timestamp: i64,
-    user_id: String,
-    score: i64,
-    rank: i64,
-}
-
-fn collect_dims<'a, I>(
-    server: SekaiServerRegion,
-    event_id: i64,
-    anonymizer: &UidAnonymizer,
-    records: I,
-) -> (HashSet<i64>, HashMap<String, UserDimRow>)
-where
-    I: Iterator<Item = &'a PlayerEventRankingRecordSchema>,
-{
-    let mut timestamps = HashSet::new();
-    let mut users: HashMap<String, UserDimRow> = HashMap::new();
-    for r in records {
-        timestamps.insert(r.timestamp);
-        users
-            .entry(r.user_id.clone())
-            .or_insert_with(|| UserDimRow::from_record(server, event_id, anonymizer, r));
-    }
-    (timestamps, users)
-}
-
 fn collect_users<'a, I>(
     server: SekaiServerRegion,
     event_id: i64,
@@ -541,6 +511,19 @@ pub async fn batch_upsert_event_users(
     Ok(())
 }
 
+/// Rows a flush wrote, per table.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FlushOutcome {
+    pub main_rows: usize,
+    pub world_bloom_rows: usize,
+}
+
+impl FlushOutcome {
+    pub fn wrote_rows(&self) -> bool {
+        self.main_rows > 0 || self.world_bloom_rows > 0
+    }
+}
+
 #[tracing::instrument(skip(engine, records), fields(event_id, n = records.len()))]
 pub async fn batch_insert_event_rankings(
     engine: &DatabaseEngine,
@@ -549,67 +532,18 @@ pub async fn batch_insert_event_rankings(
     anonymizer: &UidAnonymizer,
     records: &[PlayerEventRankingRecordSchema],
 ) -> Result<(), DbErr> {
-    if records.is_empty() {
-        return Ok(());
-    }
-    let backend = engine.backend();
-    let time_tbl = intern(TableKind::TimeId, event_id);
-    let users_tbl = intern(TableKind::EventUsers, event_id);
-    let event_tbl = intern(TableKind::Event, event_id);
-
-    let (timestamps, users) = collect_dims(server, event_id, anonymizer, records.iter());
-    let owned: Vec<OwnedRecord> = records
-        .iter()
-        .map(|r| OwnedRecord {
-            timestamp: r.timestamp,
-            user_id: r.user_id.clone(),
-            score: r.score,
-            rank: r.rank,
-        })
-        .collect();
-
-    let user_lookup =
-        batch_get_or_create_user_id_keys(engine.conn(), backend, users_tbl, &users).await?;
-
-    engine
-        .conn()
-        .transaction::<_, (), DbErr>(move |tx| {
-            Box::pin(async move {
-                let time_lookup =
-                    batch_get_or_create_time_ids(tx, backend, time_tbl, &timestamps, 0).await?;
-
-                let mut ins = Query::insert();
-                ins.into_table(Alias::new(event_tbl)).columns([
-                    event::Column::TimeId,
-                    event::Column::UserIdKey,
-                    event::Column::Score,
-                    event::Column::Rank,
-                ]);
-                for r in &owned {
-                    let time_id_v = *time_lookup
-                        .get(&r.timestamp)
-                        .ok_or_else(|| DbErr::Custom("missing time_id lookup".into()))?;
-                    let user_key_v = *user_lookup
-                        .get(&r.user_id)
-                        .ok_or_else(|| DbErr::Custom("missing user_id_key lookup".into()))?;
-                    ins.values_panic([
-                        time_id_v.into(),
-                        user_key_v.into(),
-                        r.score.into(),
-                        r.rank.into(),
-                    ]);
-                }
-                ins.on_conflict(
-                    OnConflict::columns([event::Column::TimeId, event::Column::UserIdKey])
-                        .do_nothing_on([event::Column::TimeId, event::Column::UserIdKey])
-                        .to_owned(),
-                );
-                tx.execute(&ins).await?;
-                Ok(())
-            })
-        })
-        .await
-        .map_err(unwrap_tx_err)
+    batch_insert_flush(
+        engine,
+        server,
+        event_id,
+        anonymizer,
+        records,
+        &[],
+        &mut HashMap::new(),
+        &mut HashMap::new(),
+    )
+    .await
+    .map(|_| ())
 }
 
 #[tracing::instrument(skip(engine, records, prev_state), fields(event_id, n = records.len()))]
@@ -622,43 +556,90 @@ pub async fn batch_insert_world_bloom_rankings(
     prev_state: &mut HashMap<WorldBloomKey, PlayerState>,
     user_key_cache: &mut HashMap<i64, i64>,
 ) -> Result<usize, DbErr> {
-    if records.is_empty() {
-        return Ok(0);
+    batch_insert_flush(
+        engine,
+        server,
+        event_id,
+        anonymizer,
+        &[],
+        records,
+        prev_state,
+        user_key_cache,
+    )
+    .await
+    .map(|outcome| outcome.world_bloom_rows)
+}
+
+/// Writes one tracker flush — main and World Bloom rows of every buffered
+/// sample — in a single transaction, so a reader (or a streaming replica)
+/// sees either none of it or all of it: never a sample with only some of
+/// its rank moves, and never main rows without the chapter rows sampled
+/// with them. `flush_max_rows` / hot-rank triggers only decide *when* the
+/// whole buffer flushes; nothing splits it.
+///
+/// World Bloom rows are diffed against `prev_state` first (a no-change
+/// batch writes nothing), and the state only advances after the commit (a
+/// failed flush retries the same diff; the inserts' DO NOTHING dedups any
+/// rows that already landed). `running` advances per record within the
+/// batch: a coalesced flush can carry several samples for one
+/// `(user, chapter)`, and a value that oscillates back to the pre-batch
+/// state is still a real trace point.
+#[allow(clippy::too_many_arguments)]
+#[tracing::instrument(
+    skip(engine, anonymizer, main, world_bloom, prev_state, user_key_cache),
+    fields(event_id, main = main.len(), world_bloom = world_bloom.len())
+)]
+pub async fn batch_insert_flush(
+    engine: &DatabaseEngine,
+    server: SekaiServerRegion,
+    event_id: i64,
+    anonymizer: &UidAnonymizer,
+    main: &[PlayerEventRankingRecordSchema],
+    world_bloom: &[PlayerWorldBloomRankingRecordSchema],
+    prev_state: &mut HashMap<WorldBloomKey, PlayerState>,
+    user_key_cache: &mut HashMap<i64, i64>,
+) -> Result<FlushOutcome, DbErr> {
+    if main.is_empty() && world_bloom.is_empty() {
+        return Ok(FlushOutcome::default());
     }
     let backend = engine.backend();
     let time_tbl = intern(TableKind::TimeId, event_id);
     let users_tbl = intern(TableKind::EventUsers, event_id);
+    let event_tbl = intern(TableKind::Event, event_id);
     let wl_tbl = intern(TableKind::WorldBloom, event_id);
 
-    let (timestamps, users) = collect_dims(
+    let users = collect_users(
         server,
         event_id,
         anonymizer,
-        records.iter().map(|r| &r.base),
+        main.iter().chain(world_bloom.iter().map(|r| &r.base)),
     );
     let user_lookup =
         batch_get_or_create_user_id_keys(engine.conn(), backend, users_tbl, &users).await?;
-    // Feed the tracker's uid -> key memo so future ticks can pre-diff these
-    // users before materializing their rows at all.
-    for (user_id, key) in &user_lookup {
-        if let Ok(uid) = user_id.parse::<i64>() {
-            user_key_cache.insert(uid, *key);
+    let user_key = |user_id: &str| {
+        user_lookup
+            .get(user_id)
+            .copied()
+            .ok_or_else(|| DbErr::Custom("missing user_id_key lookup".into()))
+    };
+    if !world_bloom.is_empty() {
+        // Feed the tracker's uid -> key memo so future ticks can pre-diff
+        // these users before materializing their rows at all.
+        for (user_id, key) in &user_lookup {
+            if let Ok(uid) = user_id.parse::<i64>() {
+                user_key_cache.insert(uid, *key);
+            }
         }
     }
 
-    // Diff against the previous state outside the transaction: a no-change
-    // tick never opens one, and the state map is only updated after the
-    // rows actually committed (a failed tick retries the same diff; the
-    // ranking insert's DO NOTHING dedups any partially-landed rows).
-    // `running` advances per record within the batch: a coalesced flush can
-    // carry several samples for one `(user, chapter)`, and a value that
-    // oscillates back to the pre-batch state is still a real trace point.
-    let mut changed: Vec<(i64, i64, i64, i64, i64)> = Vec::new();
+    let mut main_rows: Vec<(i64, i64, i64, i64)> = Vec::with_capacity(main.len());
+    for r in main {
+        main_rows.push((r.timestamp, user_key(&r.user_id)?, r.score, r.rank));
+    }
+    let mut wl_rows: Vec<(i64, i64, i64, i64, i64)> = Vec::new();
     let mut running: HashMap<WorldBloomKey, PlayerState> = HashMap::new();
-    for r in records {
-        let user_key = *user_lookup
-            .get(&r.base.user_id)
-            .ok_or_else(|| DbErr::Custom("missing user_id_key lookup".into()))?;
+    for r in world_bloom {
+        let user_key = user_key(&r.base.user_id)?;
         let key = WorldBloomKey {
             user_id_key: user_key,
             character_id: r.character_id,
@@ -668,7 +649,7 @@ pub async fn batch_insert_world_bloom_rankings(
             .copied()
             .or_else(|| prev_state.get(&key).copied());
         if last.is_none_or(|p| p.score != r.base.score || p.rank != r.base.rank) {
-            changed.push((
+            wl_rows.push((
                 r.base.timestamp,
                 user_key,
                 r.character_id,
@@ -684,10 +665,18 @@ pub async fn batch_insert_world_bloom_rankings(
             );
         }
     }
-    if changed.is_empty() {
-        return Ok(0);
+    if main_rows.is_empty() && wl_rows.is_empty() {
+        return Ok(FlushOutcome::default());
     }
-    let changed_len = changed.len();
+    let outcome = FlushOutcome {
+        main_rows: main_rows.len(),
+        world_bloom_rows: wl_rows.len(),
+    };
+    let timestamps: HashSet<i64> = main_rows
+        .iter()
+        .map(|row| row.0)
+        .chain(wl_rows.iter().map(|row| row.0))
+        .collect();
 
     engine
         .conn()
@@ -695,41 +684,70 @@ pub async fn batch_insert_world_bloom_rankings(
             Box::pin(async move {
                 let time_lookup =
                     batch_get_or_create_time_ids(tx, backend, time_tbl, &timestamps, 0).await?;
-
-                let mut ins = Query::insert();
-                ins.into_table(Alias::new(wl_tbl)).columns([
-                    world_bloom::Column::TimeId,
-                    world_bloom::Column::UserIdKey,
-                    world_bloom::Column::CharacterId,
-                    world_bloom::Column::Score,
-                    world_bloom::Column::Rank,
-                ]);
-                for (ts, u, c, s, rk) in &changed {
-                    let time_id_v = *time_lookup
+                let time_id = |ts: &i64| {
+                    time_lookup
                         .get(ts)
-                        .ok_or_else(|| DbErr::Custom("missing time_id lookup".into()))?;
-                    ins.values_panic([
-                        time_id_v.into(),
-                        (*u).into(),
-                        (*c).into(),
-                        (*s).into(),
-                        (*rk).into(),
+                        .copied()
+                        .ok_or_else(|| DbErr::Custom("missing time_id lookup".into()))
+                };
+
+                if !main_rows.is_empty() {
+                    let mut ins = Query::insert();
+                    ins.into_table(Alias::new(event_tbl)).columns([
+                        event::Column::TimeId,
+                        event::Column::UserIdKey,
+                        event::Column::Score,
+                        event::Column::Rank,
                     ]);
+                    for (ts, user_key, score, rank) in &main_rows {
+                        ins.values_panic([
+                            time_id(ts)?.into(),
+                            (*user_key).into(),
+                            (*score).into(),
+                            (*rank).into(),
+                        ]);
+                    }
+                    ins.on_conflict(
+                        OnConflict::columns([event::Column::TimeId, event::Column::UserIdKey])
+                            .do_nothing_on([event::Column::TimeId, event::Column::UserIdKey])
+                            .to_owned(),
+                    );
+                    tx.execute(&ins).await?;
                 }
-                ins.on_conflict(
-                    OnConflict::columns([
+
+                if !wl_rows.is_empty() {
+                    let mut ins = Query::insert();
+                    ins.into_table(Alias::new(wl_tbl)).columns([
                         world_bloom::Column::TimeId,
                         world_bloom::Column::UserIdKey,
                         world_bloom::Column::CharacterId,
-                    ])
-                    .do_nothing_on([
-                        world_bloom::Column::TimeId,
-                        world_bloom::Column::UserIdKey,
-                        world_bloom::Column::CharacterId,
-                    ])
-                    .to_owned(),
-                );
-                tx.execute(&ins).await?;
+                        world_bloom::Column::Score,
+                        world_bloom::Column::Rank,
+                    ]);
+                    for (ts, user_key, character_id, score, rank) in &wl_rows {
+                        ins.values_panic([
+                            time_id(ts)?.into(),
+                            (*user_key).into(),
+                            (*character_id).into(),
+                            (*score).into(),
+                            (*rank).into(),
+                        ]);
+                    }
+                    ins.on_conflict(
+                        OnConflict::columns([
+                            world_bloom::Column::TimeId,
+                            world_bloom::Column::UserIdKey,
+                            world_bloom::Column::CharacterId,
+                        ])
+                        .do_nothing_on([
+                            world_bloom::Column::TimeId,
+                            world_bloom::Column::UserIdKey,
+                            world_bloom::Column::CharacterId,
+                        ])
+                        .to_owned(),
+                    );
+                    tx.execute(&ins).await?;
+                }
                 Ok(())
             })
         })
@@ -737,7 +755,7 @@ pub async fn batch_insert_world_bloom_rankings(
         .map_err(unwrap_tx_err)?;
 
     prev_state.extend(running);
-    Ok(changed_len)
+    Ok(outcome)
 }
 
 fn unwrap_tx_err(e: TransactionError<DbErr>) -> DbErr {

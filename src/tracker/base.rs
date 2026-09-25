@@ -18,9 +18,7 @@ use thiserror::Error;
 
 use crate::db::engine::DatabaseEngine;
 use crate::db::privacy::ensure_user_table_extensions;
-use crate::db::query::batch::{
-    batch_insert_event_rankings, batch_insert_world_bloom_rankings, batch_upsert_event_users,
-};
+use crate::db::query::batch::{batch_insert_flush, batch_upsert_event_users};
 use crate::db::query::heartbeat::write_heartbeat;
 use crate::db::schema::create_event_tables;
 use crate::model::enums::{SekaiEventType, SekaiServerRegion};
@@ -113,6 +111,8 @@ pub struct EventTrackerBase {
     /// `(written_at, status)` of the last heartbeat-equivalent row, used to
     /// throttle status-only heartbeats at second-level cadence.
     last_heartbeat: Option<(i64, i16)>,
+    /// Timestamp of the latest upstream sample (see `claim_record_time`).
+    last_record_time: Option<i64>,
     last_border_fetch_at: Option<i64>,
     /// Last time a border-fetch failure was logged at WARN; repeats inside
     /// `BORDER_FAILURE_WARN_INTERVAL_SECS` drop to DEBUG.
@@ -184,6 +184,7 @@ impl EventTrackerBase {
             tuning,
             last_post_end_user_refresh_at: None,
             last_heartbeat: None,
+            last_record_time: None,
             last_border_fetch_at: None,
             last_border_failure_warn_at: None,
             border_retry_after: None,
@@ -499,7 +500,8 @@ impl EventTrackerBase {
         should_refresh_after_end(self.pending_since, now, self.tuning.flush_interval_secs)
     }
 
-    /// Write the pending buffer in one batch. On success the flushed-state
+    /// Write the pending buffer in one transaction (`batch_insert_flush`).
+    /// On success the flushed-state
     /// side effects run (Redis `rank_state`, border hash, epoch bump); on
     /// failure the rows are put back and retried on the next flush trigger.
     async fn flush_pending(
@@ -509,29 +511,34 @@ impl EventTrackerBase {
     ) -> Result<bool, TrackerError> {
         let records = std::mem::take(&mut self.pending_records);
         let wl_rows = std::mem::take(&mut self.pending_wl_rows);
-        self.begin_cache_update(!records.is_empty() || !wl_rows.is_empty())
-            .await;
-        let batch_called = match self.persist_main_records(&records).await {
-            Ok(called) => called,
-            Err(err) => {
-                self.pending_records = records;
-                self.pending_wl_rows = wl_rows;
-                return Err(err);
-            }
-        };
-        let batch_called = match self
-            .persist_world_bloom_records(&wl_rows, batch_called)
-            .await
+        let will_write = !records.is_empty() || !wl_rows.is_empty();
+        self.begin_cache_update(will_write).await;
+        let outcome = match batch_insert_flush(
+            &self.db,
+            self.server,
+            self.event_id,
+            &self.anonymizer,
+            &records,
+            &wl_rows,
+            &mut self.prev_world_bloom_state,
+            &mut self.wl_user_keys,
+        )
+        .await
         {
-            Ok(called) => called,
+            Ok(outcome) => outcome,
             Err(err) => {
-                // The main rows may already have landed; re-inserting them on
-                // retry is a DO NOTHING no-op, so putting both back is safe.
+                self.abort_cache_update("failed to clear API cache dirty after insert error")
+                    .await;
                 self.pending_records = records;
                 self.pending_wl_rows = wl_rows;
-                return Err(err);
+                return Err(err.into());
             }
         };
+        let batch_called = outcome.wrote_rows();
+        if will_write && !batch_called {
+            self.abort_cache_update("failed to clear API cache dirty after no-op flush")
+                .await;
+        }
         self.complete_cache_update(batch_called, write_idle_heartbeat, now)
             .await?;
 
@@ -620,69 +627,6 @@ impl EventTrackerBase {
         }
     }
 
-    async fn persist_main_records(
-        &mut self,
-        records: &[PlayerEventRankingRecordSchema],
-    ) -> Result<bool, TrackerError> {
-        if !records.is_empty()
-            && let Err(err) = batch_insert_event_rankings(
-                &self.db,
-                self.server,
-                self.event_id,
-                &self.anonymizer,
-                records,
-            )
-            .await
-        {
-            self.abort_cache_update("failed to clear API cache dirty after insert error")
-                .await;
-            return Err(err.into());
-        }
-        Ok(!records.is_empty())
-    }
-
-    async fn persist_world_bloom_records(
-        &mut self,
-        records: &[PlayerWorldBloomRankingRecordSchema],
-        batch_called: bool,
-    ) -> Result<bool, TrackerError> {
-        if records.is_empty() {
-            return Ok(batch_called);
-        }
-        let result = batch_insert_world_bloom_rankings(
-            &self.db,
-            self.server,
-            self.event_id,
-            &self.anonymizer,
-            records,
-            &mut self.prev_world_bloom_state,
-            &mut self.wl_user_keys,
-        )
-        .await;
-        match result {
-            Ok(inserted) if inserted > 0 => Ok(true),
-            Ok(_) => {
-                if !batch_called {
-                    self.abort_cache_update(
-                        "failed to clear API cache dirty after no-op world bloom insert",
-                    )
-                    .await;
-                }
-                Ok(batch_called)
-            }
-            Err(err) => {
-                if batch_called {
-                    self.finish_cache_update("failed to bump API cache epoch after partial write")
-                        .await;
-                } else {
-                    self.abort_cache_update("failed to clear API cache dirty after insert error")
-                        .await;
-                }
-                Err(err.into())
-            }
-        }
-    }
-
     async fn complete_cache_update(
         &mut self,
         batch_called: bool,
@@ -746,7 +690,7 @@ impl EventTrackerBase {
             }
         };
 
-        let record_time = Utc::now().timestamp();
+        let record_time = self.claim_record_time();
         let main_top100 = top100.rankings;
         let main_border = border.border_rankings;
 
@@ -804,8 +748,8 @@ impl EventTrackerBase {
         Ok(self.top100_only_data(top100))
     }
 
-    fn top100_only_data(&self, top100: Top100RankingResponse) -> HandledRankingData {
-        let record_time = Utc::now().timestamp();
+    fn top100_only_data(&mut self, top100: Top100RankingResponse) -> HandledRankingData {
+        let record_time = self.claim_record_time();
         let world_bloom_rankings = if self.event_type == SekaiEventType::WorldBloom {
             extract_world_bloom_rankings(
                 top100.user_world_bloom_chapter_rankings,
@@ -822,6 +766,20 @@ impl EventTrackerBase {
             world_bloom_rankings,
             border_cache: None,
         }
+    }
+
+    /// The time of a freshly fetched sample, strictly after the previous
+    /// sample's. The cron fires every second and a tick's time is taken
+    /// after its fetch, so two ticks can land in one wall-clock second and
+    /// would share a `time_id`: the insert's DO NOTHING then drops the
+    /// second sample's rows for players the first already recorded while
+    /// the rank state still advances, leaving players both at their old
+    /// rank and beside the rows that did land. Readers also rely on later
+    /// flushes carrying only larger `time_id`s (`latest_rank_cut`).
+    fn claim_record_time(&mut self) -> i64 {
+        let record_time = next_record_time(self.last_record_time, Utc::now().timestamp());
+        self.last_record_time = Some(record_time);
+        record_time
     }
 
     /// Hold border fetches off for `max(border_fetch_interval_secs,
@@ -859,6 +817,10 @@ fn collect_visible_user_records(
             .map(|row| row.base),
     );
     out
+}
+
+fn next_record_time(last: Option<i64>, now: i64) -> i64 {
+    last.map_or(now, |last| now.max(last.saturating_add(1)))
 }
 
 fn should_refresh_after_end(last: Option<i64>, now: i64, interval_secs: u64) -> bool {
@@ -953,6 +915,14 @@ pub(crate) mod tests {
             TrackerTuning::default(),
             HashMap::new(),
         ))
+    }
+
+    #[test]
+    fn sample_times_strictly_increase_within_a_second() {
+        assert_eq!(next_record_time(None, 100), 100);
+        assert_eq!(next_record_time(Some(99), 100), 100);
+        assert_eq!(next_record_time(Some(100), 100), 101);
+        assert_eq!(next_record_time(Some(101), 100), 102);
     }
 
     #[test]
