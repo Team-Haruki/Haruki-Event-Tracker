@@ -76,6 +76,10 @@ GET .../leaderboards/world-bloom/{character_id}/details/user/{user_id}
 
 `{user_id}` accepts either the public `unique_id` or a positive numeric game UID (a bare numeric id is always treated as a game UID; `idType=unique` / `idType=uid` force the interpretation). A game UID is mapped to the event-specific anonymous ID before querying, so detail cache keys still use anonymous IDs, but the response then reveals that one player's raw UID (see the next section). This lookup does not require a Toolbox binding. Query params: `interval`, `at`, `includeTrace`, `includePlayerTrace`, `includeProfile`, `cursor`, `limit` (trace pages are cursor-paginated).
 
+A trace with no rows in the requested window — typically a `cursor` poll with nothing newer — is an empty `rankTrace` / `playerTrace`, not a 404; the detail 404s only when the rank has never been held or the player was never tracked in the event.
+
+User details carry `ranked`. A player tracked in the event who no longer holds a tracked rank gets `"ranked": false` with `current`, `previous` and `next` omitted (their last row's rank belongs to someone else now, who is never shown in their place), while `playerTrace` and `profile` still describe them. The private user details follow the same rule. The cloud `sk/query?userId=` keeps answering 404 for such a player.
+
 ### Exact UID Lookup (check-room)
 
 ```text

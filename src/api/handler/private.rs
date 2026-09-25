@@ -303,6 +303,25 @@ async fn web_user_detail_for_scope(
             .await?
             .map(RecordedRankData::Normal),
     };
+    // The player's last row keeps its rank after they leave the tracked
+    // ranks; unless they still hold that rank they are not ranked.
+    let occupant = match current.as_ref() {
+        Some(rank_data) => {
+            fetch_rank_item(
+                &engine,
+                event_id,
+                character_id,
+                rank_of_rank_data(rank_data),
+                mode,
+            )
+            .await?
+        }
+        None => None,
+    };
+    let ranked = occupant
+        .as_ref()
+        .is_some_and(|item| user_id_of(&item.rank_data) == user_id);
+    let current = current.filter(|_| ranked);
     let rank = current.as_ref().map(rank_of_rank_data);
     let (previous, next) = tokio::try_join!(
         async {
@@ -365,6 +384,7 @@ async fn web_user_detail_for_scope(
             fetched_at: chrono::Utc::now().timestamp(),
         },
         subject: None,
+        ranked,
         current,
         previous,
         next,
@@ -396,6 +416,13 @@ async fn fetch_rank_item(
     }))
 }
 
+fn user_id_of(rank_data: &RecordedRankData) -> &str {
+    match rank_data {
+        RecordedRankData::Normal(data) => &data.user_id,
+        RecordedRankData::WorldBloom(data) => &data.user_id,
+    }
+}
+
 fn rank_of_rank_data(rank_data: &RecordedRankData) -> i64 {
     match rank_data {
         RecordedRankData::Normal(data) => data.rank,
@@ -413,7 +440,8 @@ mod tests {
     use crate::api::ws_ticket::WsTicketStore;
     use crate::config::{ApiQueryConfig, ToolboxConfig};
     use crate::db::query::web::tests::{
-        seed_normal_event_with_history, seed_world_bloom_event_with_history, sqlite_engine,
+        seed_normal_event_with_history, seed_player_pushed_out,
+        seed_world_bloom_event_with_history, sqlite_engine,
     };
     use crate::db::schema::create_event_tables;
     use crate::privacy::UidAnonymizer;
@@ -561,9 +589,50 @@ mod tests {
         .await
         .unwrap()
         .0;
+        assert!(world.ranked);
         assert!(world.current.is_some());
         assert!(world.next.is_some());
         assert_eq!(world.meta.character_id, Some(17));
+    }
+
+    #[tokio::test]
+    async fn private_web_details_of_players_who_left_the_ranks_are_not_ranked() {
+        let state = test_state(true).await;
+        let (_, engine) = resolve_region_engine(&state, "jp").unwrap();
+        seed_player_pushed_out(&engine, NORMAL_EVENT, None, 1).await;
+        seed_player_pushed_out(&engine, WORLD_BLOOM_EVENT, Some(17), 1).await;
+        let total = web_total_user_detail(
+            State(state.clone()),
+            Path(("jp".into(), NORMAL_EVENT, "100".into())),
+            Query(detail_query()),
+            subject(),
+        )
+        .await
+        .unwrap()
+        .0;
+        let world = web_world_bloom_user_detail(
+            State(state),
+            Path(("jp".into(), WORLD_BLOOM_EVENT, 17, "100".into())),
+            Query(detail_query()),
+            subject(),
+        )
+        .await
+        .unwrap()
+        .0;
+        for detail in [total, world] {
+            assert!(!detail.ranked);
+            assert!(detail.current.is_none());
+            assert!(detail.previous.is_none());
+            assert!(detail.next.is_none());
+            assert_eq!(detail.player_trace.len(), 2);
+            assert!(
+                detail
+                    .player_trace
+                    .iter()
+                    .all(|row| user_id_of(row) == "100")
+            );
+            assert_eq!(detail.profile.unwrap().user_id, "100");
+        }
     }
 
     #[tokio::test]

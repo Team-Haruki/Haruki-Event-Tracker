@@ -293,17 +293,25 @@ pub(super) fn ensure_current_is_user(
     rank: i64,
     user_id: &str,
 ) -> Result<(), ApiError> {
+    if snapshot_shows_user(snapshot, rank, user_id) {
+        Ok(())
+    } else {
+        Err(ApiError::NotFound)
+    }
+}
+
+pub(super) fn snapshot_shows_user(
+    snapshot: &RankSnapshotsResponseSchema,
+    rank: i64,
+    user_id: &str,
+) -> bool {
     let shown = snapshot
         .items
         .iter()
         .find(|item| item.rank == rank)
         .and_then(|item| item.current.as_ref())
         .and_then(|current| user_id_of_rank_data(&current.rank_data));
-    if shown.as_deref() == Some(user_id) {
-        Ok(())
-    } else {
-        Err(ApiError::NotFound)
-    }
+    shown.as_deref() == Some(user_id)
 }
 
 async fn fetch_snapshot_metrics(
