@@ -108,6 +108,9 @@ pub struct EventTrackerBase {
     anonymizer: UidAnonymizer,
     tuning: TrackerTuning,
     last_post_end_user_refresh_at: Option<i64>,
+    /// API-cache epoch returned by the latest `finish_cache_update`; the
+    /// daemon's realtime push carries it as `version`.
+    cache_version: Option<i64>,
     /// `(written_at, status)` of the last heartbeat-equivalent row, used to
     /// throttle status-only heartbeats at second-level cadence.
     last_heartbeat: Option<(i64, i16)>,
@@ -183,6 +186,7 @@ impl EventTrackerBase {
             anonymizer,
             tuning,
             last_post_end_user_refresh_at: None,
+            cache_version: None,
             last_heartbeat: None,
             last_record_time: None,
             last_border_fetch_at: None,
@@ -658,9 +662,15 @@ impl EventTrackerBase {
 
     async fn finish_cache_update(&mut self, message: &'static str) {
         let db = self.db.clone();
-        self.invalidation
+        self.cache_version = self
+            .invalidation
             .finish(self.server, self.event_id, &db, message)
             .await;
+    }
+
+    /// The post-bump API-cache epoch of the last committed write.
+    pub fn cache_version(&self) -> Option<i64> {
+        self.cache_version
     }
 
     async fn handle_ranking_data(&mut self) -> Result<HandledRankingData, TrackerError> {

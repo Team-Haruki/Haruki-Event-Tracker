@@ -77,8 +77,27 @@ struct WsEvent<'a> {
     event_id: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     timestamp: Option<i64>,
+    /// `updated` only: the event's API-cache epoch after this update. A
+    /// client passes it as `v=<version>` to fetch the matching data over
+    /// plain HTTP (cacheable, see `api::http_cache`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    version: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     online: Option<OnlinePayload>,
+}
+
+/// What goes back for one client frame: a structured response, or a
+/// proxied success already rendered to its final wire text.
+#[derive(Debug)]
+enum WsReply {
+    Response(WsResponse),
+    Raw(String),
+}
+
+impl From<WsResponse> for WsReply {
+    fn from(response: WsResponse) -> Self {
+        Self::Response(response)
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -149,6 +168,7 @@ async fn handle_socket(
             server: None,
             event_id: None,
             timestamp: None,
+            version: None,
             online: Some(OnlinePayload {
                 total: total_online,
                 topic: 0,
@@ -213,14 +233,14 @@ async fn handle_client_message(
         }
         Message::Binary(bytes) => match std::str::from_utf8(&bytes) {
             Ok(text) => handle_text_request(router, hub, topics, subject, text).await,
-            Err(_) => WsResponse::error("", StatusCode::BAD_REQUEST, "invalid utf-8"),
+            Err(_) => WsResponse::error("", StatusCode::BAD_REQUEST, "invalid utf-8").into(),
         },
         Message::Ping(payload) => return socket.send(Message::Pong(payload)).await.map_err(|_| ()),
         Message::Pong(_) => return Ok(()),
         Message::Close(_) => return Err(()),
     };
 
-    send_response(socket, &response).await.map_err(|_| ())
+    send_reply(socket, response).await.map_err(|_| ())
 }
 
 async fn handle_realtime_message(
@@ -229,7 +249,11 @@ async fn handle_realtime_message(
     message: RealtimeMessage,
 ) -> Result<(), ()> {
     match message {
-        RealtimeMessage::Updated { topic, timestamp } => {
+        RealtimeMessage::Updated {
+            topic,
+            timestamp,
+            version,
+        } => {
             if topics.contains(&topic) {
                 send_event(
                     socket,
@@ -239,6 +263,7 @@ async fn handle_realtime_message(
                         server: Some(topic.server),
                         event_id: Some(topic.event_id),
                         timestamp: Some(timestamp),
+                        version,
                         online: None,
                     },
                 )
@@ -260,6 +285,7 @@ async fn handle_realtime_message(
                         server: Some(topic.server),
                         event_id: Some(topic.event_id),
                         timestamp: None,
+                        version: None,
                         online: Some(OnlinePayload {
                             total,
                             topic: topic_online,
@@ -281,22 +307,23 @@ async fn handle_text_request(
     topics: &mut HashSet<RealtimeTopic>,
     subject: &str,
     text: &str,
-) -> WsResponse {
+) -> WsReply {
     let request = match sonic_rs::from_str::<WsRequest>(text) {
         Ok(request) => request,
-        Err(_) => return WsResponse::error("", StatusCode::BAD_REQUEST, "invalid request"),
+        Err(_) => return WsResponse::error("", StatusCode::BAD_REQUEST, "invalid request").into(),
     };
 
     match request.kind.as_str() {
-        "subscribe" => subscribe_topic(hub, topics, request).await,
-        "unsubscribe" => unsubscribe_topic(hub, topics, request).await,
+        "subscribe" => subscribe_topic(hub, topics, request).await.into(),
+        "unsubscribe" => unsubscribe_topic(hub, topics, request).await.into(),
         "ping" => WsResponse {
             id: request.id,
             ok: true,
             data: sonic_rs::from_str(r#"{"type":"pong"}"#).ok(),
             error: None,
             status: StatusCode::OK.as_u16(),
-        },
+        }
+        .into(),
         _ => handle_proxy_request(router, request, subject).await,
     }
 }
@@ -361,14 +388,16 @@ async fn subscribe_topic(
     }
 }
 
-async fn handle_proxy_request(router: &Router, request: WsRequest, subject: &str) -> WsResponse {
+async fn handle_proxy_request(router: &Router, request: WsRequest, subject: &str) -> WsReply {
     if !is_allowed_event_path(&request.path) {
-        return WsResponse::error(&request.id, StatusCode::BAD_REQUEST, "invalid path");
+        return WsResponse::error(&request.id, StatusCode::BAD_REQUEST, "invalid path").into();
     }
 
     let uri: Uri = match request.path.parse() {
         Ok(uri) => uri,
-        Err(_) => return WsResponse::error(&request.id, StatusCode::BAD_REQUEST, "invalid path"),
+        Err(_) => {
+            return WsResponse::error(&request.id, StatusCode::BAD_REQUEST, "invalid path").into();
+        }
     };
     let mut http_request = Request::builder()
         .method(Method::GET)
@@ -387,7 +416,8 @@ async fn handle_proxy_request(router: &Router, request: WsRequest, subject: &str
                 &request.id,
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "request failed",
-            );
+            )
+            .into();
         }
     };
     let status = response.status();
@@ -399,29 +429,44 @@ async fn handle_proxy_request(router: &Router, request: WsRequest, subject: &str
                 &request.id,
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "request failed",
-            );
+            )
+            .into();
         }
     };
 
     if !status.is_success() {
         let message = extract_error_message(&body).unwrap_or_else(|| status.to_string());
-        return WsResponse::error(&request.id, status, message);
+        return WsResponse::error(&request.id, status, message).into();
     }
 
-    match sonic_rs::from_slice::<sonic_rs::Value>(&body) {
-        Ok(data) => WsResponse {
-            id: request.id,
-            ok: true,
-            data: Some(data),
-            error: None,
-            status: status.as_u16(),
-        },
-        Err(_) => WsResponse::error(
+    match splice_success(&request.id, status, &body) {
+        Some(text) => WsReply::Raw(text),
+        None => WsResponse::error(
             &request.id,
             StatusCode::INTERNAL_SERVER_ERROR,
             "invalid json response",
-        ),
+        )
+        .into(),
     }
+}
+
+/// Renders `{"id":…,"ok":true,"data":<body>,"status":…}` around the
+/// handler's JSON body as-is — the same text `WsResponse` serialization
+/// produced from a parsed copy, without building and re-encoding a tree
+/// for every (often ~128 KB) overview. The body is only validated.
+fn splice_success(id: &str, status: StatusCode, body: &[u8]) -> Option<String> {
+    let body = std::str::from_utf8(body).ok()?;
+    sonic_rs::from_str::<sonic_rs::LazyValue<'_>>(body).ok()?;
+    let id = sonic_rs::to_string(id).ok()?;
+    let mut text = String::with_capacity(body.len() + id.len() + 40);
+    text.push_str(r#"{"id":"#);
+    text.push_str(&id);
+    text.push_str(r#","ok":true,"data":"#);
+    text.push_str(body);
+    text.push_str(r#","status":"#);
+    text.push_str(&status.as_u16().to_string());
+    text.push('}');
+    Some(text)
 }
 
 pub fn resolve_oathkeeper_subject(headers: &HeaderMap) -> Option<String> {
@@ -439,15 +484,23 @@ pub fn resolve_oathkeeper_subject(headers: &HeaderMap) -> Option<String> {
     None
 }
 
-async fn send_response(socket: &mut WebSocket, response: &WsResponse) -> Result<(), axum::Error> {
-    let text = match sonic_rs::to_string(response) {
-        Ok(text) => text,
-        Err(err) => {
-            tracing::error!(%err, "websocket response encode failed");
-            r#"{"id":"","ok":false,"error":"json encode error","status":500}"#.to_owned()
+async fn send_reply(socket: &mut WebSocket, reply: WsReply) -> Result<(), axum::Error> {
+    socket.send(Message::Text(reply.into_text().into())).await
+}
+
+impl WsReply {
+    fn into_text(self) -> String {
+        match self {
+            Self::Raw(text) => text,
+            Self::Response(response) => match sonic_rs::to_string(&response) {
+                Ok(text) => text,
+                Err(err) => {
+                    tracing::error!(%err, "websocket response encode failed");
+                    r#"{"id":"","ok":false,"error":"json encode error","status":500}"#.to_owned()
+                }
+            },
         }
-    };
-    socket.send(Message::Text(text.into())).await
+    }
 }
 
 async fn send_event(socket: &mut WebSocket, event: &WsEvent<'_>) -> Result<(), axum::Error> {
@@ -508,6 +561,22 @@ mod tests {
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
     use tokio_tungstenite::tungstenite::protocol::Message as ClientMessage;
 
+    #[derive(Debug, Deserialize)]
+    struct ParsedReply {
+        ok: bool,
+        status: u16,
+        #[serde(default)]
+        data: Option<sonic_rs::Value>,
+        #[serde(default)]
+        error: Option<String>,
+    }
+
+    impl WsReply {
+        fn parsed(self) -> ParsedReply {
+            sonic_rs::from_str(&self.into_text()).unwrap()
+        }
+    }
+
     fn router() -> Router {
         Router::new()
             .route(
@@ -560,7 +629,9 @@ mod tests {
         let mut topics = HashSet::new();
         hub.connection_opened();
 
-        let invalid = handle_text_request(&router, &hub, &mut topics, "owner", "{").await;
+        let invalid = handle_text_request(&router, &hub, &mut topics, "owner", "{")
+            .await
+            .parsed();
         assert_eq!(invalid.status, StatusCode::BAD_REQUEST.as_u16());
 
         let missing = handle_text_request(
@@ -570,7 +641,8 @@ mod tests {
             "owner",
             r#"{"id":"1","type":"subscribe"}"#,
         )
-        .await;
+        .await
+        .parsed();
         assert!(!missing.ok);
 
         let missing_event = handle_text_request(
@@ -580,7 +652,8 @@ mod tests {
             "owner",
             r#"{"id":"2","type":"subscribe","server":"jp"}"#,
         )
-        .await;
+        .await
+        .parsed();
         assert!(!missing_event.ok);
 
         let subscribed = handle_text_request(
@@ -590,7 +663,8 @@ mod tests {
             "owner",
             r#"{"id":"3","type":"subscribe","server":"jp","eventId":10}"#,
         )
-        .await;
+        .await
+        .parsed();
         assert!(subscribed.ok);
         assert_eq!(topics.len(), 1);
 
@@ -601,7 +675,8 @@ mod tests {
             "owner",
             r#"{"id":"4","type":"subscribe","server":"jp","eventId":10}"#,
         )
-        .await;
+        .await
+        .parsed();
         assert!(duplicate.ok);
         assert_eq!(
             hub.topic_online(&RealtimeTopic::new(SekaiServerRegion::Jp, 10))
@@ -616,7 +691,8 @@ mod tests {
             "owner",
             r#"{"id":"5","type":"ping"}"#,
         )
-        .await;
+        .await
+        .parsed();
         assert!(ping.ok);
         assert_eq!(ping.data.unwrap()["type"].as_str(), Some("pong"));
 
@@ -627,7 +703,8 @@ mod tests {
             "owner",
             r#"{"id":"6","type":"unsubscribe"}"#,
         )
-        .await;
+        .await
+        .parsed();
         assert!(!missing_unsubscribe.ok);
 
         let invalid_unsubscribe = handle_text_request(
@@ -637,7 +714,8 @@ mod tests {
             "owner",
             r#"{"id":"7","type":"unsubscribe","server":"jp","eventId":0}"#,
         )
-        .await;
+        .await
+        .parsed();
         assert!(!invalid_unsubscribe.ok);
 
         let unsubscribed = handle_text_request(
@@ -647,7 +725,8 @@ mod tests {
             "owner",
             r#"{"id":"8","type":"unsubscribe","server":"jp","eventId":10}"#,
         )
-        .await;
+        .await
+        .parsed();
         assert!(unsubscribed.ok);
         assert!(topics.is_empty());
         hub.connection_closed(&[]).await;
@@ -666,7 +745,8 @@ mod tests {
             "owner-1",
             r#"{"id":"1","path":"/api/v2/web/ok"}"#,
         )
-        .await;
+        .await
+        .parsed();
         assert!(ok.ok);
         assert_eq!(ok.data.unwrap()["value"].as_i64(), Some(42));
 
@@ -677,7 +757,8 @@ mod tests {
             "owner-1",
             r#"{"id":"2","path":"/api/v2/web/error"}"#,
         )
-        .await;
+        .await
+        .parsed();
         assert_eq!(error.status, StatusCode::UNPROCESSABLE_ENTITY.as_u16());
         assert_eq!(error.error.as_deref(), Some("bad query"));
 
@@ -688,7 +769,8 @@ mod tests {
             "owner-1",
             r#"{"id":"3","path":"/api/v2/web/text"}"#,
         )
-        .await;
+        .await
+        .parsed();
         assert_eq!(
             invalid_json.status,
             StatusCode::INTERNAL_SERVER_ERROR.as_u16()
@@ -707,8 +789,138 @@ mod tests {
                 server: None,
                 event_id: None,
             };
-            let response = handle_proxy_request(&router, request, "owner-1").await;
+            let response = handle_proxy_request(&router, request, "owner-1")
+                .await
+                .parsed();
             assert_eq!(response.status, StatusCode::BAD_REQUEST.as_u16());
+        }
+    }
+
+    /// The pre-splice encoding: parse the body, re-serialize it inside
+    /// `WsResponse`.
+    fn parsed_success_text(id: &str, status: StatusCode, body: &[u8]) -> String {
+        sonic_rs::to_string(&WsResponse {
+            id: id.to_owned(),
+            ok: true,
+            data: Some(sonic_rs::from_slice(body).unwrap()),
+            error: None,
+            status: status.as_u16(),
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn spliced_replies_match_the_parsed_encoding_byte_for_byte() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(async {
+                        use crate::api::handler::web::tests::{
+                            NORMAL_EVENT, WORLD_BLOOM_EVENT, test_state,
+                        };
+                        let state = test_state(true).await;
+                        let user = state.anonymizer().public_user_id(
+                            SekaiServerRegion::Jp,
+                            NORMAL_EVENT,
+                            "100",
+                        );
+                        let (trust, _) =
+                            ProxyTrust::from_config(false, &[], "X-Forwarded-For", 1.0, 1000);
+                        let router = web_v2_routes(Arc::new(trust)).with_state(state);
+                        let base = format!("/api/v2/web/events/jp/{NORMAL_EVENT}/leaderboards");
+                        let wb = format!(
+                            "/api/v2/web/events/jp/{WORLD_BLOOM_EVENT}/leaderboards/world-bloom/17"
+                        );
+                        let paths = [
+                            format!("{base}/total/overview?at=1710000060&interval=60"),
+                            format!("{base}/total/replay/overview?at=1710000060&interval=60"),
+                            format!("{base}/total/details/rank/1?at=1710000060&includeTrace=true"),
+                            format!("{base}/total/details/user/{user}?at=1710000060"),
+                            format!("{base}/total/users/search?name=Alpha"),
+                            format!("{base}/total/check-room?userId=100"),
+                            format!("{wb}/overview?at=1710000060&interval=60"),
+                            format!("{wb}/users/search?name=Alpha"),
+                        ];
+                        for path in paths {
+                            for id in ["1", "quo\"te\\back/slash", "\u{1}ユニ"] {
+                                let body = axum::body::to_bytes(
+                                    router
+                                        .clone()
+                                        .oneshot(
+                                            Request::builder()
+                                                .uri(&path)
+                                                .body(Body::empty())
+                                                .unwrap(),
+                                        )
+                                        .await
+                                        .unwrap()
+                                        .into_body(),
+                                    usize::MAX,
+                                )
+                                .await
+                                .unwrap();
+                                let request = WsRequest {
+                                    id: id.into(),
+                                    path: path.clone(),
+                                    kind: String::new(),
+                                    server: None,
+                                    event_id: None,
+                                };
+                                let WsReply::Raw(text) =
+                                    handle_proxy_request(&router, request, "owner").await
+                                else {
+                                    panic!("{path} was not spliced");
+                                };
+                                assert_eq!(
+                                    text,
+                                    parsed_success_text(id, StatusCode::OK, &body),
+                                    "{path}"
+                                );
+                            }
+                        }
+                    });
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+
+        // Whatever sonic-rs emits — escapes, floats, unicode, nesting —
+        // splices to the same text a parse + re-encode produces.
+        let body = sonic_rs::to_vec(&json!({
+            "s": "\"q\" \\ / \n \t \u{7f} \u{2028} é ユニ 🎉",
+            "f": [0.1, 1.5e300, 123456789.125, f64::MIN_POSITIVE],
+            "i": [i64::MIN, u64::MAX],
+            "n": null,
+            "b": [true, false],
+            "e": {"a": [], "o": {}},
+        }))
+        .unwrap();
+        assert_eq!(
+            splice_success("x", StatusCode::OK, &body).unwrap(),
+            parsed_success_text("x", StatusCode::OK, &body)
+        );
+        // The one divergence: the old parse dropped the sign of `-0.0`;
+        // the splice keeps the handler's bytes, as the HTTP body does.
+        assert_eq!(
+            splice_success("x", StatusCode::OK, b"[-0.0]").unwrap(),
+            r#"{"id":"x","ok":true,"data":[-0.0],"status":200}"#
+        );
+        for invalid in [
+            &b"not json"[..],
+            b"{\"a\":tru}",
+            b"{\"a\":1",
+            b"[1,]",
+            b"{} {}",
+            b"\xff",
+        ] {
+            assert!(
+                splice_success("x", StatusCode::OK, invalid).is_none(),
+                "{invalid:?}"
+            );
         }
     }
 
@@ -792,10 +1004,20 @@ mod tests {
         }
         assert!(saw_subscribed && saw_online);
 
-        hub.notify_update(RealtimeTopic::new(SekaiServerRegion::Jp, 99), 1234);
+        hub.notify_update(
+            RealtimeTopic::new(SekaiServerRegion::Jp, 99),
+            1234,
+            Some(42),
+        );
         let updated = next_json(&mut socket).await;
         assert_eq!(updated["type"].as_str(), Some("updated"));
         assert_eq!(updated["timestamp"].as_i64(), Some(1234));
+        assert_eq!(updated["version"].as_i64(), Some(42));
+        // Without an API cache there is no version to announce.
+        hub.notify_update(RealtimeTopic::new(SekaiServerRegion::Jp, 99), 1235, None);
+        let unversioned = next_json(&mut socket).await;
+        assert_eq!(unversioned["timestamp"].as_i64(), Some(1235));
+        assert!(unversioned.get("version").is_none());
 
         socket
             .send(ClientMessage::Binary(vec![0xff].into()))

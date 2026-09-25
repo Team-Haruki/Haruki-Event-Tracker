@@ -362,7 +362,7 @@ mod tests {
             .unwrap();
         assert!(matches!(
             message,
-            RealtimeMessage::Updated { ref topic, timestamp: 7 }
+            RealtimeMessage::Updated { ref topic, timestamp: 7, version: None }
                 if topic.server == SekaiServerRegion::Jp && topic.event_id == 200
         ));
         assert_eq!(link.last_seq(), 1);

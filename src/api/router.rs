@@ -1,5 +1,6 @@
-//! Mounts the public Tracker API routes. The middleware stack mirrors the Go
-//! fiber app: panic catcher → compression (gzip+brotli) → access log.
+//! Mounts the public Tracker API routes. Middleware, outermost first: panic
+//! catcher → access log → web HTTP caching (ETag / 304 / Cache-Control on
+//! `/api/v2/web/`) → compression (gzip+brotli).
 
 use std::sync::Arc;
 
@@ -14,7 +15,7 @@ use tower_http::compression::predicate::{DefaultPredicate, Predicate, SizeAbove}
 use crate::api::access_log::{self, ProxyTrust};
 use crate::api::handler::{health, leaderboard, private, status, web};
 use crate::api::state::AppState;
-use crate::api::{cloud_auth, cluster, ws, ws_ticket};
+use crate::api::{cloud_auth, cluster, http_cache, ws, ws_ticket};
 
 /// A cluster `writer` exposes only health plus the update stream; every
 /// other role serves the public surface (cloud group behind the optional
@@ -48,7 +49,6 @@ pub fn build_router(state: AppState, trust: Arc<ProxyTrust>) -> Router {
 
     router
         .with_state(state)
-        .layer(axum::middleware::from_fn_with_state(trust, access_log::log))
         // Without an explicit quality tower-http hands brotli its library
         // default (quality 11, ~1 MB/s); browsers prefer br over gzip, so
         // every large response would eat that cost inline on a worker.
@@ -59,6 +59,10 @@ pub fn build_router(state: AppState, trust: Arc<ProxyTrust>) -> Router {
                 .quality(CompressionLevel::Precise(4))
                 .compress_when(SizeAbove::new(1024).and(DefaultPredicate::new())),
         )
+        // Outside compression so ETags and 304s cover the encoded bytes;
+        // inside the access log so a 304 is logged as one.
+        .layer(middleware::from_fn(http_cache::web_cache_headers))
+        .layer(axum::middleware::from_fn_with_state(trust, access_log::log))
         .layer(CatchPanicLayer::new())
 }
 

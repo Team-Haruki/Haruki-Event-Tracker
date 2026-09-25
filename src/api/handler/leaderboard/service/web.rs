@@ -41,6 +41,23 @@ pub struct WebDetailQuery {
     user_id: Option<String>,
 }
 
+impl WebDetailQuery {
+    /// Whether `details/user/{user_id}` resolves `user_id` as a raw upstream
+    /// UID — such a response carries that UID and must stay private.
+    pub(crate) fn looks_up_raw_uid(&self, user_id: &str) -> Result<bool, ApiError> {
+        match self.id_type.as_deref().map(str::trim) {
+            // A bare numeric id can only be a game UID (unique_ids are hex
+            // digests), so it is treated as an explicit raw lookup.
+            None | Some("") => Ok(looks_like_raw_uid(user_id)),
+            Some("unique") => Ok(false),
+            Some("uid") => Ok(true),
+            Some(other) => Err(ApiError::BadRequest(format!(
+                "idType must be unique or uid, got {other}"
+            ))),
+        }
+    }
+}
+
 const MAX_RAW_UID_LEN: usize = 30;
 
 fn looks_like_raw_uid(value: &str) -> bool {
@@ -216,19 +233,7 @@ pub(crate) async fn web_user_detail_for_scope(
     user_id: String,
     query: WebDetailQuery,
 ) -> Result<Json<WebUserDetailResponseSchema>, ApiError> {
-    let by_raw_uid = match query.id_type.as_deref().map(str::trim) {
-        // A bare numeric id can only be a game UID (unique_ids are hex
-        // digests), so it is treated as an explicit raw lookup.
-        None | Some("") => looks_like_raw_uid(&user_id),
-        Some("unique") => false,
-        Some("uid") => true,
-        Some(other) => {
-            return Err(ApiError::BadRequest(format!(
-                "idType must be unique or uid, got {other}"
-            )));
-        }
-    };
-    if by_raw_uid {
+    if query.looks_up_raw_uid(&user_id)? {
         web_user_detail_by_raw_uid(state, server, event_id, character_id, user_id, query).await
     } else {
         web_user_detail_by_unique_id(state, server, event_id, character_id, user_id, query).await

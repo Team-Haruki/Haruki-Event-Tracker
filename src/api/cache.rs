@@ -85,6 +85,10 @@ pub enum CacheTtl {
 pub struct CachedJson {
     pub bytes: Bytes,
     pub encoding: CachedJsonEncoding,
+    /// The cache epoch these bytes belong to: set only when they were read
+    /// from, or accepted into, the epoch-keyed cache while the event was
+    /// clean. `None` for dirty bypasses, cache errors and uncacheable sizes.
+    pub epoch: Option<i64>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -98,6 +102,7 @@ impl CachedJson {
         Self {
             bytes,
             encoding: CachedJsonEncoding::Identity,
+            epoch: None,
         }
     }
 
@@ -105,7 +110,13 @@ impl CachedJson {
         Self {
             bytes,
             encoding: CachedJsonEncoding::Gzip,
+            epoch: None,
         }
+    }
+
+    fn at_epoch(mut self, epoch: Option<i64>) -> Self {
+        self.epoch = epoch;
+        self
     }
 }
 
@@ -734,7 +745,7 @@ impl ApiCache {
                 cache_status = cache_status(request.options, "l1_gzip_hit"),
                 "api cache L1 gzip hit"
             );
-            return Ok(CachedJson::gzip(bytes));
+            return Ok(CachedJson::gzip(bytes).at_epoch(Some(control.epoch)));
         }
         if let Some(bytes) = self.l1.get_value(&key) {
             record_l1_hit(request.options);
@@ -787,7 +798,7 @@ impl ApiCache {
                     "api cache L2 gzip hit"
                 );
                 self.store_l1_value(gzip, bytes.clone());
-                Ok(CachedJson::gzip(bytes))
+                Ok(CachedJson::gzip(bytes).at_epoch(Some(epoch)))
             }
             Ok(L2EncodedRead::Identity(bytes)) => {
                 record_l2_hit(request.options);
@@ -1205,7 +1216,7 @@ impl ApiCache {
         let Some(ctx) = write_context else {
             return self.encode_response(bytes, None, options).await;
         };
-        let encoded = self
+        let mut encoded = self
             .encode_response(bytes.clone(), Some(ctx.clone()), options)
             .await?;
         match self
@@ -1218,8 +1229,13 @@ impl ApiCache {
                     self.store_l1_value(gzip_key(&ctx.value_key), encoded.bytes.clone());
                 }
             }
-            Ok(false) => {}
-            Err(err) => tracing::warn!(%err, "api cache write failed"),
+            // A rejected write means the event went dirty or moved on while
+            // this fetch ran, so the bytes can't be vouched for as `ctx.epoch`.
+            Ok(false) => encoded.epoch = None,
+            Err(err) => {
+                encoded.epoch = None;
+                tracing::warn!(%err, "api cache write failed");
+            }
         }
         Ok(encoded)
     }
@@ -1230,8 +1246,9 @@ impl ApiCache {
         write_context: Option<CacheWriteContext>,
         _options: CacheOptions,
     ) -> Result<CachedJson, ApiError> {
+        let epoch = write_context.as_ref().map(|ctx| ctx.epoch);
         if bytes.len() < self.cfg.precompress_min_bytes {
-            return Ok(CachedJson::identity(bytes));
+            return Ok(CachedJson::identity(bytes).at_epoch(epoch));
         }
         let gzip = self.gzip_response_bytes(bytes).await?;
         if let Some(ctx) = write_context {
@@ -1244,7 +1261,7 @@ impl ApiCache {
                 Err(err) => tracing::warn!(%err, "api cache gzip write failed"),
             }
         }
-        Ok(CachedJson::gzip(gzip))
+        Ok(CachedJson::gzip(gzip).at_epoch(epoch))
     }
 
     async fn gzip_response_bytes(&self, bytes: Bytes) -> Result<Bytes, ApiError> {
@@ -1896,18 +1913,20 @@ pub async fn begin_event_update(
     .await
 }
 
+/// Bumps the event's cache epoch and clears its dirty flag; returns the new
+/// epoch (the `version` realtime `updated` pushes carry).
 pub async fn finish_event_update(
     conn: &mut ConnectionManager,
     server: impl std::fmt::Display,
     event_id: i64,
-) -> Result<(), redis::RedisError> {
+) -> Result<i64, redis::RedisError> {
     let server = server.to_string();
     let mut pipe = redis::pipe();
     pipe.incr(epoch_key(&server, event_id), 1)
-        .ignore()
         .del(dirty_key(&server, event_id))
         .ignore();
-    pipe.query_async::<()>(conn).await
+    let (epoch,) = pipe.query_async::<(i64,)>(conn).await?;
+    Ok(epoch)
 }
 
 pub async fn abort_event_update(

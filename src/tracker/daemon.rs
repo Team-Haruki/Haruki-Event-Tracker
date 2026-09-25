@@ -172,7 +172,12 @@ impl HarukiEventTracker {
         };
         if base.is_event_ended() {
             match base.refresh_after_end().await {
-                Ok(true) => notify_realtime_update(&self.realtime, self.server, event.event_id),
+                Ok(true) => notify_realtime_update(
+                    &self.realtime,
+                    self.server,
+                    event.event_id,
+                    base.cache_version(),
+                ),
                 Ok(false) => {}
                 Err(err) => {
                     tracing::error!(
@@ -210,7 +215,9 @@ impl HarukiEventTracker {
         }
         tracing::info!(event_id = event.event_id, "event ended, finalizing");
         match base.record_ranking_data(false, true).await {
-            Ok(true) => notify_realtime_update(realtime, server, event.event_id),
+            Ok(true) => {
+                notify_realtime_update(realtime, server, event.event_id, base.cache_version())
+            }
             Ok(false) => {}
             Err(err) => {
                 tracing::error!(%err, event_id = event.event_id, "final record_ranking_data failed")
@@ -265,7 +272,12 @@ impl HarukiEventTracker {
                     "WB chapter ended, finalizing"
                 );
                 match base.record_ranking_data(true, true).await {
-                    Ok(true) => notify_realtime_update(realtime, server, event.event_id),
+                    Ok(true) => notify_realtime_update(
+                        realtime,
+                        server,
+                        event.event_id,
+                        base.cache_version(),
+                    ),
                     Ok(false) => {}
                     Err(err) => {
                         tracing::error!(
@@ -284,7 +296,8 @@ impl HarukiEventTracker {
     }
 
     fn notify_update(&self, event_id: i64) {
-        notify_realtime_update(&self.realtime, self.server, event_id);
+        let version = self.inner.as_ref().and_then(|base| base.cache_version());
+        notify_realtime_update(&self.realtime, self.server, event_id, version);
     }
 
     /// Drain the inner tracker's pending write buffer. Called from graceful
@@ -296,8 +309,17 @@ impl HarukiEventTracker {
     }
 }
 
-fn notify_realtime_update(realtime: &RealtimeHub, server: SekaiServerRegion, event_id: i64) {
-    realtime.notify_update(RealtimeTopic::new(server, event_id), Utc::now().timestamp());
+fn notify_realtime_update(
+    realtime: &RealtimeHub,
+    server: SekaiServerRegion,
+    event_id: i64,
+    version: Option<i64>,
+) {
+    realtime.notify_update(
+        RealtimeTopic::new(server, event_id),
+        Utc::now().timestamp(),
+        version,
+    );
 }
 
 fn world_bloom_statuses_equal(
@@ -465,11 +487,12 @@ mod tests {
         let event_id = base.event_id();
         let realtime = RealtimeHub::new();
         let mut receiver = realtime.subscribe();
-        notify_realtime_update(&realtime, SekaiServerRegion::Jp, event_id);
-        let RealtimeMessage::Updated { topic, .. } = receiver.recv().await.unwrap() else {
+        notify_realtime_update(&realtime, SekaiServerRegion::Jp, event_id, Some(5));
+        let RealtimeMessage::Updated { topic, version, .. } = receiver.recv().await.unwrap() else {
             panic!("expected update");
         };
         assert_eq!(topic, RealtimeTopic::new(SekaiServerRegion::Jp, event_id));
+        assert_eq!(version, Some(5));
 
         let statuses = HashMap::from([
             (10, chapter(event_id, 10, SekaiEventStatus::NotStarted)),

@@ -728,7 +728,8 @@ where
             Ok(match encoded.encoding {
                 CachedJsonEncoding::Gzip => EncodedJson::gzip(encoded.bytes),
                 CachedJsonEncoding::Identity => EncodedJson::identity(encoded.bytes),
-            })
+            }
+            .at_epoch(encoded.epoch))
         }
     } else {
         encode_fetched(fetch).await.map(EncodedJson::identity)
@@ -827,6 +828,13 @@ pub(crate) mod tests {
     pub(crate) const WORLD_BLOOM_EVENT: i64 = 822;
 
     pub(crate) async fn test_state(anonymization: bool) -> AppState {
+        test_state_with_cache(anonymization, None).await
+    }
+
+    pub(crate) async fn test_state_with_cache(
+        anonymization: bool,
+        cache: Option<crate::api::cache::ApiCache>,
+    ) -> AppState {
         let engine = sqlite_engine().await;
         create_event_tables(&engine, SekaiServerRegion::Jp, NORMAL_EVENT, false)
             .await
@@ -838,7 +846,7 @@ pub(crate) mod tests {
         seed_world_bloom_event_with_history(&engine, WORLD_BLOOM_EVENT).await;
         AppState::new(
             HashMap::from([(SekaiServerRegion::Jp, Arc::new(engine))]),
-            None,
+            cache,
             ApiQueryLimiter::new(ApiQueryConfig::default(), [SekaiServerRegion::Jp]),
             if anonymization {
                 UidAnonymizer::enabled("test-salt")

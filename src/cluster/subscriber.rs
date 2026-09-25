@@ -204,14 +204,21 @@ impl Applier {
     }
 
     async fn invalidate(&mut self, server: SekaiServerRegion, event_id: i64, timestamp: i64) {
-        if let Some(conn) = self.deps.api_cache_redis.as_mut()
-            && let Err(err) = finish_event_update(conn, server, event_id).await
-        {
-            tracing::warn!(%err, %server, event_id, "failed to bump API cache epoch");
-        }
+        // The push carries the post-bump epoch, so a client fetching with
+        // `v=<version>` asks for exactly the data this update produced.
+        let version = match self.deps.api_cache_redis.as_mut() {
+            Some(conn) => match finish_event_update(conn, server, event_id).await {
+                Ok(epoch) => Some(epoch),
+                Err(err) => {
+                    tracing::warn!(%err, %server, event_id, "failed to bump API cache epoch");
+                    None
+                }
+            },
+            None => None,
+        };
         self.deps
             .realtime
-            .notify_update(RealtimeTopic::new(server, event_id), timestamp);
+            .notify_update(RealtimeTopic::new(server, event_id), timestamp, version);
     }
 }
 
@@ -271,7 +278,7 @@ mod tests {
         let first = rx.try_recv().unwrap();
         assert!(matches!(
             first,
-            crate::api::realtime::RealtimeMessage::Updated { ref topic, timestamp: 10 }
+            crate::api::realtime::RealtimeMessage::Updated { ref topic, timestamp: 10, version: None }
                 if topic.event_id == 179
         ));
         assert_eq!(applier.deps.link.last_seq(), 1);
@@ -301,5 +308,40 @@ mod tests {
         assert!(rx.try_recv().is_ok());
         applier.apply(StreamMessage::Ping, Duration::ZERO).await;
         assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn updates_carry_the_post_bump_cache_epoch() {
+        let Ok(url) = std::env::var("HARUKI_COVERAGE_REDIS_URL") else {
+            return;
+        };
+        let conn = redis::aio::ConnectionManager::new(redis::Client::open(url).unwrap())
+            .await
+            .unwrap();
+        let (mut deps, realtime) = deps();
+        deps.api_cache_redis = Some(conn);
+        let mut rx = realtime.subscribe();
+        let mut applier = Applier::new(deps);
+        let event_id = chrono::Utc::now().timestamp_micros();
+        for (seq, expected) in [(1, 1), (2, 2)] {
+            applier
+                .apply(
+                    StreamMessage::Updated {
+                        seq,
+                        server: SekaiServerRegion::Cn,
+                        event_id,
+                        timestamp: 10,
+                        lsn: None,
+                    },
+                    Duration::ZERO,
+                )
+                .await;
+            let crate::api::realtime::RealtimeMessage::Updated { version, .. } =
+                rx.try_recv().unwrap()
+            else {
+                panic!("expected update");
+            };
+            assert_eq!(version, Some(expected));
+        }
     }
 }
