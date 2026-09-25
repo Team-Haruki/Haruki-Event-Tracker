@@ -44,6 +44,11 @@ impl EncodedJson {
         }
     }
 
+    /// The plain JSON bytes, or `None` for a gzip body.
+    pub fn into_identity_bytes(self) -> Option<Bytes> {
+        (self.encoding == JsonEncoding::Identity).then_some(self.bytes)
+    }
+
     /// Tags the response with the API-cache epoch its bytes belong to
     /// (`ServedEpoch` extension), which lets `http_cache` mark a matching
     /// `v=<epoch>` request immutable.

@@ -136,6 +136,18 @@ pub fn web_v2_routes(trust: Arc<ProxyTrust>) -> Router<AppState> {
             get(leaderboard::web::total_replay_overview),
         )
         .route(
+            "/api/v2/web/events/{server}/{event_id}/leaderboards/total/top100",
+            get(leaderboard::web::total_top100),
+        )
+        .route(
+            "/api/v2/web/events/{server}/{event_id}/leaderboards/total/borders",
+            get(leaderboard::web::total_borders),
+        )
+        .route(
+            "/api/v2/web/events/{server}/{event_id}/leaderboards/total/growth",
+            get(leaderboard::web::total_growth),
+        )
+        .route(
             "/api/v2/web/events/{server}/{event_id}/leaderboards/total/details/rank/{rank}",
             get(leaderboard::web::total_rank_detail),
         )
@@ -158,6 +170,18 @@ pub fn web_v2_routes(trust: Arc<ProxyTrust>) -> Router<AppState> {
         .route(
             "/api/v2/web/events/{server}/{event_id}/leaderboards/world-bloom/{character_id}/replay/overview",
             get(leaderboard::web::world_bloom_replay_overview),
+        )
+        .route(
+            "/api/v2/web/events/{server}/{event_id}/leaderboards/world-bloom/{character_id}/top100",
+            get(leaderboard::web::world_bloom_top100),
+        )
+        .route(
+            "/api/v2/web/events/{server}/{event_id}/leaderboards/world-bloom/{character_id}/borders",
+            get(leaderboard::web::world_bloom_borders),
+        )
+        .route(
+            "/api/v2/web/events/{server}/{event_id}/leaderboards/world-bloom/{character_id}/growth",
+            get(leaderboard::web::world_bloom_growth),
         )
         .route(
             "/api/v2/web/events/{server}/{event_id}/leaderboards/world-bloom/{character_id}/details/rank/{rank}",
@@ -326,6 +350,12 @@ mod tests {
                         let web_paths = [
                             format!("/api/v2/web/events/jp/{NORMAL_EVENT}/leaderboards/total/overview?at=1710000060&interval=60"),
                             format!("/api/v2/web/events/jp/{NORMAL_EVENT}/leaderboards/total/replay/overview?at=1710000060&interval=60"),
+                            format!("/api/v2/web/events/jp/{NORMAL_EVENT}/leaderboards/total/top100?at=1710000060"),
+                            format!("/api/v2/web/events/jp/{NORMAL_EVENT}/leaderboards/total/borders"),
+                            format!("/api/v2/web/events/jp/{NORMAL_EVENT}/leaderboards/total/growth?interval=60&v=3"),
+                            format!("/api/v2/web/events/jp/{WORLD_BLOOM_EVENT}/leaderboards/world-bloom/17/top100"),
+                            format!("/api/v2/web/events/jp/{WORLD_BLOOM_EVENT}/leaderboards/world-bloom/17/borders?at=1710000060"),
+                            format!("/api/v2/web/events/jp/{WORLD_BLOOM_EVENT}/leaderboards/world-bloom/17/growth?interval=60"),
                             format!("/api/v2/web/events/jp/{NORMAL_EVENT}/leaderboards/total/details/rank/1?at=1710000060"),
                             format!("/api/v2/web/events/jp/{NORMAL_EVENT}/leaderboards/total/details/user/{user}"),
                             format!("/api/v2/web/events/jp/{NORMAL_EVENT}/leaderboards/total/users/search?name=Alpha"),

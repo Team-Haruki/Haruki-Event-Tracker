@@ -4,8 +4,8 @@ use axum::response::{IntoResponse, Response};
 
 use crate::api::error::ApiError;
 use crate::api::handler::leaderboard::service::{
-    OverviewQuery, WebDetailQuery, web_check_room_for_scope, web_overview_for_scope,
-    web_rank_detail_for_scope, web_user_detail_for_scope,
+    OverviewPart, OverviewQuery, WebDetailQuery, web_check_room_for_scope, web_overview_for_scope,
+    web_overview_part_for_scope, web_rank_detail_for_scope, web_user_detail_for_scope,
 };
 use crate::api::handler::web::UserSearchQuery;
 use crate::api::http_cache;
@@ -82,6 +82,48 @@ pub async fn world_bloom_replay_overview(
         prefer_gzip,
     )
     .await
+}
+
+macro_rules! overview_part_handlers {
+    ($($total:ident, $world_bloom:ident => $part:expr;)*) => {$(
+        #[tracing::instrument(skip(state, query, headers), fields(server, event_id))]
+        pub async fn $total(
+            State(state): State<AppState>,
+            Path((server, event_id)): Path<(String, i64)>,
+            Query(query): Query<OverviewQuery>,
+            headers: HeaderMap,
+        ) -> Result<EncodedJson, ApiError> {
+            let prefer_gzip = accepts_gzip(&headers);
+            web_overview_part_for_scope(state, server, event_id, None, $part, query, prefer_gzip)
+                .await
+        }
+
+        #[tracing::instrument(skip(state, query, headers), fields(server, event_id, character_id))]
+        pub async fn $world_bloom(
+            State(state): State<AppState>,
+            Path((server, event_id, character_id)): Path<(String, i64, i64)>,
+            Query(query): Query<OverviewQuery>,
+            headers: HeaderMap,
+        ) -> Result<EncodedJson, ApiError> {
+            let prefer_gzip = accepts_gzip(&headers);
+            web_overview_part_for_scope(
+                state,
+                server,
+                event_id,
+                Some(character_id),
+                $part,
+                query,
+                prefer_gzip,
+            )
+            .await
+        }
+    )*};
+}
+
+overview_part_handlers! {
+    total_top100, world_bloom_top100 => OverviewPart::Top100;
+    total_borders, world_bloom_borders => OverviewPart::Borders;
+    total_growth, world_bloom_growth => OverviewPart::Growth;
 }
 
 #[tracing::instrument(skip(state, query), fields(server, event_id, rank))]

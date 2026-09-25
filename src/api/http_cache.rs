@@ -413,6 +413,11 @@ mod tests {
         });
     }
 
+    async fn overview_meta(response: Response) -> serde_json::Value {
+        let value: serde_json::Value = serde_json::from_slice(&body(response).await).unwrap();
+        value["meta"].clone()
+    }
+
     #[test]
     fn versioned_overview_is_immutable_for_the_current_epoch_only() {
         run(|| async {
@@ -452,6 +457,25 @@ mod tests {
             }
             let stale = get_with(&router, &format!("{uri}&v={}", epoch - 1), &gzip).await;
             assert_eq!(header(&stale, "cache-control"), Some(LIVE_CACHE_CONTROL));
+
+            // Every part of one version is immutable too, and all of them
+            // are cut from the same cached overview computation.
+            let expected_meta =
+                overview_meta(get_with(&router, &format!("{uri}&v={epoch}"), &[]).await).await;
+            for part in ["top100", "borders", "growth"] {
+                let part_uri = format!(
+                    "/api/v2/web/events/jp/{NORMAL_EVENT}/leaderboards/total/{part}?interval=60&v={epoch}"
+                );
+                let response = get_with(&router, &part_uri, &gzip).await;
+                assert_eq!(response.status(), StatusCode::OK, "{part}");
+                assert_eq!(
+                    header(&response, "cache-control"),
+                    Some(VERSIONED_CACHE_CONTROL),
+                    "{part}"
+                );
+                let plain = get_with(&router, &part_uri, &[]).await;
+                assert_eq!(overview_meta(plain).await, expected_meta, "{part}");
+            }
 
             // After the next write the old version is no longer vouched for.
             let next = finish_event_update(&mut conn, SekaiServerRegion::Jp, NORMAL_EVENT)
