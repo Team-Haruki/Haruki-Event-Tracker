@@ -1,4 +1,5 @@
 pub mod batch;
+pub(crate) mod edge;
 pub mod growth;
 pub mod heartbeat;
 pub mod lines;

@@ -7,6 +7,9 @@ use sea_orm::{DbErr, ExprTrait, FromQueryResult};
 
 use crate::db::engine::DatabaseEngine;
 use crate::db::entity::{event, event_users, time_id, world_bloom};
+use crate::db::query::edge::{
+    Edge, EdgeSpec, TimeWindow, and_where_time_id_within, edge_keys_select,
+};
 use crate::db::query::user::PublicUserIdMode;
 use crate::db::table_name::{TableKind, intern};
 use crate::model::api::{
@@ -252,10 +255,10 @@ impl WorldBloomRankingPageRow {
 }
 
 #[derive(Debug, FromQueryResult)]
-struct PlayerGrowthRow {
-    user_id_key: i64,
-    timestamp: i64,
-    score: i64,
+pub(crate) struct PlayerGrowthRow {
+    pub(crate) user_id_key: i64,
+    pub(crate) timestamp: i64,
+    pub(crate) score: i64,
 }
 
 fn select_user_profile_columns(stmt: &mut SelectStatement, users_tbl: Alias) {
@@ -507,20 +510,84 @@ fn apply_rank_window_outer_filters(
     }
 }
 
+/// Widest `rank_min..=rank_max` span resolved by per-rank edge probes;
+/// wider or open-ended windows fall back to the grouped form.
+const MAX_ENUMERATED_RANK_SPAN: i64 = 1000;
+
+/// The exact rank set a rank window can match, when it is small enough to
+/// probe rank by rank (`db::query::edge`).
+fn window_rank_keys(filter: &WebRankingFilter) -> Option<Vec<i64>> {
+    let in_bounds = |rank: &i64| {
+        filter.rank_min.is_none_or(|min| *rank >= min)
+            && filter.rank_max.is_none_or(|max| *rank <= max)
+    };
+    if let Some(ranks) = &filter.rank_in {
+        let mut ranks: Vec<i64> = ranks.iter().copied().filter(in_bounds).collect();
+        ranks.sort_unstable();
+        ranks.dedup();
+        return Some(ranks);
+    }
+    let (min, max) = (filter.rank_min?, filter.rank_max?);
+    if max < min {
+        return Some(Vec::new());
+    }
+    (max.checked_sub(min)? < MAX_ENUMERATED_RANK_SPAN).then(|| (min..=max).collect())
+}
+
+/// The rank-window time filters as one inclusive window (`timestamp` means
+/// "as of", i.e. an upper bound).
+fn rank_window_time_window(filter: &WebRankingFilter) -> TimeWindow {
+    TimeWindow::new(filter.start_time, filter.end_time)
+        .with_start(filter.after)
+        .with_end(filter.before)
+        .with_end(filter.timestamp)
+}
+
+/// The non-window search's time filters as one inclusive window; a cursor
+/// only continues with rows at or before its timestamp.
+fn common_time_window(filter: &WebRankingFilter) -> TimeWindow {
+    rank_window_time_window(filter)
+        .with_start(filter.timestamp)
+        .with_end(filter.cursor.map(|cursor| cursor.timestamp))
+}
+
 fn limit_rank_window(filter: &WebRankingFilter) -> u64 {
     filter.limit + 1
 }
 
-fn latest_rank_window_select(
+pub(crate) fn latest_rank_window_select(
     event_id: i64,
     filter: &WebRankingFilter,
     mode: PublicUserIdMode,
 ) -> SelectStatement {
+    let latest = match window_rank_keys(filter) {
+        Some(ranks) => edge_keys_select(&EdgeSpec {
+            tbl: intern(TableKind::Event, event_id),
+            time_tbl: intern(TableKind::TimeId, event_id),
+            key_col: "rank",
+            keys: &ranks,
+            character_id: None,
+            edge: Edge::Latest,
+            window: rank_window_time_window(filter),
+            score_min: filter.score_min,
+            score_max: filter.score_max,
+        }),
+        None => grouped_latest_rank(event_id, filter, true),
+    };
+    latest_rank_window_join(event_id, filter, mode, latest)
+}
+
+/// `MAX(time_id) GROUP BY rank`: the fallback for rank windows too wide
+/// (or open-ended) to enumerate; cost grows with the ranks' history.
+/// `derive_time_id_bounds` adds the `time_id` range implied by the time
+/// filters (off only for the pre-`edge` reference in tests).
+pub(crate) fn grouped_latest_rank(
+    event_id: i64,
+    filter: &WebRankingFilter,
+    derive_time_id_bounds: bool,
+) -> SelectStatement {
     let event_tbl = Alias::new(intern(TableKind::Event, event_id));
     let time_tbl = Alias::new(intern(TableKind::TimeId, event_id));
-    let users_tbl = Alias::new(intern(TableKind::EventUsers, event_id));
-    let latest_tbl = Alias::new("latest_rank");
-
     let mut latest = Query::select();
     latest
         .expr_as(
@@ -547,6 +614,14 @@ fn latest_rank_window_select(
             Expr::col((time_tbl.clone(), time_id::Column::Timestamp)),
             filter,
         );
+        if derive_time_id_bounds {
+            and_where_time_id_within(
+                &mut latest,
+                Expr::col((event_tbl.clone(), event::Column::TimeId)),
+                intern(TableKind::TimeId, event_id),
+                rank_window_time_window(filter),
+            );
+        }
     }
     if let Some(rank_min) = filter.rank_min {
         latest.and_where(Expr::col((event_tbl.clone(), event::Column::Rank)).gte(rank_min));
@@ -564,7 +639,20 @@ fn latest_rank_window_select(
         Expr::col((event_tbl.clone(), event::Column::Score)),
         filter,
     );
-    latest.group_by_col((event_tbl.clone(), event::Column::Rank));
+    latest.group_by_col((event_tbl, event::Column::Rank));
+    latest.to_owned()
+}
+
+pub(crate) fn latest_rank_window_join(
+    event_id: i64,
+    filter: &WebRankingFilter,
+    mode: PublicUserIdMode,
+    latest: SelectStatement,
+) -> SelectStatement {
+    let event_tbl = Alias::new(intern(TableKind::Event, event_id));
+    let time_tbl = Alias::new(intern(TableKind::TimeId, event_id));
+    let users_tbl = Alias::new(intern(TableKind::EventUsers, event_id));
+    let latest_tbl = Alias::new("latest_rank");
 
     let mut stmt = Query::select();
     stmt.expr_as(
@@ -596,7 +684,7 @@ fn latest_rank_window_select(
         )
         .join_subquery(
             JoinType::InnerJoin,
-            latest.to_owned(),
+            latest,
             latest_tbl.clone(),
             Expr::col((event_tbl.clone(), event::Column::Rank))
                 .equals((latest_tbl.clone(), Alias::new("rank")))
@@ -630,11 +718,31 @@ fn latest_world_bloom_rank_window_select(
     filter: &WebRankingFilter,
     mode: PublicUserIdMode,
 ) -> SelectStatement {
+    let latest = match window_rank_keys(filter) {
+        Some(ranks) => edge_keys_select(&EdgeSpec {
+            tbl: intern(TableKind::WorldBloom, event_id),
+            time_tbl: intern(TableKind::TimeId, event_id),
+            key_col: "rank",
+            keys: &ranks,
+            character_id: Some(character_id),
+            edge: Edge::Latest,
+            window: rank_window_time_window(filter),
+            score_min: filter.score_min,
+            score_max: filter.score_max,
+        }),
+        None => grouped_latest_world_bloom_rank(event_id, character_id, filter, true),
+    };
+    latest_world_bloom_rank_window_join(event_id, character_id, filter, mode, latest)
+}
+
+pub(crate) fn grouped_latest_world_bloom_rank(
+    event_id: i64,
+    character_id: i64,
+    filter: &WebRankingFilter,
+    derive_time_id_bounds: bool,
+) -> SelectStatement {
     let wl_tbl = Alias::new(intern(TableKind::WorldBloom, event_id));
     let time_tbl = Alias::new(intern(TableKind::TimeId, event_id));
-    let users_tbl = Alias::new(intern(TableKind::EventUsers, event_id));
-    let latest_tbl = Alias::new("latest_rank");
-
     let mut latest = Query::select();
     latest
         .expr_as(
@@ -658,6 +766,14 @@ fn latest_world_bloom_rank_window_select(
             Expr::col((time_tbl.clone(), time_id::Column::Timestamp)),
             filter,
         );
+        if derive_time_id_bounds {
+            and_where_time_id_within(
+                &mut latest,
+                Expr::col((wl_tbl.clone(), world_bloom::Column::TimeId)),
+                intern(TableKind::TimeId, event_id),
+                rank_window_time_window(filter),
+            );
+        }
     }
     if let Some(rank_min) = filter.rank_min {
         latest.and_where(Expr::col((wl_tbl.clone(), world_bloom::Column::Rank)).gte(rank_min));
@@ -675,7 +791,21 @@ fn latest_world_bloom_rank_window_select(
         Expr::col((wl_tbl.clone(), world_bloom::Column::Score)),
         filter,
     );
-    latest.group_by_col((wl_tbl.clone(), world_bloom::Column::Rank));
+    latest.group_by_col((wl_tbl, world_bloom::Column::Rank));
+    latest.to_owned()
+}
+
+pub(crate) fn latest_world_bloom_rank_window_join(
+    event_id: i64,
+    character_id: i64,
+    filter: &WebRankingFilter,
+    mode: PublicUserIdMode,
+    latest: SelectStatement,
+) -> SelectStatement {
+    let wl_tbl = Alias::new(intern(TableKind::WorldBloom, event_id));
+    let time_tbl = Alias::new(intern(TableKind::TimeId, event_id));
+    let users_tbl = Alias::new(intern(TableKind::EventUsers, event_id));
+    let latest_tbl = Alias::new("latest_rank");
 
     let mut stmt = Query::select();
     stmt.expr_as(
@@ -711,7 +841,7 @@ fn latest_world_bloom_rank_window_select(
         )
         .join_subquery(
             JoinType::InnerJoin,
-            latest.to_owned(),
+            latest,
             latest_tbl.clone(),
             Expr::col((wl_tbl.clone(), world_bloom::Column::Rank))
                 .equals((latest_tbl.clone(), Alias::new("rank")))
@@ -777,6 +907,12 @@ pub async fn search_ranking_rows(
             Expr::col((time_tbl.clone(), time_id::Column::Timestamp)),
             Expr::col((users_tbl, event_users::Column::UserIdKey)),
             filter,
+        );
+        and_where_time_id_within(
+            &mut stmt,
+            Expr::col((event_tbl.clone(), event::Column::TimeId)),
+            intern(TableKind::TimeId, event_id),
+            common_time_window(filter),
         );
         // `time_id` order == `timestamp` order is an invariant (see
         // `ranking.rs`), so ordering by the ranking table's own column lets
@@ -845,6 +981,12 @@ pub async fn search_world_bloom_ranking_rows(
             Expr::col((users_tbl, event_users::Column::UserIdKey)),
             filter,
         );
+        and_where_time_id_within(
+            &mut stmt,
+            Expr::col((wl_tbl.clone(), world_bloom::Column::TimeId)),
+            intern(TableKind::TimeId, event_id),
+            common_time_window(filter),
+        );
         stmt.order_by((wl_tbl.clone(), world_bloom::Column::TimeId), Order::Desc)
             .order_by((wl_tbl.clone(), world_bloom::Column::Rank), Order::Asc)
             .order_by((wl_tbl, world_bloom::Column::UserIdKey), Order::Asc)
@@ -864,6 +1006,115 @@ pub async fn search_world_bloom_ranking_rows(
     Ok((rows, next_cursor))
 }
 
+/// Each top player's earliest row in `[start_time, end_time]`: one
+/// `(user_id_key, time_id)` edge probe per player (`db::query::edge`) joined
+/// back for the score and timestamp. Only the earliest row is used by the
+/// growth, so the window's other rows are never read.
+pub(crate) fn earliest_player_rows_select(
+    tbl: &'static str,
+    time_tbl: &'static str,
+    character_id: Option<i64>,
+    user_keys: &[i64],
+    start_time: i64,
+    end_time: Option<i64>,
+) -> SelectStatement {
+    let mut keys = user_keys.to_vec();
+    keys.sort_unstable();
+    keys.dedup();
+    let edge = edge_keys_select(&EdgeSpec {
+        tbl,
+        time_tbl,
+        key_col: "user_id_key",
+        keys: &keys,
+        character_id,
+        edge: Edge::Earliest,
+        window: TimeWindow::new(Some(start_time), end_time),
+        score_min: None,
+        score_max: None,
+    });
+    let rows = Alias::new(tbl);
+    let times = Alias::new(time_tbl);
+    let edge_tbl = Alias::new("edge");
+    let key_col = Alias::new("user_id_key");
+    let tid_col = Alias::new("time_id");
+    let mut stmt = Query::select();
+    stmt.expr_as(Expr::col((rows.clone(), key_col.clone())), key_col.clone())
+        .expr_as(
+            Expr::col((times.clone(), time_id::Column::Timestamp)),
+            Alias::new("timestamp"),
+        )
+        .expr_as(
+            Expr::col((rows.clone(), Alias::new("score"))),
+            Alias::new("score"),
+        )
+        .from(rows.clone())
+        .join_subquery(
+            JoinType::InnerJoin,
+            edge,
+            edge_tbl.clone(),
+            Expr::col((rows.clone(), key_col.clone()))
+                .equals((edge_tbl.clone(), key_col.clone()))
+                .and(
+                    Expr::col((rows.clone(), tid_col.clone())).equals((edge_tbl, tid_col.clone())),
+                ),
+        )
+        .inner_join(
+            times.clone(),
+            Expr::col((rows.clone(), tid_col)).equals((times.clone(), time_id::Column::TimeId)),
+        );
+    if let Some(character_id) = character_id {
+        stmt.and_where(Expr::col((rows.clone(), Alias::new("character_id"))).eq(character_id));
+    }
+    stmt.order_by((rows, key_col), Order::Asc)
+        .order_by((times, time_id::Column::Timestamp), Order::Asc)
+        .to_owned()
+}
+
+/// The pre-`edge` player-growth query (every row of every top player in
+/// the window), kept as the reference for the equivalence tests.
+#[cfg(test)]
+pub(crate) fn legacy_player_rows_select(
+    tbl: &'static str,
+    time_tbl: &'static str,
+    character_id: Option<i64>,
+    user_keys: &[i64],
+    start_time: i64,
+    end_time: Option<i64>,
+) -> SelectStatement {
+    let rows = Alias::new(tbl);
+    let times = Alias::new(time_tbl);
+    let mut stmt = Query::select();
+    stmt.expr_as(
+        Expr::col((rows.clone(), Alias::new("user_id_key"))),
+        Alias::new("user_id_key"),
+    )
+    .expr_as(
+        Expr::col((times.clone(), time_id::Column::Timestamp)),
+        Alias::new("timestamp"),
+    )
+    .expr_as(
+        Expr::col((rows.clone(), Alias::new("score"))),
+        Alias::new("score"),
+    )
+    .from(rows.clone())
+    .inner_join(
+        times.clone(),
+        Expr::col((rows.clone(), Alias::new("time_id")))
+            .equals((times.clone(), time_id::Column::TimeId)),
+    );
+    if let Some(character_id) = character_id {
+        stmt.and_where(Expr::col((rows.clone(), Alias::new("character_id"))).eq(character_id));
+    }
+    stmt.and_where(Expr::col((rows.clone(), Alias::new("user_id_key"))).is_in(user_keys.to_vec()))
+        .and_where(Expr::col((times.clone(), time_id::Column::Timestamp)).gte(start_time));
+    if let Some(end_time) = end_time {
+        stmt.and_where(Expr::col((times.clone(), time_id::Column::Timestamp)).lte(end_time));
+    }
+    stmt.order_by((rows, Alias::new("user_id_key")), Order::Asc)
+        .order_by((times, time_id::Column::Timestamp), Order::Asc)
+        .to_owned()
+}
+
 #[tracing::instrument(skip(engine, top_rows), fields(event_id, top_len = top_rows.len(), start_time))]
 pub async fn fetch_top_player_growths(
     engine: &DatabaseEngine,
@@ -879,37 +1130,14 @@ pub async fn fetch_top_player_growths(
         .iter()
         .map(RankingPageRow::user_id_key)
         .collect::<Vec<_>>();
-    let event_tbl = Alias::new(intern(TableKind::Event, event_id));
-    let time_tbl = Alias::new(intern(TableKind::TimeId, event_id));
-    let stmt = Query::select()
-        .expr_as(
-            Expr::col((event_tbl.clone(), event::Column::UserIdKey)),
-            Alias::new("user_id_key"),
-        )
-        .expr_as(
-            Expr::col((time_tbl.clone(), time_id::Column::Timestamp)),
-            Alias::new("timestamp"),
-        )
-        .expr_as(
-            Expr::col((event_tbl.clone(), event::Column::Score)),
-            Alias::new("score"),
-        )
-        .from(event_tbl.clone())
-        .inner_join(
-            time_tbl.clone(),
-            Expr::col((event_tbl.clone(), event::Column::TimeId))
-                .equals((time_tbl.clone(), time_id::Column::TimeId)),
-        )
-        .and_where(Expr::col((event_tbl.clone(), event::Column::UserIdKey)).is_in(user_keys))
-        .and_where(Expr::col((time_tbl.clone(), time_id::Column::Timestamp)).gte(start_time))
-        .to_owned();
-    let mut stmt = stmt;
-    if let Some(end_time) = end_time {
-        stmt.and_where(Expr::col((time_tbl.clone(), time_id::Column::Timestamp)).lte(end_time));
-    }
-    stmt.order_by((event_tbl.clone(), event::Column::UserIdKey), Order::Asc)
-        .order_by((time_tbl, time_id::Column::Timestamp), Order::Asc);
-
+    let stmt = earliest_player_rows_select(
+        intern(TableKind::Event, event_id),
+        intern(TableKind::TimeId, event_id),
+        None,
+        &user_keys,
+        start_time,
+        end_time,
+    );
     let backend = engine.backend();
     let rows = PlayerGrowthRow::find_by_statement(backend.build(&stmt))
         .all(engine.conn())
@@ -933,38 +1161,14 @@ pub async fn fetch_world_bloom_top_player_growths(
         .iter()
         .map(WorldBloomRankingPageRow::user_id_key)
         .collect::<Vec<_>>();
-    let wl_tbl = Alias::new(intern(TableKind::WorldBloom, event_id));
-    let time_tbl = Alias::new(intern(TableKind::TimeId, event_id));
-    let stmt = Query::select()
-        .expr_as(
-            Expr::col((wl_tbl.clone(), world_bloom::Column::UserIdKey)),
-            Alias::new("user_id_key"),
-        )
-        .expr_as(
-            Expr::col((time_tbl.clone(), time_id::Column::Timestamp)),
-            Alias::new("timestamp"),
-        )
-        .expr_as(
-            Expr::col((wl_tbl.clone(), world_bloom::Column::Score)),
-            Alias::new("score"),
-        )
-        .from(wl_tbl.clone())
-        .inner_join(
-            time_tbl.clone(),
-            Expr::col((wl_tbl.clone(), world_bloom::Column::TimeId))
-                .equals((time_tbl.clone(), time_id::Column::TimeId)),
-        )
-        .and_where(Expr::col((wl_tbl.clone(), world_bloom::Column::CharacterId)).eq(character_id))
-        .and_where(Expr::col((wl_tbl.clone(), world_bloom::Column::UserIdKey)).is_in(user_keys))
-        .and_where(Expr::col((time_tbl.clone(), time_id::Column::Timestamp)).gte(start_time))
-        .to_owned();
-    let mut stmt = stmt;
-    if let Some(end_time) = end_time {
-        stmt.and_where(Expr::col((time_tbl.clone(), time_id::Column::Timestamp)).lte(end_time));
-    }
-    stmt.order_by((wl_tbl.clone(), world_bloom::Column::UserIdKey), Order::Asc)
-        .order_by((time_tbl, time_id::Column::Timestamp), Order::Asc);
-
+    let stmt = earliest_player_rows_select(
+        intern(TableKind::WorldBloom, event_id),
+        intern(TableKind::TimeId, event_id),
+        Some(character_id),
+        &user_keys,
+        start_time,
+        end_time,
+    );
     let backend = engine.backend();
     let rows = PlayerGrowthRow::find_by_statement(backend.build(&stmt))
         .all(engine.conn())
@@ -995,6 +1199,15 @@ pub async fn search_user_trace(
         &mut stmt,
         Expr::col((time_tbl.clone(), time_id::Column::Timestamp)),
         filter,
+    );
+    and_where_time_id_within(
+        &mut stmt,
+        Expr::col((
+            Alias::new(intern(TableKind::Event, event_id)),
+            event::Column::TimeId,
+        )),
+        intern(TableKind::TimeId, event_id),
+        trace_time_window(filter),
     );
     stmt.order_by((time_tbl, time_id::Column::Timestamp), Order::Asc);
     if let Some(limit) = filter.limit {
@@ -1032,6 +1245,15 @@ pub async fn search_world_bloom_user_trace(
         Expr::col((time_tbl.clone(), time_id::Column::Timestamp)),
         filter,
     );
+    and_where_time_id_within(
+        &mut stmt,
+        Expr::col((
+            Alias::new(intern(TableKind::WorldBloom, event_id)),
+            world_bloom::Column::TimeId,
+        )),
+        intern(TableKind::TimeId, event_id),
+        trace_time_window(filter),
+    );
     stmt.order_by((time_tbl, time_id::Column::Timestamp), Order::Asc);
     if let Some(limit) = filter.limit {
         stmt.limit(limit);
@@ -1064,6 +1286,15 @@ pub async fn search_rank_trace(
         &mut stmt,
         Expr::col((time_tbl.clone(), time_id::Column::Timestamp)),
         filter,
+    );
+    and_where_time_id_within(
+        &mut stmt,
+        Expr::col((
+            Alias::new(intern(TableKind::Event, event_id)),
+            event::Column::TimeId,
+        )),
+        intern(TableKind::TimeId, event_id),
+        trace_time_window(filter),
     );
     stmt.order_by((time_tbl, time_id::Column::Timestamp), Order::Asc);
     if let Some(limit) = filter.limit {
@@ -1100,6 +1331,15 @@ pub async fn search_world_bloom_rank_trace(
         Expr::col((time_tbl.clone(), time_id::Column::Timestamp)),
         filter,
     );
+    and_where_time_id_within(
+        &mut stmt,
+        Expr::col((
+            Alias::new(intern(TableKind::WorldBloom, event_id)),
+            world_bloom::Column::TimeId,
+        )),
+        intern(TableKind::TimeId, event_id),
+        trace_time_window(filter),
+    );
     stmt.order_by((time_tbl, time_id::Column::Timestamp), Order::Asc);
     if let Some(limit) = filter.limit {
         stmt.limit(limit);
@@ -1114,6 +1354,12 @@ pub async fn search_world_bloom_rank_trace(
             .map(RecordedRankData::WorldBloom)
             .collect(),
     )
+}
+
+/// The trace filters as one inclusive window (the cursor is exclusive).
+fn trace_time_window(filter: &WebTraceFilter) -> TimeWindow {
+    TimeWindow::new(filter.start_time, filter.end_time)
+        .with_start(filter.cursor.and_then(|cursor| cursor.checked_add(1)))
 }
 
 fn apply_trace_filters(

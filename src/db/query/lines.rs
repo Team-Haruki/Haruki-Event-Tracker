@@ -1,9 +1,10 @@
 //! Per-rank "latest score" lookups for the `/ranking-lines` endpoint
 //! (Go: `FetchRankingLines`, `FetchWorldBloomRankingLines`).
 //!
-//! All ranks are resolved in a single round trip: a `MAX(time_id) GROUP BY
-//! rank` subquery finds each rank's latest row on the `(rank, time_id)`
-//! index, and the outer select joins back for the score and timestamp.
+//! All ranks are resolved in a single round trip: a per-rank `ORDER BY
+//! time_id DESC LIMIT 1` probe (`db::query::edge`) finds each rank's latest
+//! row on the `(rank, time_id)` index, and the outer select joins back for
+//! the score and timestamp.
 //! This relies on the invariant that `time_id` order == `timestamp` order
 //! (writer: `time_id = timestamp`; legacy rows: `db::repair`).
 //! Query errors are swallowed into an empty result — matching the Go
@@ -17,6 +18,7 @@ use sea_orm::{DbErr, ExprTrait, FromQueryResult};
 
 use crate::db::engine::DatabaseEngine;
 use crate::db::entity::time_id;
+use crate::db::query::edge::{Edge, EdgeSpec, TimeWindow, edge_keys_select};
 use crate::db::table_name::{TableKind, intern};
 use crate::model::api::RankingLineScoreSchema;
 
@@ -33,9 +35,74 @@ pub(crate) enum RankEdge {
 }
 
 /// One row per rank: the earliest/latest `(timestamp, score)` within the
-/// optional `[start_time, end_time]` window, resolved via a grouped edge
-/// subquery joined back to the ranking and time tables.
+/// optional `[start_time, end_time]` window, resolved via a per-rank edge
+/// probe (`db::query::edge`) joined back to the ranking and time tables.
 pub(crate) fn rank_edge_select(
+    spec: &RankEdgeSpec,
+    ranks: &[i64],
+    edge: RankEdge,
+    start_time: Option<i64>,
+    end_time: Option<i64>,
+) -> SelectStatement {
+    let edge_sub = edge_keys_select(&EdgeSpec {
+        tbl: spec.tbl,
+        time_tbl: spec.time_tbl,
+        key_col: "rank",
+        keys: ranks,
+        character_id: spec.character_id,
+        edge: match edge {
+            RankEdge::Earliest => Edge::Earliest,
+            RankEdge::Latest => Edge::Latest,
+        },
+        window: TimeWindow::new(start_time, end_time),
+        score_min: None,
+        score_max: None,
+    });
+    join_rank_edge(spec, edge_sub)
+}
+
+fn join_rank_edge(spec: &RankEdgeSpec, edge_sub: SelectStatement) -> SelectStatement {
+    let tbl = Alias::new(spec.tbl);
+    let time_tbl = Alias::new(spec.time_tbl);
+    let edge_tbl = Alias::new("edge");
+    let rank_col = Alias::new("rank");
+    let score_col = Alias::new("score");
+    let tid_col = Alias::new("time_id");
+    let character_col = Alias::new("character_id");
+
+    let mut stmt = Query::select();
+    stmt.expr_as(
+        Expr::col((time_tbl.clone(), time_id::Column::Timestamp)),
+        Alias::new("timestamp"),
+    )
+    .expr_as(Expr::col((tbl.clone(), score_col)), Alias::new("score"))
+    .expr_as(
+        Expr::col((tbl.clone(), rank_col.clone())),
+        Alias::new("rank"),
+    )
+    .from(tbl.clone())
+    .join_subquery(
+        JoinType::InnerJoin,
+        edge_sub,
+        edge_tbl.clone(),
+        Expr::col((tbl.clone(), rank_col.clone()))
+            .equals((edge_tbl.clone(), rank_col.clone()))
+            .and(Expr::col((tbl.clone(), tid_col.clone())).equals((edge_tbl, tid_col.clone()))),
+    )
+    .inner_join(
+        time_tbl.clone(),
+        Expr::col((tbl.clone(), tid_col)).equals((time_tbl, time_id::Column::TimeId)),
+    );
+    if let Some(character_id) = spec.character_id {
+        stmt.and_where(Expr::col((tbl.clone(), character_col)).eq(character_id));
+    }
+    stmt.order_by((tbl, rank_col), Order::Asc).to_owned()
+}
+
+/// The pre-`edge` grouped form (`MIN/MAX(time_id) GROUP BY rank`), kept as
+/// the reference for the equivalence tests and the benchmark.
+#[cfg(test)]
+pub(crate) fn grouped_rank_edge_select(
     spec: &RankEdgeSpec,
     ranks: &[i64],
     edge: RankEdge,
