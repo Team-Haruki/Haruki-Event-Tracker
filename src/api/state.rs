@@ -9,6 +9,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::api::cache::ApiCache;
+use crate::api::error::ApiError;
 use crate::api::limiter::ApiQueryLimiter;
 use crate::api::private_lookup::PrivateLookupVerifier;
 use crate::api::realtime::RealtimeHub;
@@ -155,7 +156,7 @@ impl AppState {
         engine: &DatabaseEngine,
         server: SekaiServerRegion,
         event_id: i64,
-    ) -> Result<(), DbErr> {
+    ) -> Result<(), ApiError> {
         let key = UserTableExtensionKey {
             server,
             event_id,
@@ -178,7 +179,11 @@ impl AppState {
         if cache.contains(&key) {
             return Ok(());
         }
-        ensure_user_table_extensions(engine, server, event_id, &self.inner.anonymizer).await?;
+        match ensure_user_table_extensions(engine, server, event_id, &self.inner.anonymizer).await {
+            Ok(()) => {}
+            Err(DbErr::RecordNotFound(_)) => return Err(ApiError::NotFound),
+            Err(err) => return Err(err.into()),
+        }
         cache.insert(key);
         Ok(())
     }
@@ -244,5 +249,18 @@ mod tests {
             .ensure_user_table_extensions(&engine, SekaiServerRegion::Jp, 123)
             .await
             .unwrap();
+
+        // Event not created yet (reader ahead of the writer): 404, not 500.
+        let reader = DatabaseEngine::from_connection(
+            Database::connect("sqlite::memory:").await.unwrap(),
+            DatabaseBackend::Sqlite,
+        )
+        .with_read_only(true);
+        assert!(matches!(
+            state
+                .ensure_user_table_extensions(&reader, SekaiServerRegion::Jp, 124)
+                .await,
+            Err(ApiError::NotFound)
+        ));
     }
 }

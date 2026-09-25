@@ -32,6 +32,8 @@ pub async fn ensure_user_unique_ids(
 /// (cluster reader, possibly a streaming replica) this only *verifies* the
 /// columns are present: the writer owns every ALTER/backfill/index, and a
 /// missing column there means the writer has not migrated the event yet.
+/// An absent table (event not started / not yet created by the writer) is
+/// reported as `DbErr::RecordNotFound` so the API can answer 404.
 pub async fn ensure_user_table_extensions(
     engine: &DatabaseEngine,
     server: SekaiServerRegion,
@@ -39,6 +41,11 @@ pub async fn ensure_user_table_extensions(
     anonymizer: &UidAnonymizer,
 ) -> Result<(), DbErr> {
     let table = intern(TableKind::EventUsers, event_id);
+    if !table_exists(engine, table).await? {
+        return Err(DbErr::RecordNotFound(format!(
+            "table {table} does not exist"
+        )));
+    }
     ensure_profile_columns(engine, table).await?;
 
     if !anonymizer.is_enabled() {
@@ -114,6 +121,31 @@ async fn ensure_column(
         return Err(err);
     }
     Ok(())
+}
+
+async fn table_exists(engine: &DatabaseEngine, table: &'static str) -> Result<bool, DbErr> {
+    let backend = engine.backend();
+    let sql = match backend {
+        DatabaseBackend::Sqlite => format!(
+            "SELECT 1 AS present FROM sqlite_master WHERE type = 'table' AND name = {} LIMIT 1",
+            quote_literal(table),
+        ),
+        DatabaseBackend::MySql => format!(
+            "SELECT 1 AS present FROM information_schema.TABLES \
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = {} LIMIT 1",
+            quote_literal(table),
+        ),
+        // Resolve through search_path like the unqualified queries do.
+        _ => format!(
+            "SELECT 1 AS present WHERE to_regclass({}) IS NOT NULL",
+            quote_literal(&quote_ident(backend, table)),
+        ),
+    };
+    let row = engine
+        .conn()
+        .query_one_raw(Statement::from_string(backend, sql))
+        .await?;
+    Ok(row.is_some())
 }
 
 /// SQLite treats an unknown double-quoted identifier as a string literal,
@@ -362,6 +394,13 @@ mod tests {
         assert!(err.to_string().contains("read-only"), "{err}");
         assert!(!column_exists(&legacy, users_tbl, "card_id").await.unwrap());
         assert!(column_exists(&legacy, users_tbl, "name").await.unwrap());
+
+        // An event whose tables the writer has not created yet is "not
+        // found", not a missing-column migration error.
+        let err = ensure_user_table_extensions(&legacy, SekaiServerRegion::Jp, 779, &anonymizer)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, DbErr::RecordNotFound(_)), "{err}");
     }
 
     #[tokio::test]
