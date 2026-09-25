@@ -27,6 +27,9 @@ pub enum RealtimeMessage {
     Updated {
         topic: RealtimeTopic,
         timestamp: i64,
+        /// The event's API-cache epoch after the bump that triggered this
+        /// push (`None` when this process has no API cache).
+        version: Option<i64>,
     },
     Online {
         topic: RealtimeTopic,
@@ -49,12 +52,12 @@ struct Inner {
 }
 
 /// Per-topic `updated` push throttle state. Suppressed updates coalesce
-/// into `pending` (latest timestamp wins) and one trailing task delivers
+/// into `pending` (latest timestamp and version win) and one trailing task delivers
 /// it when the window closes, so subscribers never miss the last change
 /// of a burst — they just see it at most once per interval.
 struct TopicThrottle {
     last_sent_at: Instant,
-    pending: Option<i64>,
+    pending: Option<(i64, Option<i64>)>,
     trailing_scheduled: bool,
 }
 
@@ -140,13 +143,14 @@ impl RealtimeHub {
             .unwrap_or(0)
     }
 
-    pub fn notify_update(&self, topic: RealtimeTopic, timestamp: i64) {
+    pub fn notify_update(&self, topic: RealtimeTopic, timestamp: i64, version: Option<i64>) {
         let interval = self.inner.min_push_interval;
         if interval.is_zero() {
-            let _ = self
-                .inner
-                .tx
-                .send(RealtimeMessage::Updated { topic, timestamp });
+            let _ = self.inner.tx.send(RealtimeMessage::Updated {
+                topic,
+                timestamp,
+                version,
+            });
             return;
         }
 
@@ -159,7 +163,7 @@ impl RealtimeHub {
                 .unwrap_or_else(PoisonError::into_inner);
             match throttle.get_mut(&topic) {
                 Some(state) if now.duration_since(state.last_sent_at) < interval => {
-                    state.pending = Some(timestamp);
+                    state.pending = Some((timestamp, version));
                     if state.trailing_scheduled {
                         return;
                     }
@@ -187,10 +191,11 @@ impl RealtimeHub {
 
         match trailing_deadline {
             None => {
-                let _ = self
-                    .inner
-                    .tx
-                    .send(RealtimeMessage::Updated { topic, timestamp });
+                let _ = self.inner.tx.send(RealtimeMessage::Updated {
+                    topic,
+                    timestamp,
+                    version,
+                });
             }
             Some(deadline) => {
                 let inner = self.inner.clone();
@@ -211,8 +216,12 @@ impl RealtimeHub {
                         }
                         pending
                     };
-                    if let Some(timestamp) = pending {
-                        let _ = inner.tx.send(RealtimeMessage::Updated { topic, timestamp });
+                    if let Some((timestamp, version)) = pending {
+                        let _ = inner.tx.send(RealtimeMessage::Updated {
+                            topic,
+                            timestamp,
+                            version,
+                        });
                     }
                 });
             }
@@ -233,8 +242,16 @@ mod tests {
     use super::*;
 
     fn expect_updated(msg: RealtimeMessage) -> (RealtimeTopic, i64) {
+        expect_versioned(msg).0
+    }
+
+    fn expect_versioned(msg: RealtimeMessage) -> ((RealtimeTopic, i64), Option<i64>) {
         match msg {
-            RealtimeMessage::Updated { topic, timestamp } => (topic, timestamp),
+            RealtimeMessage::Updated {
+                topic,
+                timestamp,
+                version,
+            } => ((topic, timestamp), version),
             RealtimeMessage::Online { .. } => panic!("expected update message"),
         }
     }
@@ -246,19 +263,26 @@ mod tests {
         let mut receiver = hub.subscribe();
 
         // First push of a window goes out immediately.
-        hub.notify_update(topic.clone(), 1);
-        assert_eq!(expect_updated(receiver.recv().await.unwrap()).1, 1);
+        hub.notify_update(topic.clone(), 1, Some(11));
+        assert_eq!(
+            expect_versioned(receiver.recv().await.unwrap()),
+            ((topic.clone(), 1), Some(11))
+        );
 
-        // Updates inside the window coalesce; the latest timestamp wins.
-        hub.notify_update(topic.clone(), 2);
-        hub.notify_update(topic.clone(), 3);
+        // Updates inside the window coalesce; the latest timestamp and
+        // version win.
+        hub.notify_update(topic.clone(), 2, Some(12));
+        hub.notify_update(topic.clone(), 3, Some(13));
         assert!(receiver.try_recv().is_err());
         tokio::time::advance(Duration::from_secs(6)).await;
-        assert_eq!(expect_updated(receiver.recv().await.unwrap()).1, 3);
+        assert_eq!(
+            expect_versioned(receiver.recv().await.unwrap()),
+            ((topic.clone(), 3), Some(13))
+        );
 
         // A quiet window resets to immediate delivery.
         tokio::time::advance(Duration::from_secs(6)).await;
-        hub.notify_update(topic.clone(), 4);
+        hub.notify_update(topic.clone(), 4, None);
         assert_eq!(expect_updated(receiver.recv().await.unwrap()).1, 4);
         // No stray trailing push follows.
         tokio::time::advance(Duration::from_secs(6)).await;
@@ -288,14 +312,16 @@ mod tests {
             RealtimeMessage::Updated { .. } => panic!("expected online message"),
         }
 
-        hub.notify_update(topic.clone(), 1234);
+        hub.notify_update(topic.clone(), 1234, Some(7));
         match receiver.recv().await.unwrap() {
             RealtimeMessage::Updated {
                 topic: received,
                 timestamp,
+                version,
             } => {
                 assert_eq!(received, topic);
                 assert_eq!(timestamp, 1234);
+                assert_eq!(version, Some(7));
             }
             RealtimeMessage::Online { .. } => panic!("expected update message"),
         }

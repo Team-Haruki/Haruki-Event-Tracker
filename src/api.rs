@@ -5,6 +5,7 @@ pub mod cluster;
 pub mod error;
 pub mod extract;
 pub mod handler;
+pub mod http_cache;
 pub mod json;
 pub mod limiter;
 pub mod private_lookup;

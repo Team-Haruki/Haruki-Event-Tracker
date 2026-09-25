@@ -15,7 +15,7 @@ use crate::api::cache::finish_event_update;
 use crate::api::realtime::{RealtimeHub, RealtimeTopic};
 use crate::cluster::{ClusterLink, StreamMessage};
 use crate::db::engine::DatabaseEngine;
-use crate::db::replication::wait_for_replay;
+use crate::db::replication::{replay_reached, wait_for_replay};
 use crate::model::enums::SekaiServerRegion;
 
 /// Silence on the socket longer than this (the writer pings every
@@ -176,19 +176,38 @@ impl Applier {
                 }
                 self.expected_seq = Some(seq + 1);
                 self.seen.insert((server, event_id));
-                if let Some(lsn) = lsn.as_deref()
-                    && !replica_wait.is_zero()
-                    && let Some(engine) = self.deps.dbs.get(&server)
-                    && !wait_for_replay(engine, lsn, replica_wait).await
-                {
+                let replayed = self.replayed(server, lsn.as_deref(), replica_wait).await;
+                if !replayed && let Some(lsn) = lsn.as_deref() {
                     tracing::warn!(%server, event_id, lsn, "replica did not reach lsn in time; invalidating anyway");
                 }
-                self.invalidate(server, event_id, timestamp).await;
+                self.invalidate(server, event_id, timestamp, replayed).await;
                 self.deps.link.record_update(seq, timestamp);
                 self.was_healthy = true;
             }
             StreamMessage::Ping => {}
         }
+    }
+
+    /// Whether this reader's database is known to hold the update: the
+    /// writer sent its WAL position and the local engine replayed it (a
+    /// primary trivially has). With `replica_wait` zero the position is
+    /// probed once without waiting. No position = unknown.
+    async fn replayed(
+        &self,
+        server: SekaiServerRegion,
+        lsn: Option<&str>,
+        replica_wait: Duration,
+    ) -> bool {
+        let (Some(lsn), Some(engine)) = (lsn, self.deps.dbs.get(&server)) else {
+            return false;
+        };
+        if replica_wait.is_zero() {
+            return replay_reached(engine, lsn).await.unwrap_or_else(|err| {
+                tracing::warn!(%err, lsn, "replay probe failed");
+                false
+            });
+        }
+        wait_for_replay(engine, lsn, replica_wait).await
     }
 
     async fn resync(&mut self) {
@@ -199,19 +218,36 @@ impl Applier {
             "resyncing caches for every known event"
         );
         for (server, event_id) in topics {
-            self.invalidate(server, event_id, now).await;
+            self.invalidate(server, event_id, now, false).await;
         }
     }
 
-    async fn invalidate(&mut self, server: SekaiServerRegion, event_id: i64, timestamp: i64) {
-        if let Some(conn) = self.deps.api_cache_redis.as_mut()
-            && let Err(err) = finish_event_update(conn, server, event_id).await
-        {
-            tracing::warn!(%err, %server, event_id, "failed to bump API cache epoch");
-        }
+    /// Bumps the event's cache epoch and pushes `updated`. The push carries
+    /// the new epoch as `version` only when `replayed`: a client fetches
+    /// `v=<version>` as immutable, so a version is announced only once this
+    /// reader's database is known to hold the data behind it. Otherwise the
+    /// epoch still moves (caches refetch) but clients get no version and
+    /// stay on short-lived responses until the next confirmed update.
+    async fn invalidate(
+        &mut self,
+        server: SekaiServerRegion,
+        event_id: i64,
+        timestamp: i64,
+        replayed: bool,
+    ) {
+        let version = match self.deps.api_cache_redis.as_mut() {
+            Some(conn) => match finish_event_update(conn, server, event_id).await {
+                Ok(epoch) => replayed.then_some(epoch),
+                Err(err) => {
+                    tracing::warn!(%err, %server, event_id, "failed to bump API cache epoch");
+                    None
+                }
+            },
+            None => None,
+        };
         self.deps
             .realtime
-            .notify_update(RealtimeTopic::new(server, event_id), timestamp);
+            .notify_update(RealtimeTopic::new(server, event_id), timestamp, version);
     }
 }
 
@@ -271,7 +307,7 @@ mod tests {
         let first = rx.try_recv().unwrap();
         assert!(matches!(
             first,
-            crate::api::realtime::RealtimeMessage::Updated { ref topic, timestamp: 10 }
+            crate::api::realtime::RealtimeMessage::Updated { ref topic, timestamp: 10, version: None }
                 if topic.event_id == 179
         ));
         assert_eq!(applier.deps.link.last_seq(), 1);
@@ -301,5 +337,54 @@ mod tests {
         assert!(rx.try_recv().is_ok());
         applier.apply(StreamMessage::Ping, Duration::ZERO).await;
         assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn updates_carry_a_version_only_once_the_data_is_replayed() {
+        let Ok(url) = std::env::var("HARUKI_COVERAGE_REDIS_URL") else {
+            return;
+        };
+        let conn = redis::aio::ConnectionManager::new(redis::Client::open(url).unwrap())
+            .await
+            .unwrap();
+        let (mut deps, realtime) = deps();
+        deps.api_cache_redis = Some(conn);
+        // SQLite has no replication: any position counts as replayed.
+        let engine = crate::db::engine::DatabaseEngine::from_connection(
+            sea_orm::Database::connect("sqlite::memory:").await.unwrap(),
+            sea_orm::DatabaseBackend::Sqlite,
+        );
+        deps.dbs
+            .insert(SekaiServerRegion::Cn, std::sync::Arc::new(engine));
+        let mut rx = realtime.subscribe();
+        let mut applier = Applier::new(deps);
+        let event_id = chrono::Utc::now().timestamp_micros();
+        let next = |seq: u64, lsn: Option<&str>| StreamMessage::Updated {
+            seq,
+            server: SekaiServerRegion::Cn,
+            event_id,
+            timestamp: 10,
+            lsn: lsn.map(str::to_owned),
+        };
+        let version = |rx: &mut tokio::sync::broadcast::Receiver<_>| {
+            let crate::api::realtime::RealtimeMessage::Updated { version, .. } =
+                rx.try_recv().unwrap()
+            else {
+                panic!("expected update");
+            };
+            version
+        };
+        // Replayed (with and without a wait budget): the post-bump epoch.
+        applier
+            .apply(next(1, Some("0/1")), Duration::from_millis(50))
+            .await;
+        assert_eq!(version(&mut rx), Some(1));
+        applier.apply(next(2, Some("0/2")), Duration::ZERO).await;
+        assert_eq!(version(&mut rx), Some(2));
+        // No WAL position: the epoch still moves, but nothing is vouched for.
+        applier.apply(next(3, None), Duration::ZERO).await;
+        assert_eq!(version(&mut rx), None);
+        applier.apply(next(4, Some("0/4")), Duration::ZERO).await;
+        assert_eq!(version(&mut rx), Some(4));
     }
 }

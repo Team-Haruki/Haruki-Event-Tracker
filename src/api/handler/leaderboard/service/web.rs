@@ -2,13 +2,20 @@ use serde::Deserialize;
 
 use crate::api::error::ApiError;
 use crate::api::extract::{ApiAudience, prepare_audience_user_id_mode, resolve_region_engine};
-use crate::api::handler::web::{build_overview, build_world_bloom_overview, cached_overview_bytes};
+use crate::api::handler::web::{
+    build_overview, build_overview_until, build_world_bloom_overview,
+    build_world_bloom_overview_until, cached_overview_bytes, overview_status,
+};
 use crate::api::json::{EncodedJson, Json};
 use crate::api::state::AppState;
+use crate::db::engine::DatabaseEngine;
+use crate::db::query::heartbeat::fetch_time_id_timestamp;
+use crate::db::query::web::RankSnapshotCut;
 use crate::model::api::{
     LeaderboardOverviewSchema, RecordedRankData, WebRankDetailResponseSchema, WebRankingItemSchema,
     WebSubjectSchema, WebUserDetailResponseSchema,
 };
+use crate::model::enums::SekaiServerRegion;
 
 use super::snapshot::{
     SnapshotBuildRequest, build_rank_snapshots_response, ensure_current_is_user, resolve_rank_cut,
@@ -17,11 +24,275 @@ use super::snapshot::{
 use super::trace::{SubjectTraceQuery, build_subject_trace_response};
 use super::util::{interval_seconds, meta, positive_timestamp, user_id_of_rank_data};
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Copy, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OverviewQuery {
     interval: Option<i64>,
     at: Option<i64>,
+}
+
+/// A slice of the overview served as its own resource (`.../top100`,
+/// `.../borders`, `.../growth`). Parts are cut out of one cached
+/// "as-of" overview per version: the same builders as the overview, but
+/// with the growth window and `meta.fetchedAt` anchored to the newest
+/// ranking sample instead of the wall clock, and without `status`. So a
+/// part is a pure function of the data behind its cache epoch: every fetch
+/// of one `v` is byte-identical and all parts of one `v` agree.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum OverviewPart {
+    Top100,
+    Borders,
+    Growth,
+}
+
+/// `(field, value when the overview omitted it)`; `None` = omit too.
+type PartField = (&'static str, Option<&'static str>);
+
+impl OverviewPart {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Top100 => "top100",
+            Self::Borders => "borders",
+            Self::Growth => "growth",
+        }
+    }
+
+    /// The overview fields each part carries, in output order. Lists the
+    /// overview skips when empty come back as `[]`.
+    fn fields(self) -> &'static [PartField] {
+        match self {
+            Self::Top100 => &[("meta", None), ("topRankings", Some("[]"))],
+            Self::Borders => &[("meta", None), ("borderLines", Some("[]"))],
+            Self::Growth => &[
+                ("meta", None),
+                ("topPlayerGrowths", Some("[]")),
+                ("topRankGrowths", Some("[]")),
+                ("borderGrowths", Some("[]")),
+                ("intervalSeconds", None),
+                ("windowStart", None),
+                ("windowEnd", None),
+            ],
+        }
+    }
+}
+
+/// Copies the part's fields out of an overview body verbatim (no tree is
+/// built and nothing is re-encoded).
+fn project_overview_part(overview: &[u8], part: OverviewPart) -> Result<String, ApiError> {
+    let fields = part.fields();
+    let mut raw: Vec<Option<std::borrow::Cow<'_, str>>> = vec![None; fields.len()];
+    for entry in sonic_rs::to_object_iter(overview) {
+        let (key, value) = entry.map_err(|err| {
+            tracing::warn!(%err, "overview body is not a JSON object");
+            ApiError::ServiceUnavailable("overview decode failed".into())
+        })?;
+        if let Some(index) = fields.iter().position(|(name, _)| key == *name) {
+            raw[index] = Some(value.as_raw_cow());
+        }
+    }
+    let mut out = String::with_capacity(overview.len() / 2 + 64);
+    out.push('{');
+    for ((name, fallback), value) in fields.iter().zip(&raw) {
+        let Some(value) = value.as_deref().or(*fallback) else {
+            continue;
+        };
+        if out.len() > 1 {
+            out.push(',');
+        }
+        out.push('"');
+        out.push_str(name);
+        out.push_str("\":");
+        out.push_str(value);
+    }
+    out.push('}');
+    Ok(out)
+}
+
+/// Already-encoded JSON that serializes as itself.
+struct RawJsonText(String);
+
+impl serde::Serialize for RawJsonText {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let value: sonic_rs::LazyValue<'_> =
+            sonic_rs::from_str(&self.0).map_err(serde::ser::Error::custom)?;
+        value.serialize(serializer)
+    }
+}
+
+pub(crate) async fn web_overview_part_for_scope(
+    state: AppState,
+    server: String,
+    event_id: i64,
+    character_id: Option<i64>,
+    part: OverviewPart,
+    query: OverviewQuery,
+    prefer_gzip: bool,
+) -> Result<EncodedJson, ApiError> {
+    let interval = interval_seconds(query.interval);
+    let at = positive_timestamp(query.at);
+    let (region, engine) = resolve_region_engine(&state, &server)?;
+    // The per-epoch commit cut (#80) fixes both which rows are read and,
+    // through its sample's timestamp, where the growth window ends.
+    let cut = Box::pin(resolve_rank_cut(
+        &state,
+        &server,
+        &engine,
+        event_id,
+        character_id,
+        at,
+    ))
+    .await?;
+    let suffix = format!(
+        "{}:part={}",
+        overview_suffix(
+            WEB_OVERVIEW_PREFIX,
+            character_id,
+            interval,
+            at,
+            cut.as_of_time_id
+        ),
+        part.name()
+    );
+    let fetch = async {
+        // Boxed: the overview's own cache + build future nested inline makes
+        // this handler's future (and debug-build stack frames) very large.
+        let overview = Box::pin(as_of_overview_bytes(
+            &state,
+            &server,
+            (region, &engine),
+            event_id,
+            character_id,
+            interval,
+            cut,
+        ))
+        .await?;
+        project_overview_part(&overview, part).map(RawJsonText)
+    };
+    let encoded = cached_overview_bytes(
+        &state,
+        &server,
+        event_id,
+        suffix,
+        at.is_some(),
+        prefer_gzip,
+        fetch,
+    )
+    .await?;
+    // A live read without a pinned cut (no samples yet) ends its window at
+    // the wall clock: it is not a function of the version, so never claim one.
+    Ok(if at.is_none() && cut.as_of_time_id.is_none() {
+        encoded.at_epoch(None)
+    } else {
+        encoded
+    })
+}
+
+pub(crate) const WEB_OVERVIEW_PREFIX: &str = "web:v2";
+const AS_OF_OVERVIEW_PREFIX: &str = "web:v2:asof";
+
+/// The overview the parts are cut from (see `OverviewPart`), as identity
+/// JSON. Live: the window ends at the newest ranking sample; with `at`: at
+/// `at`, as for the replay overview.
+async fn as_of_overview_bytes(
+    state: &AppState,
+    server: &str,
+    (region, engine): (SekaiServerRegion, &DatabaseEngine),
+    event_id: i64,
+    character_id: Option<i64>,
+    interval: i64,
+    cut: RankSnapshotCut,
+) -> Result<bytes::Bytes, ApiError> {
+    let at = cut.at;
+    let suffix = overview_suffix(
+        AS_OF_OVERVIEW_PREFIX,
+        character_id,
+        interval,
+        at,
+        cut.as_of_time_id,
+    );
+    let fetch = async {
+        let mode = prepare_audience_user_id_mode(state, engine, region, event_id, ApiAudience::Web)
+            .await?;
+        let as_of = match cut.as_of_time_id {
+            Some(time_id) => fetch_time_id_timestamp(engine, event_id, time_id).await?,
+            None => None,
+        };
+        // An event without samples has nothing to anchor to; its lists are
+        // empty either way.
+        let end_time = at
+            .or(as_of)
+            .unwrap_or_else(|| chrono::Utc::now().timestamp());
+        let overview = match character_id {
+            Some(character_id) => {
+                build_world_bloom_overview_until(
+                    engine,
+                    event_id,
+                    character_id,
+                    mode,
+                    interval,
+                    cut,
+                    end_time,
+                )
+                .await?
+            }
+            None => build_overview_until(engine, event_id, mode, interval, cut, end_time).await?,
+        };
+        Ok(LeaderboardOverviewSchema {
+            meta: meta(server, event_id, character_id, end_time),
+            overview,
+            window_start: end_time - interval,
+            window_end: end_time,
+        })
+    };
+    cached_overview_bytes(state, server, event_id, suffix, at.is_some(), false, fetch)
+        .await?
+        .into_identity_bytes()
+        .ok_or_else(|| ApiError::ServiceUnavailable("overview encoding mismatch".into()))
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct WebStatusSchema {
+    meta: crate::model::api::LeaderboardMetaSchema,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    status: Option<crate::model::api::EventStatusResponseSchema>,
+}
+
+/// `.../status`: the tracker heartbeat, computed per request. It moves
+/// without a cache epoch bump (idle and error heartbeats) and carries
+/// `timeAgo`, so it is never versioned.
+pub(crate) async fn web_status_for_scope(
+    state: AppState,
+    server: String,
+    event_id: i64,
+    character_id: Option<i64>,
+    query: OverviewQuery,
+) -> Result<Json<WebStatusSchema>, ApiError> {
+    let at = positive_timestamp(query.at);
+    let (_, engine) = resolve_region_engine(&state, &server)?;
+    let status = overview_status(&engine, event_id, at).await?;
+    let now = at.unwrap_or_else(|| chrono::Utc::now().timestamp());
+    Ok(Json(WebStatusSchema {
+        meta: meta(&server, event_id, character_id, now),
+        status,
+    }))
+}
+
+fn overview_suffix(
+    cache_prefix: &str,
+    character_id: Option<i64>,
+    interval: i64,
+    at: Option<i64>,
+    cut: Option<i64>,
+) -> String {
+    match character_id {
+        Some(character_id) => format!(
+            "{cache_prefix}:wb:{character_id}:overview:interval={interval}:at={at:?}:cut={cut:?}"
+        ),
+        None => {
+            format!("{cache_prefix}:total:overview:interval={interval}:at={at:?}:cut={cut:?}")
+        }
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -39,6 +310,23 @@ pub struct WebDetailQuery {
     id_type: Option<String>,
     /// `check-room` only: the raw upstream UID to look up.
     user_id: Option<String>,
+}
+
+impl WebDetailQuery {
+    /// Whether `details/user/{user_id}` resolves `user_id` as a raw upstream
+    /// UID — such a response carries that UID and must stay private.
+    pub(crate) fn looks_up_raw_uid(&self, user_id: &str) -> Result<bool, ApiError> {
+        match self.id_type.as_deref().map(str::trim) {
+            // A bare numeric id can only be a game UID (unique_ids are hex
+            // digests), so it is treated as an explicit raw lookup.
+            None | Some("") => Ok(looks_like_raw_uid(user_id)),
+            Some("unique") => Ok(false),
+            Some("uid") => Ok(true),
+            Some(other) => Err(ApiError::BadRequest(format!(
+                "idType must be unique or uid, got {other}"
+            ))),
+        }
+    }
 }
 
 const MAX_RAW_UID_LEN: usize = 30;
@@ -83,15 +371,7 @@ pub(crate) async fn web_overview_for_scope(
         at,
     ))
     .await?;
-    let cut_key = cut.as_of_time_id;
-    let suffix = match character_id {
-        Some(character_id) => format!(
-            "{cache_prefix}:wb:{character_id}:overview:interval={interval}:at={at:?}:cut={cut_key:?}"
-        ),
-        None => {
-            format!("{cache_prefix}:total:overview:interval={interval}:at={at:?}:cut={cut_key:?}")
-        }
-    };
+    let suffix = overview_suffix(cache_prefix, character_id, interval, at, cut.as_of_time_id);
     let cache_server = server.clone();
     let fetch = async {
         let mode =
@@ -111,6 +391,9 @@ pub(crate) async fn web_overview_for_scope(
             window_end: end_time,
         })
     };
+    // Live overviews end their window at the wall clock and carry
+    // `status.timeAgo`, so they are never marked immutable; only the
+    // epoch-pure parts are.
     cached_overview_bytes(
         &state,
         &cache_server,
@@ -121,6 +404,7 @@ pub(crate) async fn web_overview_for_scope(
         fetch,
     )
     .await
+    .map(|overview| overview.at_epoch(None))
 }
 
 pub(crate) async fn web_rank_detail_for_scope(
@@ -216,19 +500,7 @@ pub(crate) async fn web_user_detail_for_scope(
     user_id: String,
     query: WebDetailQuery,
 ) -> Result<Json<WebUserDetailResponseSchema>, ApiError> {
-    let by_raw_uid = match query.id_type.as_deref().map(str::trim) {
-        // A bare numeric id can only be a game UID (unique_ids are hex
-        // digests), so it is treated as an explicit raw lookup.
-        None | Some("") => looks_like_raw_uid(&user_id),
-        Some("unique") => false,
-        Some("uid") => true,
-        Some(other) => {
-            return Err(ApiError::BadRequest(format!(
-                "idType must be unique or uid, got {other}"
-            )));
-        }
-    };
-    if by_raw_uid {
+    if query.looks_up_raw_uid(&user_id)? {
         web_user_detail_by_raw_uid(state, server, event_id, character_id, user_id, query).await
     } else {
         web_user_detail_by_unique_id(state, server, event_id, character_id, user_id, query).await
@@ -794,5 +1066,125 @@ mod tests {
         assert_eq!(trace_query.subject_type.as_deref(), Some("user"));
         assert_eq!(trace_query.cursor, Some(1_786_726_540));
         assert_eq!(trace_query.limit, Some(5_000));
+    }
+
+    #[test]
+    fn overview_parts_project_fields_verbatim() {
+        let overview = br#"{"meta":{"server":"jp","eventId":1},"topRankings":[{"rankData":{"score":1.50}}],"intervalSeconds":60,"windowStart":0,"windowEnd":60}"#;
+        assert_eq!(
+            project_overview_part(overview, OverviewPart::Top100).unwrap(),
+            r#"{"meta":{"server":"jp","eventId":1},"topRankings":[{"rankData":{"score":1.50}}]}"#
+        );
+        // Lists the overview skipped come back empty; a missing status
+        // stays missing.
+        assert_eq!(
+            project_overview_part(overview, OverviewPart::Borders).unwrap(),
+            r#"{"meta":{"server":"jp","eventId":1},"borderLines":[]}"#
+        );
+        assert_eq!(
+            project_overview_part(overview, OverviewPart::Growth).unwrap(),
+            r#"{"meta":{"server":"jp","eventId":1},"topPlayerGrowths":[],"topRankGrowths":[],"borderGrowths":[],"intervalSeconds":60,"windowStart":0,"windowEnd":60}"#
+        );
+        assert!(project_overview_part(b"[1]", OverviewPart::Top100).is_err());
+        assert!(project_overview_part(b"{\"meta\":", OverviewPart::Top100).is_err());
+        assert_eq!(
+            sonic_rs::to_string(&RawJsonText(r#"{"a":[1,2.50]}"#.into())).unwrap(),
+            r#"{"a":[1,2.50]}"#
+        );
+    }
+
+    #[test]
+    fn overview_parts_carry_exactly_the_overview_fields() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(async {
+                        let state = test_state().await;
+                        let query = OverviewQuery {
+                            interval: Some(60),
+                            at: Some(1_710_000_060),
+                        };
+                        for (event_id, character_id) in
+                            [(NORMAL_EVENT, None), (WORLD_BLOOM_EVENT, Some(17))]
+                        {
+                            let overview: serde_json::Value = serde_json::from_slice(
+                                &web_overview_for_scope(
+                                    state.clone(),
+                                    "jp".into(),
+                                    event_id,
+                                    character_id,
+                                    query,
+                                    WEB_OVERVIEW_PREFIX,
+                                    false,
+                                )
+                                .await
+                                .unwrap()
+                                .into_identity_bytes()
+                                .unwrap(),
+                            )
+                            .unwrap();
+                            assert!(!overview["topRankings"].as_array().unwrap().is_empty());
+                            let mut covered = std::collections::BTreeSet::new();
+                            for part in [
+                                OverviewPart::Top100,
+                                OverviewPart::Borders,
+                                OverviewPart::Growth,
+                            ] {
+                                let body = web_overview_part_for_scope(
+                                    state.clone(),
+                                    "jp".into(),
+                                    event_id,
+                                    character_id,
+                                    part,
+                                    query,
+                                    false,
+                                )
+                                .await
+                                .unwrap()
+                                .into_identity_bytes()
+                                .unwrap();
+                                let value: serde_json::Value =
+                                    serde_json::from_slice(&body).unwrap();
+                                let object = value.as_object().unwrap();
+                                for (name, _) in part.fields() {
+                                    let expected = overview
+                                        .get(*name)
+                                        .cloned()
+                                        .unwrap_or_else(|| serde_json::json!([]));
+                                    if *name == "status" && overview.get("status").is_none() {
+                                        assert!(!object.contains_key("status"));
+                                        continue;
+                                    }
+                                    assert_eq!(
+                                        object.get(*name),
+                                        Some(&expected),
+                                        "{part:?} {name}"
+                                    );
+                                    covered.insert(*name);
+                                }
+                                assert!(
+                                    object
+                                        .keys()
+                                        .all(|key| part.fields().iter().any(|(n, _)| n == key))
+                                );
+                            }
+                            // Every overview field lives in some part, except
+                            // the wall-clock `status` (its own endpoint).
+                            for key in overview.as_object().unwrap().keys() {
+                                assert!(
+                                    key == "status" || covered.contains(key.as_str()),
+                                    "{key} is in no part"
+                                );
+                            }
+                        }
+                    });
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 }

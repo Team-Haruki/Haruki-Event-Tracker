@@ -23,7 +23,45 @@ GET .../leaderboards/world-bloom/{character_id}/overview
 GET .../leaderboards/world-bloom/{character_id}/replay/overview
 ```
 
-Query params: `interval` (trace sampling window in seconds, default 3600, clamped to 1–86400) and `at` (unix timestamp for timeline scrubbing / replay playback). Overview responses are served from the two-tier API cache, optionally as precompressed gzip.
+Query params: `interval` (trace sampling window in seconds, default 3600, clamped to 1–86400) and `at` (unix timestamp for timeline scrubbing / replay playback). Overview responses are served from the two-tier API cache, optionally as precompressed gzip. `v=<version>` (the `version` of the last realtime `updated` push) is accepted and ignored by the query itself; it only affects `Cache-Control` (below).
+
+### Overview parts
+
+```text
+GET .../leaderboards/total/top100
+GET .../leaderboards/total/borders
+GET .../leaderboards/total/growth
+GET .../leaderboards/world-bloom/{character_id}/top100
+GET .../leaderboards/world-bloom/{character_id}/borders
+GET .../leaderboards/world-bloom/{character_id}/growth
+GET .../leaderboards/total/status
+GET .../leaderboards/world-bloom/{character_id}/status
+```
+
+Parts of the overview as separate resources, each with its own `ETag` and version caching. The query params are the overview's (`interval`, `at`, `v`).
+
+- `top100`: `{meta, topRankings: WebRankingItem[]}`
+- `borders`: `{meta, borderLines: {rank, score, timestamp}[]}`
+- `growth`: `{meta, topPlayerGrowths[], topRankGrowths[], borderGrowths[], intervalSeconds, windowStart, windowEnd}`
+- `status`: `{meta, status?: {timestamp, status, statusDesc, timeAgo}}`. It is computed per request and never versioned.
+
+The lists are always present (`[]` when empty).
+
+The three data parts are a pure function of the data behind a cache version:
+- They are cut from one cached "as-of" overview per version.
+- Live, their `meta.fetchedAt` and growth window end at the **newest ranking sample**, not the wall clock. With `at`, they end at `at`.
+- They carry no `status`, whose heartbeat moves without an epoch bump.
+
+So every fetch of one `v` is byte-identical, and all parts of one `v` share `meta.fetchedAt`. Pass the same `interval` to every part: `top100` and `borders` don't depend on it, but sharing it lets them reuse the as-of overview that `growth` needs. Staleness ("updated N s ago") comes from `status.timestamp` (or `timeAgo`) on the `status` endpoint.
+
+The full `overview` stays available with an unchanged body: wall-clock window, `status` with `timeAgo`. It is deprecated for new clients, never marked immutable, and removal will be announced once the Toolbox no longer uses it.
+
+### HTTP caching (all `/api/v2/web/...` GETs)
+
+- `200` responses carry a strong `ETag` (digest of the bytes actually sent, so gzip / br / identity each have their own) and `Vary: accept-encoding`; `If-None-Match` with a matching tag (weak comparison, `*` allowed) answers `304` with the same `ETag` / `Cache-Control` / `Vary`.
+- `Cache-Control: public, max-age=86400, immutable` when the request has `v=<version>` and the body is the API cache's entry for exactly that version. Only the live `top100` / `borders` / `growth` parts fetched with gzip accepted qualify; the precompressed variant carries its epoch. Identity (non-precompressed) responses, `at` requests, the overview and `status` never do.
+- `Cache-Control: public, max-age=1, stale-while-revalidate=5` otherwise — no `v`, a `v` that is not the served version, or an endpoint that doesn't report one.
+- `Cache-Control: private, no-store` and no `ETag` for the `/private/` routes and raw-UID lookups (`check-room`, `details/user/{uid}` resolved as a game UID); `no-store` for non-`200` answers.
 
 Top-100 rows (and every rank snapshot: rank details' `current`/`previous`/`next`, the cloud `sk` endpoints) are read at one cut — the newest committed ranking row, pinned per API-cache epoch so separate requests answered in the same epoch agree. A rank whose latest row names a player who has a newer row at another rank is stale (the tracker stores only changed ranks) and is omitted rather than listing that player twice; clients render it as unknown until the tracker rewrites it. A user detail (or cloud `sk` query by `userId`) for a player who has dropped out of the tracked ranks is a 404 rather than the player now holding their last rank.
 
@@ -65,7 +103,7 @@ GET /ws-ticket
 GET /ws?ticket=...
 ```
 
-`/ws-ticket` issues a single-use 45-second ticket to subjects resolved from trusted-proxy headers. The socket accepts `subscribe` / `unsubscribe` / `ping` frames plus proxied requests for any `/api/v2/web/...` path, and pushes `ready` / `updated` / `online` events for subscribed `(server, event_id)` topics. Tracker writes trigger the `updated` broadcasts.
+`/ws-ticket` issues a single-use 45-second ticket to subjects resolved from trusted-proxy headers. The socket accepts `subscribe` / `unsubscribe` / `ping` frames plus proxied requests for any `/api/v2/web/...` path, and pushes `ready` / `updated` / `online` events for subscribed `(server, event_id)` topics. Tracker writes trigger the `updated` broadcasts: `{"type":"updated","server":"cn","eventId":180,"timestamp":1760000000,"version":4242}`. `version` is the event's API-cache epoch after the write. It is omitted when the process has no API cache, and on a cluster reader until its database has confirmably replayed the write (WAL position reached): an unconfirmed update still refreshes caches, but announces no version; fetch `...?v=<version>` over HTTP to get a cacheable response for exactly that data. Proxied request frames keep their `{"id","ok","status","data"}` reply unchanged.
 
 ### User Profile Search
 

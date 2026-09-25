@@ -11,11 +11,14 @@ use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
 use serde::Serialize;
 
+use crate::api::http_cache::ServedEpoch;
+
 pub struct Json<T>(pub T);
 pub struct RawJson(pub Bytes);
 pub struct EncodedJson {
     bytes: Bytes,
     encoding: JsonEncoding,
+    epoch: Option<i64>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -29,6 +32,7 @@ impl EncodedJson {
         Self {
             bytes,
             encoding: JsonEncoding::Identity,
+            epoch: None,
         }
     }
 
@@ -36,7 +40,21 @@ impl EncodedJson {
         Self {
             bytes,
             encoding: JsonEncoding::Gzip,
+            epoch: None,
         }
+    }
+
+    /// The plain JSON bytes, or `None` for a gzip body.
+    pub fn into_identity_bytes(self) -> Option<Bytes> {
+        (self.encoding == JsonEncoding::Identity).then_some(self.bytes)
+    }
+
+    /// Tags the response with the API-cache epoch its bytes belong to
+    /// (`ServedEpoch` extension), which lets `http_cache` mark a matching
+    /// `v=<epoch>` request immutable.
+    pub fn at_epoch(mut self, epoch: Option<i64>) -> Self {
+        self.epoch = epoch;
+        self
     }
 }
 
@@ -95,13 +113,24 @@ impl IntoResponse for RawJson {
 
 impl IntoResponse for EncodedJson {
     fn into_response(self) -> Response {
+        let mut response = self.encoding_response();
+        if let Some(epoch) = self.epoch {
+            response.extensions_mut().insert(ServedEpoch(epoch));
+        }
+        response
+    }
+}
+
+impl EncodedJson {
+    fn encoding_response(&self) -> Response {
+        let bytes = self.bytes.clone();
         match self.encoding {
             JsonEncoding::Identity => (
                 [
                     (CONTENT_TYPE, HeaderValue::from_static("application/json")),
                     (VARY, HeaderValue::from_static("accept-encoding")),
                 ],
-                self.bytes,
+                bytes,
             )
                 .into_response(),
             JsonEncoding::Gzip => (
@@ -110,7 +139,7 @@ impl IntoResponse for EncodedJson {
                     (CONTENT_ENCODING, HeaderValue::from_static("gzip")),
                     (VARY, HeaderValue::from_static("accept-encoding")),
                 ],
-                self.bytes,
+                bytes,
             )
                 .into_response(),
         }

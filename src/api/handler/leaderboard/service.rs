@@ -9,6 +9,7 @@ pub(crate) use cloud::{
     cloud_speed_for_scope, cloud_trace_for_scope,
 };
 pub(crate) use web::{
-    OverviewQuery, WebDetailQuery, web_check_room_for_scope, web_overview_for_scope,
-    web_rank_detail_for_scope, web_user_detail_for_scope,
+    OverviewPart, OverviewQuery, WebDetailQuery, web_check_room_for_scope, web_overview_for_scope,
+    web_overview_part_for_scope, web_rank_detail_for_scope, web_status_for_scope,
+    web_user_detail_for_scope,
 };

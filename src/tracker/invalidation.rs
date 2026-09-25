@@ -47,21 +47,24 @@ impl CacheInvalidation {
     }
 
     /// Called after the data is committed. `db` is consulted for the WAL
-    /// position on the cluster path only.
+    /// position on the cluster path only. Returns the bumped local cache
+    /// epoch — `None` when this process has no API cache to bump.
     pub async fn finish(
         &mut self,
         server: SekaiServerRegion,
         event_id: i64,
         db: &DatabaseEngine,
         message: &str,
-    ) {
+    ) -> Option<i64> {
         match self {
-            Self::Disabled => {}
-            Self::LocalRedis(conn) => {
-                if let Err(err) = finish_event_update(conn, server, event_id).await {
+            Self::Disabled => None,
+            Self::LocalRedis(conn) => match finish_event_update(conn, server, event_id).await {
+                Ok(epoch) => Some(epoch),
+                Err(err) => {
                     tracing::warn!(%err, "{message}");
+                    None
                 }
-            }
+            },
             Self::Cluster(bus) => {
                 let lsn = match current_wal_lsn(db).await {
                     Ok(lsn) => lsn,
@@ -72,6 +75,7 @@ impl CacheInvalidation {
                 };
                 let seq = bus.publish(server, event_id, chrono::Utc::now().timestamp(), lsn);
                 tracing::debug!(%server, event_id, seq, "published cluster update");
+                None
             }
         }
     }
@@ -101,10 +105,44 @@ mod tests {
         );
         assert!(event.lsn.is_none());
 
+        assert_eq!(
+            CacheInvalidation::from_parts(None, Some(UpdateBus::new()))
+                .finish(SekaiServerRegion::Jp, 1, &engine, "x")
+                .await,
+            None
+        );
         let mut disabled = CacheInvalidation::from_parts(None, None);
-        disabled
-            .finish(SekaiServerRegion::Jp, 1, &engine, "x")
-            .await;
+        assert_eq!(
+            disabled
+                .finish(SekaiServerRegion::Jp, 1, &engine, "x")
+                .await,
+            None
+        );
         assert!(matches!(disabled, CacheInvalidation::Disabled));
+    }
+
+    #[tokio::test]
+    async fn local_redis_finish_returns_the_bumped_epoch() {
+        let Ok(url) = std::env::var("HARUKI_COVERAGE_REDIS_URL") else {
+            return;
+        };
+        let conn = redis::aio::ConnectionManager::new(redis::Client::open(url).unwrap())
+            .await
+            .unwrap();
+        let engine = DatabaseEngine::from_connection(
+            Database::connect("sqlite::memory:").await.unwrap(),
+            DatabaseBackend::Sqlite,
+        );
+        let event_id = chrono::Utc::now().timestamp_micros();
+        let mut inv = CacheInvalidation::from_parts(Some(conn), None);
+        inv.begin(SekaiServerRegion::Jp, event_id).await;
+        let first = inv
+            .finish(SekaiServerRegion::Jp, event_id, &engine, "x")
+            .await;
+        assert_eq!(first, Some(1));
+        let second = inv
+            .finish(SekaiServerRegion::Jp, event_id, &engine, "x")
+            .await;
+        assert_eq!(second, Some(2));
     }
 }
