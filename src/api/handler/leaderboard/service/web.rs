@@ -8,11 +8,14 @@ use crate::api::handler::web::{
 };
 use crate::api::json::{EncodedJson, Json};
 use crate::api::state::AppState;
+use crate::db::engine::DatabaseEngine;
 use crate::db::query::heartbeat::fetch_time_id_timestamp;
+use crate::db::query::web::RankSnapshotCut;
 use crate::model::api::{
     LeaderboardOverviewSchema, RecordedRankData, WebRankDetailResponseSchema, WebRankingItemSchema,
     WebSubjectSchema, WebUserDetailResponseSchema,
 };
+use crate::model::enums::SekaiServerRegion;
 
 use super::snapshot::{
     SnapshotBuildRequest, build_rank_snapshots_response, ensure_current_is_user, resolve_rank_cut,
@@ -127,9 +130,27 @@ pub(crate) async fn web_overview_part_for_scope(
 ) -> Result<EncodedJson, ApiError> {
     let interval = interval_seconds(query.interval);
     let at = positive_timestamp(query.at);
+    let (region, engine) = resolve_region_engine(&state, &server)?;
+    // The per-epoch commit cut (#80) fixes both which rows are read and,
+    // through its sample's timestamp, where the growth window ends.
+    let cut = Box::pin(resolve_rank_cut(
+        &state,
+        &server,
+        &engine,
+        event_id,
+        character_id,
+        at,
+    ))
+    .await?;
     let suffix = format!(
         "{}:part={}",
-        overview_suffix(WEB_OVERVIEW_PREFIX, character_id, interval, at, None),
+        overview_suffix(
+            WEB_OVERVIEW_PREFIX,
+            character_id,
+            interval,
+            at,
+            cut.as_of_time_id
+        ),
         part.name()
     );
     let fetch = async {
@@ -138,15 +159,16 @@ pub(crate) async fn web_overview_part_for_scope(
         let overview = Box::pin(as_of_overview_bytes(
             &state,
             &server,
+            (region, &engine),
             event_id,
             character_id,
             interval,
-            at,
+            cut,
         ))
         .await?;
         project_overview_part(&overview, part).map(RawJsonText)
     };
-    cached_overview_bytes(
+    let encoded = cached_overview_bytes(
         &state,
         &server,
         event_id,
@@ -155,7 +177,14 @@ pub(crate) async fn web_overview_part_for_scope(
         prefer_gzip,
         fetch,
     )
-    .await
+    .await?;
+    // A live read without a pinned cut (no samples yet) ends its window at
+    // the wall clock: it is not a function of the version, so never claim one.
+    Ok(if at.is_none() && cut.as_of_time_id.is_none() {
+        encoded.at_epoch(None)
+    } else {
+        encoded
+    })
 }
 
 pub(crate) const WEB_OVERVIEW_PREFIX: &str = "web:v2";
@@ -167,23 +196,13 @@ const AS_OF_OVERVIEW_PREFIX: &str = "web:v2:asof";
 async fn as_of_overview_bytes(
     state: &AppState,
     server: &str,
+    (region, engine): (SekaiServerRegion, &DatabaseEngine),
     event_id: i64,
     character_id: Option<i64>,
     interval: i64,
-    at: Option<i64>,
+    cut: RankSnapshotCut,
 ) -> Result<bytes::Bytes, ApiError> {
-    let (region, engine) = resolve_region_engine(state, server)?;
-    // The per-epoch commit cut (#80) fixes both which rows are read and,
-    // through its sample's timestamp, where the growth window ends.
-    let cut = Box::pin(resolve_rank_cut(
-        state,
-        server,
-        &engine,
-        event_id,
-        character_id,
-        at,
-    ))
-    .await?;
+    let at = cut.at;
     let suffix = overview_suffix(
         AS_OF_OVERVIEW_PREFIX,
         character_id,
@@ -192,11 +211,10 @@ async fn as_of_overview_bytes(
         cut.as_of_time_id,
     );
     let fetch = async {
-        let mode =
-            prepare_audience_user_id_mode(state, &engine, region, event_id, ApiAudience::Web)
-                .await?;
+        let mode = prepare_audience_user_id_mode(state, engine, region, event_id, ApiAudience::Web)
+            .await?;
         let as_of = match cut.as_of_time_id {
-            Some(time_id) => fetch_time_id_timestamp(&engine, event_id, time_id).await?,
+            Some(time_id) => fetch_time_id_timestamp(engine, event_id, time_id).await?,
             None => None,
         };
         // An event without samples has nothing to anchor to; its lists are
@@ -207,7 +225,7 @@ async fn as_of_overview_bytes(
         let overview = match character_id {
             Some(character_id) => {
                 build_world_bloom_overview_until(
-                    &engine,
+                    engine,
                     event_id,
                     character_id,
                     mode,
@@ -217,7 +235,7 @@ async fn as_of_overview_bytes(
                 )
                 .await?
             }
-            None => build_overview_until(&engine, event_id, mode, interval, cut, end_time).await?,
+            None => build_overview_until(engine, event_id, mode, interval, cut, end_time).await?,
         };
         Ok(LeaderboardOverviewSchema {
             meta: meta(server, event_id, character_id, end_time),

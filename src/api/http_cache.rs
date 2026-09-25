@@ -165,7 +165,9 @@ mod tests {
     use super::*;
     use crate::api::access_log::ProxyTrust;
     use crate::api::cache::{ApiCache, finish_event_update};
-    use crate::api::handler::web::tests::{NORMAL_EVENT, test_state, test_state_with_cache};
+    use crate::api::handler::web::tests::{
+        NORMAL_EVENT, WORLD_BLOOM_EVENT, test_state, test_state_with_cache,
+    };
     use crate::api::json::EncodedJson;
     use crate::api::router::build_router;
     use crate::config::ApiCacheConfig;
@@ -437,6 +439,9 @@ mod tests {
             let epoch = finish_event_update(&mut conn, SekaiServerRegion::Jp, NORMAL_EVENT)
                 .await
                 .unwrap();
+            let wb_epoch = finish_event_update(&mut conn, SekaiServerRegion::Jp, WORLD_BLOOM_EVENT)
+                .await
+                .unwrap();
             let base = format!("/api/v2/web/events/jp/{NORMAL_EVENT}/leaderboards/total");
             let part = |name: &str, v: i64| format!("{base}/{name}?interval=60&v={v}");
             let gzip = [("accept-encoding", "gzip, br")];
@@ -496,6 +501,31 @@ mod tests {
             let status = get_with(&router, &format!("{base}/status?v={epoch}"), &gzip).await;
             assert_eq!(status.status(), StatusCode::OK);
             assert_eq!(header(&status, "cache-control"), Some(LIVE_CACHE_CONTROL));
+
+            // No samples yet (World Link chapter 99 has none): the read is
+            // not pinned to a cut, so even the current `v` stays short-lived.
+            let unpinned = get_with(
+                &router,
+                &format!(
+                    "/api/v2/web/events/jp/{WORLD_BLOOM_EVENT}/leaderboards/world-bloom/99/top100?interval=60&v={wb_epoch}"
+                ),
+                &gzip,
+            )
+            .await;
+            assert_eq!(unpinned.status(), StatusCode::OK);
+            assert_eq!(header(&unpinned, "cache-control"), Some(LIVE_CACHE_CONTROL));
+            let pinned = get_with(
+                &router,
+                &format!(
+                    "/api/v2/web/events/jp/{WORLD_BLOOM_EVENT}/leaderboards/world-bloom/17/top100?interval=60&v={wb_epoch}"
+                ),
+                &gzip,
+            )
+            .await;
+            assert_eq!(
+                header(&pinned, "cache-control"),
+                Some(VERSIONED_CACHE_CONTROL)
+            );
 
             let stale = get_with(&router, &part("top100", epoch - 1), &gzip).await;
             assert_eq!(header(&stale, "cache-control"), Some(LIVE_CACHE_CONTROL));
