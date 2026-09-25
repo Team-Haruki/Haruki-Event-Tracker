@@ -438,6 +438,10 @@ mod tests {
             "hello"
         );
         tracing::event!(target: ACCESS_TARGET, Level::WARN, uid = 200_i64, "request");
+        // Read before closing the sinks: the subscriber is global, and once
+        // the workers stop, events from concurrently running tests count as
+        // dropped.
+        let dropped = file_sink_dropped_lines();
         drop(guards);
 
         let main = std::fs::read_to_string(&main_path).unwrap();
@@ -446,7 +450,7 @@ mod tests {
         assert!(main.contains("enabled=true"));
         assert!(!main.contains("request"));
         assert!(access.contains("[User-200] request"));
-        assert_eq!(file_sink_dropped_lines(), (0, 0));
+        assert_eq!(dropped, (0, 0));
 
         let blocker = root.join("blocker");
         std::fs::write(&blocker, "file").unwrap();
