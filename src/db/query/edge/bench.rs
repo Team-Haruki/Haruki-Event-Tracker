@@ -7,7 +7,7 @@
 use std::time::{Duration, Instant};
 
 use sea_orm::sea_query::SelectStatement;
-use sea_orm::{ConnectionTrait, Database, DatabaseBackend, FromQueryResult, Statement};
+use sea_orm::{ConnectionTrait, DatabaseBackend, FromQueryResult, Statement};
 
 use crate::db::engine::DatabaseEngine;
 use crate::db::query::lines::{RankEdge, RankEdgeSpec, grouped_rank_edge_select, rank_edge_select};
@@ -186,8 +186,7 @@ async fn bench_overview_queries_on_postgres() {
         eprintln!("HET_BENCH_PG_URL not set; skipping");
         return;
     };
-    let conn = Database::connect(url).await.unwrap();
-    let engine = DatabaseEngine::from_connection(conn, DatabaseBackend::Postgres);
+    let engine = super::tests::quiet_connect(&url, DatabaseBackend::Postgres).await;
     if std::env::var("HET_BENCH_RESEED").is_ok() || !seeded(&engine).await {
         let started = Instant::now();
         seed(&engine).await;

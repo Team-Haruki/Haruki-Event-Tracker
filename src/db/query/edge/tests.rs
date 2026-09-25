@@ -8,7 +8,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use sea_orm::sea_query::{Alias, Query};
-use sea_orm::{ConnectionTrait, Database, DatabaseBackend, FromQueryResult};
+use sea_orm::{ConnectOptions, ConnectionTrait, Database, DatabaseBackend, FromQueryResult};
 
 use crate::db::engine::DatabaseEngine;
 use crate::db::query::lines::{RankEdge, RankEdgeSpec, grouped_rank_edge_select, rank_edge_select};
@@ -661,10 +661,22 @@ async fn run_equivalence(engine: &DatabaseEngine, first_event_id: i64, seeds: u6
     }
 }
 
+/// Statement logging off: thousands of statements would otherwise go
+/// through whatever global subscriber another test installed (the logger
+/// test asserts that its bounded file sink drops nothing).
+pub(super) async fn quiet_connect(url: &str, backend: DatabaseBackend) -> DatabaseEngine {
+    let mut opts = ConnectOptions::new(url.to_owned());
+    opts.sqlx_logging(false);
+    if backend == DatabaseBackend::Sqlite {
+        opts.max_connections(1);
+    }
+    let conn = Database::connect(opts).await.unwrap();
+    DatabaseEngine::from_connection(conn, backend)
+}
+
 #[tokio::test]
 async fn edge_queries_match_grouped_forms_on_sqlite() {
-    let conn = Database::connect("sqlite::memory:").await.unwrap();
-    let engine = DatabaseEngine::from_connection(conn, DatabaseBackend::Sqlite);
+    let engine = quiet_connect("sqlite::memory:", DatabaseBackend::Sqlite).await;
     run_equivalence(&engine, 9001, 6, 40).await;
 }
 
@@ -678,7 +690,6 @@ async fn edge_queries_match_grouped_forms_on_postgres() {
         eprintln!("HET_TEST_PG_URL not set; skipping");
         return;
     };
-    let conn = Database::connect(url).await.unwrap();
-    let engine = DatabaseEngine::from_connection(conn, DatabaseBackend::Postgres);
+    let engine = quiet_connect(&url, DatabaseBackend::Postgres).await;
     run_equivalence(&engine, 9001, 6, 40).await;
 }
