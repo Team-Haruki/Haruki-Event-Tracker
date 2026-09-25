@@ -25,7 +25,7 @@ use crate::db::query::heartbeat::write_heartbeat;
 use crate::db::schema::create_event_tables;
 use crate::model::enums::{SekaiEventType, SekaiServerRegion};
 use crate::model::event::WorldBloomChapterStatus;
-use crate::model::sekai::{BorderRankingResponse, PlayerRankingSchema, Top100RankingResponse};
+use crate::model::sekai::{PlayerRankingSchema, Top100RankingResponse};
 use crate::model::tracker::{
     HandledRankingData, PlayerEventRankingRecordSchema, PlayerState,
     PlayerWorldBloomRankingRecordSchema, RankState, WorldBloomKey,
@@ -42,6 +42,12 @@ use crate::tracker::invalidation::CacheInvalidation;
 use crate::tracker::state::{
     check_event_ended_flag, load_rank_state, save_rank_state, set_event_ended_flag,
 };
+
+/// A failing border endpoint (e.g. upstream 404 right after an event
+/// opens) is retried no more often than this, even when
+/// `border_fetch_interval_secs` is `0`.
+const BORDER_FAILURE_MIN_BACKOFF_SECS: u64 = 60;
+const BORDER_FAILURE_WARN_INTERVAL_SECS: u64 = 300;
 
 #[derive(Debug, Error)]
 pub enum TrackerError {
@@ -108,6 +114,11 @@ pub struct EventTrackerBase {
     /// throttle status-only heartbeats at second-level cadence.
     last_heartbeat: Option<(i64, i16)>,
     last_border_fetch_at: Option<i64>,
+    /// Last time a border-fetch failure was logged at WARN; repeats inside
+    /// `BORDER_FAILURE_WARN_INTERVAL_SECS` drop to DEBUG.
+    last_border_failure_warn_at: Option<i64>,
+    /// Set after a failed border fetch; until then ticks track top-100 only.
+    border_retry_after: Option<i64>,
     /// Local mirror of the Redis border-hash cache. This tracker is the
     /// only writer, so a match here skips the per-tick Redis GET; `None`
     /// (fresh process) falls back to Redis to resume across restarts.
@@ -174,6 +185,8 @@ impl EventTrackerBase {
             last_post_end_user_refresh_at: None,
             last_heartbeat: None,
             last_border_fetch_at: None,
+            last_border_failure_warn_at: None,
+            border_retry_after: None,
             last_border_hash: None,
             pending_records: Vec::new(),
             pending_wl_rows: Vec::new(),
@@ -361,6 +374,11 @@ impl EventTrackerBase {
     /// can finalize a single ended chapter without touching the main event
     /// table; finalize paths pass `force_flush = true` so terminal rows
     /// never wait out a window.
+    ///
+    /// Heartbeat status: only a top-100 failure writes status=1. A tick
+    /// whose border fetch failed but whose top-100 was recorded counts as
+    /// healthy (status=0) — the leaderboard is live, only border ranks are
+    /// stale, and the border failure is surfaced through a rate-limited WARN.
     #[tracing::instrument(skip(self), fields(server = %self.server, event_id = self.event_id, only_world_bloom, force_flush))]
     pub async fn record_ranking_data(
         &mut self,
@@ -698,22 +716,35 @@ impl EventTrackerBase {
 
     async fn handle_ranking_data(&mut self) -> Result<HandledRankingData, TrackerError> {
         let now = Utc::now().timestamp();
-        if !should_refresh_after_end(
-            self.last_border_fetch_at,
-            now,
-            self.tuning.border_fetch_interval_secs,
-        ) {
+        if self.border_retry_after.is_some_and(|at| now < at)
+            || !should_refresh_after_end(
+                self.last_border_fetch_at,
+                now,
+                self.tuning.border_fetch_interval_secs,
+            )
+        {
             return self.handle_top100_only().await;
         }
 
-        let (top100, (border_hash, border)): (
-            Top100RankingResponse,
-            ([u8; 32], BorderRankingResponse),
-        ) = tokio::try_join!(
+        // Border failures must not block top-100 tracking: record top-100
+        // alone and push the next border attempt out by the backoff. A
+        // top-100 failure still fails the tick (heartbeat status=1).
+        let (top100, border) = tokio::join!(
             self.api.get_top100(self.server, self.event_id),
             self.api.get_border(self.server, self.event_id)
-        )?;
-        self.last_border_fetch_at = Some(now);
+        );
+        let top100 = top100?;
+        let (border_hash, border) = match border {
+            Ok(border) => {
+                self.last_border_fetch_at = Some(now);
+                self.border_retry_after = None;
+                border
+            }
+            Err(err) => {
+                self.note_border_failure(now, &err);
+                return Ok(self.top100_only_data(top100));
+            }
+        };
 
         let record_time = Utc::now().timestamp();
         let main_top100 = top100.rankings;
@@ -770,6 +801,10 @@ impl EventTrackerBase {
     /// them; `border_cache` stays `None` so the stored hash is untouched.
     async fn handle_top100_only(&mut self) -> Result<HandledRankingData, TrackerError> {
         let top100 = self.api.get_top100(self.server, self.event_id).await?;
+        Ok(self.top100_only_data(top100))
+    }
+
+    fn top100_only_data(&self, top100: Top100RankingResponse) -> HandledRankingData {
         let record_time = Utc::now().timestamp();
         let world_bloom_rankings = if self.event_type == SekaiEventType::WorldBloom {
             extract_world_bloom_rankings(
@@ -781,12 +816,34 @@ impl EventTrackerBase {
         } else {
             HashMap::new()
         };
-        Ok(HandledRankingData {
+        HandledRankingData {
             record_time,
             rankings: top100.rankings,
             world_bloom_rankings,
             border_cache: None,
-        })
+        }
+    }
+
+    /// Hold border fetches off for `max(border_fetch_interval_secs,
+    /// BORDER_FAILURE_MIN_BACKOFF_SECS)`; WARN at most once per
+    /// `BORDER_FAILURE_WARN_INTERVAL_SECS`.
+    fn note_border_failure(&mut self, now: i64, err: &SekaiApiError) {
+        let backoff = self
+            .tuning
+            .border_fetch_interval_secs
+            .max(BORDER_FAILURE_MIN_BACKOFF_SECS);
+        let backoff = i64::try_from(backoff).unwrap_or(i64::MAX);
+        self.border_retry_after = Some(now.saturating_add(backoff));
+        if should_refresh_after_end(
+            self.last_border_failure_warn_at,
+            now,
+            BORDER_FAILURE_WARN_INTERVAL_SECS,
+        ) {
+            self.last_border_failure_warn_at = Some(now);
+            tracing::warn!(%err, backoff_secs = backoff, "border fetch failed; recording top100 only");
+        } else {
+            tracing::debug!(%err, "border fetch failed; recording top100 only");
+        }
     }
 }
 
@@ -831,7 +888,7 @@ fn should_write_status_heartbeat(
 pub(crate) mod tests {
     use super::*;
     use sea_orm::sea_query::{Alias, Expr, Order, Query};
-    use sea_orm::{Database, DatabaseBackend, FromQueryResult};
+    use sea_orm::{ConnectionTrait, Database, DatabaseBackend, FromQueryResult};
     use std::sync::atomic::{AtomicI64, Ordering};
 
     use crate::db::entity::time_id;
@@ -1054,6 +1111,85 @@ pub(crate) mod tests {
         );
         assert!(!tracker.pending_hot);
         assert!(tracker.pending_records.is_empty());
+    }
+
+    static BORDER_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    async fn mock_upstream_border_down() -> (String, tokio::task::JoinHandle<()>) {
+        use axum::Router;
+        use axum::body::Body;
+        use axum::http::{StatusCode, Uri};
+        use axum::response::Response;
+        use axum::routing::get;
+
+        async fn upstream(uri: Uri) -> Response {
+            if uri.path().ends_with("ranking-border") {
+                BORDER_HITS.fetch_add(1, Ordering::SeqCst);
+                return Response::builder()
+                    .status(StatusCode::BAD_GATEWAY)
+                    .body(Body::from("upstream 404"))
+                    .unwrap();
+            }
+            Response::new(Body::from(
+                r#"{"isEventAggregate":false,"userRankingStatus":"normal","rankings":[
+                    {"name":"a","rank":1,"score":5000,"userId":301},
+                    {"name":"b","rank":2,"score":4000,"userId":302}]}"#,
+            ))
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            axum::serve(listener, Router::new().route("/{*path}", get(upstream)))
+                .await
+                .unwrap();
+        });
+        (format!("http://{address}"), task)
+    }
+
+    #[tokio::test]
+    async fn border_failure_still_records_top100_and_backs_off() {
+        let Some(mut tracker) = tracker_fixture(SekaiEventType::Marathon).await else {
+            return;
+        };
+        // Keep this test's WARN out of the global logger another test installs.
+        let _quiet = tracing::dispatcher::set_default(&tracing::Dispatch::none());
+        let (base, task) = mock_upstream_border_down().await;
+        tracker.api = HarukiSekaiAPIClient::new(base, "").unwrap();
+
+        assert!(tracker.record_ranking_data(false, true).await.unwrap());
+        let retry_after = tracker.border_retry_after.expect("border backoff armed");
+        assert!(retry_after >= Utc::now().timestamp() + 50);
+        assert!(tracker.last_border_failure_warn_at.is_some());
+        assert_eq!(tracker.last_border_fetch_at, None);
+        assert_eq!(tracker.last_heartbeat.map(|(_, status)| status), Some(0));
+
+        let backend = tracker.db.backend();
+        let count = |sql: String| {
+            let db = tracker.db.clone();
+            async move {
+                db.conn()
+                    .query_one_raw(sea_orm::Statement::from_string(backend, sql))
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .try_get_by_index::<i64>(0)
+                    .unwrap()
+            }
+        };
+        let event_tbl = intern(TableKind::Event, tracker.event_id);
+        let time_tbl = intern(TableKind::TimeId, tracker.event_id);
+        assert_eq!(count(format!("SELECT COUNT(*) FROM {event_tbl}")).await, 2);
+        assert_eq!(
+            count(format!("SELECT COUNT(*) FROM {time_tbl} WHERE status <> 0")).await,
+            0
+        );
+
+        // Inside the backoff window the border endpoint is not retried.
+        tracker.handle_ranking_data().await.unwrap();
+        assert_eq!(tracker.border_retry_after, Some(retry_after));
+        assert_eq!(BORDER_HITS.load(Ordering::SeqCst), 1);
+        task.abort();
     }
 
     /// The flush path that used to invert ids: samples buffered across a
