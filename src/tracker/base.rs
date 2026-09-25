@@ -19,7 +19,7 @@ use thiserror::Error;
 use crate::db::engine::DatabaseEngine;
 use crate::db::privacy::ensure_user_table_extensions;
 use crate::db::query::batch::{batch_insert_flush, batch_upsert_event_users};
-use crate::db::query::heartbeat::write_heartbeat;
+use crate::db::query::heartbeat::{fetch_latest_heartbeat, write_heartbeat};
 use crate::db::schema::create_event_tables;
 use crate::model::enums::{SekaiEventType, SekaiServerRegion};
 use crate::model::event::WorldBloomChapterStatus;
@@ -277,6 +277,11 @@ impl EventTrackerBase {
         .await?;
         ensure_user_table_extensions(&self.db, self.server, self.event_id, &self.anonymizer)
             .await?;
+        // A restart within the same second must not reuse the last sample's
+        // timestamp (see `claim_record_time`).
+        if let Some((latest, _)) = fetch_latest_heartbeat(&self.db, self.event_id).await? {
+            self.last_record_time = Some(latest);
+        }
         tracing::info!("tracker initialized");
         Ok(())
     }

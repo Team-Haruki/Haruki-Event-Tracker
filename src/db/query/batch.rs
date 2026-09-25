@@ -691,7 +691,9 @@ pub async fn batch_insert_flush(
                         .ok_or_else(|| DbErr::Custom("missing time_id lookup".into()))
                 };
 
-                if !main_rows.is_empty() {
+                // Chunked inside the one transaction: a backlog after a DB
+                // outage must stay under PostgreSQL's 65,535 bind parameters.
+                for chunk in main_rows.chunks(INSERT_CHUNK) {
                     let mut ins = Query::insert();
                     ins.into_table(Alias::new(event_tbl)).columns([
                         event::Column::TimeId,
@@ -699,7 +701,7 @@ pub async fn batch_insert_flush(
                         event::Column::Score,
                         event::Column::Rank,
                     ]);
-                    for (ts, user_key, score, rank) in &main_rows {
+                    for (ts, user_key, score, rank) in chunk {
                         ins.values_panic([
                             time_id(ts)?.into(),
                             (*user_key).into(),
@@ -715,7 +717,7 @@ pub async fn batch_insert_flush(
                     tx.execute(&ins).await?;
                 }
 
-                if !wl_rows.is_empty() {
+                for chunk in wl_rows.chunks(INSERT_CHUNK) {
                     let mut ins = Query::insert();
                     ins.into_table(Alias::new(wl_tbl)).columns([
                         world_bloom::Column::TimeId,
@@ -724,7 +726,7 @@ pub async fn batch_insert_flush(
                         world_bloom::Column::Score,
                         world_bloom::Column::Rank,
                     ]);
-                    for (ts, user_key, character_id, score, rank) in &wl_rows {
+                    for (ts, user_key, character_id, score, rank) in chunk {
                         ins.values_panic([
                             time_id(ts)?.into(),
                             (*user_key).into(),

@@ -11,7 +11,8 @@ use crate::model::api::{
 };
 
 use super::snapshot::{
-    SnapshotBuildRequest, build_rank_snapshots_response, resolve_rank_cut, resolve_user_rank,
+    SnapshotBuildRequest, build_rank_snapshots_response, ensure_current_is_user, resolve_rank_cut,
+    resolve_user_rank,
 };
 use super::trace::{SubjectTraceQuery, build_subject_trace_response};
 use super::util::{interval_seconds, meta, positive_timestamp, user_id_of_rank_data};
@@ -356,6 +357,7 @@ async fn web_user_detail_by_unique_id(
         },
     ))
     .await?;
+    ensure_current_is_user(&snapshot, rank, &user_id)?;
     let item = snapshot
         .items
         .into_iter()

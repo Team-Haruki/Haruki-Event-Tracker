@@ -10,7 +10,7 @@ use crate::db::query::growth::{
 };
 use crate::db::query::user::PublicUserIdMode;
 use crate::db::query::web::{
-    RankSnapshotCut, latest_rank_cut, rank_snapshot_rows, user_rank_as_of,
+    RankSnapshotCut, is_missing_table_error, latest_rank_cut, rank_snapshot_rows, user_rank_as_of,
     world_bloom_rank_snapshot_rows,
 };
 use crate::model::api::{
@@ -18,7 +18,7 @@ use crate::model::api::{
 };
 
 use super::trace::hashed_subject;
-use super::util::{join_ranks, meta, rank_of_item};
+use super::util::{join_ranks, meta, rank_of_item, user_id_of_rank_data};
 
 pub(super) struct SnapshotBuildRequest {
     pub(super) ranks: Vec<i64>,
@@ -191,16 +191,14 @@ pub(crate) async fn resolve_rank_cut(
             as_of_time_id: None,
         });
     }
-    // A missing table (event not bootstrapped yet) is not this lookup's
-    // error to report: without a cut the caller's own query answers as before.
+    // Only a missing table (event not bootstrapped yet) reads as "no cut";
+    // any other failure is an error and is never cached as unpinned.
     let fetch = async {
-        Ok::<_, ApiError>(
-            latest_rank_cut(engine, event_id, character_id)
-                .await
-                .inspect_err(|err| tracing::debug!(%err, "rank cut lookup failed"))
-                .ok()
-                .flatten(),
-        )
+        match latest_rank_cut(engine, event_id, character_id).await {
+            Ok(cut) => Ok(cut),
+            Err(err) if is_missing_table_error(&err) => Ok(None),
+            Err(err) => Err(ApiError::from(err)),
+        }
     };
     let as_of_time_id = match state.cache() {
         Some(cache) => {
@@ -284,6 +282,28 @@ pub(super) async fn resolve_user_rank(
         None => fetch.await?,
     };
     Ok((rank, cut))
+}
+
+/// A user lookup's snapshot must show that user at the resolved rank. A
+/// player who fell out of the tracked ranks keeps their last row, whose rank
+/// now belongs to someone else: that is "not currently ranked", not the
+/// other player.
+pub(super) fn ensure_current_is_user(
+    snapshot: &RankSnapshotsResponseSchema,
+    rank: i64,
+    user_id: &str,
+) -> Result<(), ApiError> {
+    let shown = snapshot
+        .items
+        .iter()
+        .find(|item| item.rank == rank)
+        .and_then(|item| item.current.as_ref())
+        .and_then(|current| user_id_of_rank_data(&current.rank_data));
+    if shown.as_deref() == Some(user_id) {
+        Ok(())
+    } else {
+        Err(ApiError::NotFound)
+    }
 }
 
 async fn fetch_snapshot_metrics(

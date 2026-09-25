@@ -33,7 +33,8 @@ pub struct WebRankingFilter {
     pub after: Option<i64>,
     pub timestamp: Option<i64>,
     /// Commit cut for rank windows: rows with a larger `time_id` are
-    /// ignored, as if not yet written (see [`latest_rank_cut`]).
+    /// ignored, as if not yet written (see [`latest_rank_cut`]). `None`
+    /// means unpinned, not a version.
     pub as_of_time_id: Option<i64>,
     pub cursor: Option<WebRankingCursor>,
     pub limit: u64,
@@ -566,7 +567,10 @@ fn limit_rank_window(filter: &WebRankingFilter) -> u64 {
 /// only once the diff sees its new occupant. Showing the stale identity
 /// would list one player on two ranks, so the rank is omitted instead —
 /// callers already treat a missing rank as unknown. One
-/// `(user_id_key, time_id)` index probe per returned row.
+/// `(user_id_key, time_id)` index probe per returned row. The check ignores
+/// `score_min` / `score_max`: with a score filter, a rank whose player has
+/// since moved is dropped even when the newer row is outside the score
+/// range (before this, such searches could return the stale occupant).
 fn and_where_not_superseded(
     stmt: &mut SelectStatement,
     event_id: i64,
@@ -1127,8 +1131,20 @@ pub async fn latest_rank_cut(
 pub struct RankSnapshotCut {
     /// Replay point: rows sampled after this timestamp are ignored.
     pub at: Option<i64>,
-    /// Commit cut from [`latest_rank_cut`].
+    /// Commit cut from [`latest_rank_cut`]. `None` (no rows yet, table not
+    /// created, or a replay `at`) means the read is unpinned: callers may
+    /// key caches on it but must not present it as a data version or ETag.
     pub as_of_time_id: Option<i64>,
+}
+
+/// `true` for "table does not exist" on PostgreSQL, SQLite and MySQL — an
+/// event whose tables the tracker has not created yet.
+pub fn is_missing_table_error(err: &DbErr) -> bool {
+    let msg = err.to_string().to_ascii_lowercase();
+    msg.contains("no such table")
+        || (msg.contains("relation") && msg.contains("does not exist"))
+        || msg.contains("42p01")
+        || (msg.contains("1146") && msg.contains("doesn't exist"))
 }
 
 fn rank_snapshot_filter(ranks: &[i64], cut: RankSnapshotCut) -> WebRankingFilter {

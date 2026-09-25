@@ -25,7 +25,7 @@ GET .../leaderboards/world-bloom/{character_id}/replay/overview
 
 Query params: `interval` (trace sampling window in seconds, default 3600, clamped to 1–86400) and `at` (unix timestamp for timeline scrubbing / replay playback). Overview responses are served from the two-tier API cache, optionally as precompressed gzip.
 
-Top-100 rows (and every rank snapshot: rank details' `current`/`previous`/`next`, the cloud `sk` endpoints) are read at one cut — the newest committed ranking row, pinned per API-cache epoch so separate requests answered in the same epoch agree. A rank whose latest row names a player who has a newer row at another rank is stale (the tracker stores only changed ranks) and is omitted rather than listing that player twice; clients render it as unknown until the tracker rewrites it.
+Top-100 rows (and every rank snapshot: rank details' `current`/`previous`/`next`, the cloud `sk` endpoints) are read at one cut — the newest committed ranking row, pinned per API-cache epoch so separate requests answered in the same epoch agree. A rank whose latest row names a player who has a newer row at another rank is stale (the tracker stores only changed ranks) and is omitted rather than listing that player twice; clients render it as unknown until the tracker rewrites it. A user detail (or cloud `sk` query by `userId`) for a player who has dropped out of the tracked ranks is a 404 rather than the player now holding their last rank.
 
 ### Rank / User Details
 

@@ -11,7 +11,9 @@ use crate::model::api::{
     RankSnapshotsResponseSchema, RankingScoreGrowthSchema, RecordedRankData, WebRankingItemSchema,
 };
 
-use super::snapshot::{SnapshotBuildRequest, build_rank_snapshots_response, resolve_user_rank};
+use super::snapshot::{
+    SnapshotBuildRequest, build_rank_snapshots_response, ensure_current_is_user, resolve_user_rank,
+};
 use super::trace::{SubjectTraceQuery, build_subject_trace_response};
 use super::util::interval_seconds;
 use crate::api::handler::leaderboard::round_metrics;
@@ -71,7 +73,7 @@ pub(crate) async fn cloud_query_for_scope(
             ApiAudience::Cloud,
         )
         .await?;
-        build_rank_snapshots_response(
+        let snapshots = build_rank_snapshots_response(
             state.clone(),
             server.clone(),
             event_id,
@@ -87,7 +89,9 @@ pub(crate) async fn cloud_query_for_scope(
                 cut: Some(cut),
             },
         )
-        .await?
+        .await?;
+        ensure_current_is_user(&snapshots, rank, user_id)?;
+        snapshots
     } else {
         return Err(ApiError::BadRequest("rank or userId is required".into()));
     };
@@ -374,6 +378,7 @@ mod tests {
         seed_normal_event_with_history, seed_world_bloom_event_with_history, sqlite_engine,
     };
     use crate::db::schema::create_event_tables;
+    use crate::db::table_name::{TableKind, intern};
     use crate::model::enums::SekaiServerRegion;
     use crate::privacy::UidAnonymizer;
     use sonic_rs::JsonValueTrait;
@@ -492,6 +497,55 @@ mod tests {
         .unwrap()
         .0;
         assert_eq!(world.ranks[0].character_id, Some(17));
+    }
+
+    #[tokio::test]
+    async fn cloud_user_query_is_not_found_once_the_player_left_the_ranks() {
+        use sea_orm::ConnectionTrait;
+        let state = test_state().await;
+        let (_, engine) = crate::api::extract::resolve_region_engine(&state, "jp").unwrap();
+        // Player 300 (rank 3) is pushed out by 400; 300 gets no new row.
+        for sql in [
+            format!(
+                "INSERT INTO {} (user_id, unique_id, name) VALUES ('400', 'u-public-4', 'Delta')",
+                intern(TableKind::EventUsers, NORMAL_EVENT)
+            ),
+            format!(
+                "INSERT INTO {} (time_id, timestamp, status) VALUES (1710000120, 1710000120, 0)",
+                intern(TableKind::TimeId, NORMAL_EVENT)
+            ),
+            format!(
+                "INSERT INTO {} (time_id, user_id_key, score, rank) VALUES (1710000120, 4, 1150, 3)",
+                intern(TableKind::Event, NORMAL_EVENT)
+            ),
+        ] {
+            engine.conn().execute_unprepared(&sql).await.unwrap();
+        }
+        let mut by_user = query();
+        by_user.user_id = Some("300".into());
+        let error = cloud_query_for_scope(
+            state.clone(),
+            "jp".into(),
+            NORMAL_EVENT,
+            None,
+            by_user,
+            None,
+            false,
+        )
+        .await
+        .err()
+        .expect("a player no longer ranked must not resolve to another player");
+        assert!(matches!(error, ApiError::NotFound));
+
+        let mut by_user = query();
+        by_user.user_id = Some("400".into());
+        let response =
+            cloud_query_for_scope(state, "jp".into(), NORMAL_EVENT, None, by_user, None, false)
+                .await
+                .unwrap()
+                .0;
+        assert_eq!(response.ranks[0].rank, 3);
+        assert_eq!(response.ranks[0].user_id.as_deref(), Some("400"));
     }
 
     #[tokio::test]

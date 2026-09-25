@@ -463,3 +463,58 @@ async fn flush_writes_main_and_world_bloom_rows_atomically() {
         "main rows of a failed flush must not land on their own"
     );
 }
+
+#[tokio::test]
+async fn missing_tables_are_recognised_but_other_errors_are_not() {
+    use super::is_missing_table_error;
+    use sea_orm::DbErr;
+    let engine = quiet_connect("sqlite::memory:", DatabaseBackend::Sqlite).await;
+    let err = latest_rank_cut(&engine, 9499, None).await.unwrap_err();
+    assert!(is_missing_table_error(&err), "{err}");
+    for msg in [
+        "error returned from database: relation \"event_9499\" does not exist",
+        "error returned from database: 1146 (42S02): Table 'db.event_9499' doesn't exist",
+    ] {
+        assert!(is_missing_table_error(&DbErr::Custom(msg.into())), "{msg}");
+    }
+    for msg in [
+        "pool timed out while waiting for an open connection",
+        "error returned from database: column \"rank\" does not exist",
+    ] {
+        assert!(!is_missing_table_error(&DbErr::Custom(msg.into())), "{msg}");
+    }
+}
+
+#[tokio::test]
+async fn a_large_backlog_flushes_in_one_transaction() {
+    let engine = quiet_connect("sqlite::memory:", DatabaseBackend::Sqlite).await;
+    let event_id = 9403;
+    reset_event(&engine, event_id, true).await;
+    let anonymizer = UidAnonymizer::enabled("snapshot-test");
+    // 9,000 main rows (36,000 values) and 9,000 chapter rows (45,000) are
+    // past SQLite's 32,766 bind parameters as a single statement each.
+    let main: Vec<_> = (0..9_000)
+        .map(|i| record(&(T0 + i / 100, i % 100, 1_000 + i, i % 100 + 1)))
+        .collect();
+    let wl: Vec<_> = (0..9_000)
+        .map(|i| wl_record(&(T0 + i / 100, i % 100, 1_000 + i, i % 100 + 1)))
+        .collect();
+    let outcome = batch_insert_flush(
+        &engine,
+        SekaiServerRegion::Jp,
+        event_id,
+        &anonymizer,
+        &main,
+        &wl,
+        &mut HashMap::new(),
+        &mut HashMap::new(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(outcome.main_rows, 9_000);
+    assert_eq!(outcome.world_bloom_rows, 9_000);
+    assert_eq!(
+        latest_rank_cut(&engine, event_id, None).await.unwrap(),
+        Some(T0 + 89)
+    );
+}
