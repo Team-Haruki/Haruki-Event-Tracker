@@ -179,6 +179,10 @@ Server side of **B**, the overview split into cacheable parts, and the WS proxy 
   - reader (`cluster/subscriber.rs::invalidate`): the `INCR` result of `finish_event_update`, which now returns it;
   - standalone writer (`tracker/daemon.rs`): `CacheInvalidation::finish` returns the bumped epoch, the tracker base keeps the last one (`EventTrackerBase::cache_version`) and the daemon's push carries it.
 - Omitted when the process has no API cache (or the bump failed). A cluster writer has no WS clients, so it never sends one.
+- **A reader announces only versions whose data it holds.** The epoch is bumped on every update, but `version` is pushed only if the writer sent its WAL position and the reader's database has replayed it. With `replica_wait_ms > 0` the reader waits up to that long. With `0` it probes once. A primary, or a non-Postgres engine, counts as replayed.
+  - If replay misses the deadline, or there is no position (non-Postgres writer, LSN read failure, gap resync), the push carries no `version`.
+  - Otherwise, a fetch right after the push could read the replica's old rows, the cache would accept them under the new epoch, and they would be served `immutable` for that `v`. Worst case, that is an event's final ranking pinned wrong for a day.
+  - Clients treat a missing `version` as "refresh unversioned".
 - `realtime.push_min_interval_secs` coalescing keeps the latest `(timestamp, version)` pair for the trailing push.
 
 ### HTTP caching on `/api/v2/web/...` (`src/api/http_cache.rs`)
@@ -195,7 +199,7 @@ One middleware (`web_cache_headers`) on the public router, outside `CompressionL
 - **ETag:** strong, `"<first 128 bits of SHA-256 of the bytes sent>"`. It is computed after compression, so identity, gzip and br each get their own tag, and `Vary: accept-encoding` is always set. `Content-Length` is set on the buffered body.
 - **`If-None-Match`:** weak comparison (`W/` prefix and `*` accepted, lists allowed). A hit answers `304` with `ETag`, `Cache-Control` and `Vary`, and no body.
 - **Which version was served:** the API cache now tags `CachedJson` with the epoch its bytes belong to. The tag is set only when the bytes came from the epoch-keyed cache (L1/L2 hit) or were accepted into it (the write script checks the epoch is unchanged and not dirty), and it is cleared for dirty bypasses, rejected writes, Redis errors and oversize values. `EncodedJson` carries it as a `ServedEpoch` response extension. So "immutable" means "the bytes are the ones stored for epoch `v`", not just "`v` equals the current epoch" — a stale L1 control can't label older bytes with a newer `v`, and a `v` that differs from what was served always falls back to the short lifetime.
-- Only the live overviews and overview parts (`overview`, `top100`, `borders`, `growth` without `at`) report a version today, and only on the precompressed path, which is what browsers get (`Accept-Encoding` includes gzip). Everything else gets the short lifetime even with `v`.
+- Only the live overviews and overview parts (`top100`, `borders`, `growth` without `at`; not the wall-clock `overview`) report a version today, and only on the precompressed path, which is what browsers get (`Accept-Encoding` includes gzip). Everything else gets the short lifetime even with `v`.
 - `v` is ignored by the handlers, so it never reaches the server-side cache key. The key already contains the epoch.
 - WS request frames go through `web_v2_routes` without this layer and are unchanged.
 
@@ -205,22 +209,32 @@ The ~128 KB overview is also served as three resources, so a view fetches only w
 
 | Endpoint (under `/api/v2/web/events/{server}/{eventId}/leaderboards/`) | Body |
 | --- | --- |
-| `total/top100`, `world-bloom/{characterId}/top100` | `{meta, topRankings, status?}` |
-| `total/borders`, `world-bloom/{characterId}/borders` | `{meta, borderLines, status?}` |
+| `total/top100`, `world-bloom/{characterId}/top100` | `{meta, topRankings}` |
+| `total/borders`, `world-bloom/{characterId}/borders` | `{meta, borderLines}` |
 | `total/growth`, `world-bloom/{characterId}/growth` | `{meta, topPlayerGrowths, topRankGrowths, borderGrowths, intervalSeconds, windowStart, windowEnd}` |
+| `total/status`, `world-bloom/{characterId}/status` | `{meta, status?}`, computed per request and never versioned |
 
 - **Query params** (all parts): `interval` (seconds, default 3600, clamped to 1–86400), `at` (unix seconds, replay; no `at` = live), `v` (the `version` from `updated`). `v` only affects `Cache-Control`.
 - **Field shapes** (camelCase, same as in the overview):
   - `meta`: `{server, eventId, scope, characterId?, fetchedAt}`.
   - `topRankings[]`: `{rankData, userData?}`, the same items as the overview.
-  - `status`: `{timestamp, status, statusDesc, timeAgo}`; left out when there is no heartbeat.
+  - `status` (status endpoint only): `{timestamp, status, statusDesc, timeAgo}`; left out when there is no heartbeat.
   - `borderLines[]`: `{rank, score, timestamp}`.
   - `topPlayerGrowths[]`: `{rank, userId, scoreLatest, timestampLatest, scoreEarlier, timestampEarlier, timeDiff, growth, characterId?}`.
   - `topRankGrowths[]` and `borderGrowths[]`: `{rank, timestampLatest, scoreLatest, timestampEarlier?, scoreEarlier?, timeDiff?, growth?}`.
   - The lists are always present (`[]` when empty).
-- **One computation per version:** a part is copied verbatim (`to_object_iter` + raw splice) out of the cached overview for the same `(version, interval, at)`, then cached under its own key (`…:overview:interval=…:at=…:part=<name>`) and precompressed. So all parts fetched with one `v` come from the same overview computation: their `meta.fetchedAt` is identical, and a test asserts it. Clients should pass the same `interval` to every part so `top100` / `borders` share the overview that `growth` computes.
-- **Why parts are cut from the overview and not the other way round:** it keeps the old `overview` byte-identical, keeps one query plan per version, and leaves `build_overview` / `build_world_bloom_overview` (and the snapshot/query functions they call) as the only source of the data. The consistency fix on `fix/rank-snapshot-consistency` (one as-of cut for the top 100, per-user dedupe) lands in those builders and reaches every part without changes here.
+- **Epoch-pure bodies:** a versioned body may depend only on the data behind its epoch, never on the clock. Otherwise the same `v` recomputes to different bytes after the 1 s TTL while the first copy stays cached for a day.
+  - The parts are cut (`to_object_iter` + raw splice) from an "as-of" overview cached per version under `web:v2:asof:…`. It is built by the same builders (`build_overview_until` / `build_world_bloom_overview_until`), reading at #80's per-epoch commit cut (`resolve_rank_cut`: the newest stored `time_id`, pinned per cache epoch and part of the cache key), with the window end and `meta.fetchedAt` set to **that cut's sample timestamp**. Ranking rows only land together with an epoch bump; heartbeat rows don't count.
+  - `status` is left out of the parts because idle and error heartbeats change it without a bump, and `timeAgo` is wall-clock. It has its own per-request `status` endpoint.
+  - Tests assert that two fetches of one `v` more than a TTL apart are byte-identical, and that all parts of one `v` share `meta.fetchedAt` (= `growth.windowEnd`).
+  - Clients should pass the same `interval` to every part so `top100` / `borders` share the as-of overview that `growth` computes.
+- **The old `overview` stays wall-clock:** its window ends at `now` and its `status` carries `timeAgo`, so it is never marked immutable, whatever `v` says. Its body is unchanged.
+- **Why parts are cut from one overview and not the other way round:** it keeps the old `overview` byte-identical, keeps one query plan per version, and leaves the overview builders (and #80's `rank_snapshot_rows` cut + per-user dedupe they call) as the only source of the data.
 - **Old `overview`:** unchanged and still served (HTTP and WS request frames). It is deprecated for new clients. Remove it only after the Toolbox has switched and the access log shows no more `.../overview` hits without `at`.
+- **Caveats:**
+  - Identity responses (clients without gzip) are never immutable: only the precompressed path carries the epoch.
+  - `?at=` responses get the short lifetime. They are historical, but an `at` ahead of the last flushed sample can still change, so no long max-age is given.
+  - Epochs live in each reader's API-cache Redis. Readers behind one hostname must either share that Redis or be sticky per client. Otherwise a `version` from reader A names a different epoch on reader B, and B simply answers with the short lifetime (safe, just uncached).
 
 ### WS proxy splices the body
 
@@ -238,7 +252,7 @@ Recorded from `Team-Haruki/Haruki-Toolbox-Backend` (`external/oathkeeper/*.yml`,
 2. A TLS edge for `toolbox-api-direct` (not in the repo; presumably on the Toolbox host CN02) forwards to Oathkeeper's proxy (`:4455`).
 3. Oathkeeper matches `/event-tracker/...` and proxies to `http://haruki-toolbox-event-tracker:8777` with `strip_path: /event-tracker`:
    - `ws-ticket`, `ws`, `api/v2/web/events/.../private/...`: `cookie_session` authenticator plus the `header` mutator (subject headers).
-   - Public web rule (`noop`): `total|world-bloom/{c}` × `overview`, `replay/overview`, `details/rank/*`, `details/user/*`, `users/search`. **`check-room` has no public rule**, so it is reachable only through WS request frames. **The new `top100|borders|growth` parts have no rule yet**: until the regex gains them, Oathkeeper answers `404 Requested url does not match any rules` (WS request frames still reach them).
+   - Public web rule (`noop`): `total|world-bloom/{c}` × `overview`, `replay/overview`, `details/rank/*`, `details/user/*`, `users/search`. **`check-room` has no public rule**, so it is reachable only through WS request frames. **The new `top100|borders|growth|status` endpoints have no rule yet**: until the regex gains them, Oathkeeper answers `404 Requested url does not match any rules` (WS request frames still reach them).
    - Rules match the path, so `?v=` and `_t` pass through.
 4. **CORS** is Oathkeeper's (`serve.proxy.cors`, origin from `FRONTEND_PUBLIC_URL`, credentials allowed). `exposed_headers` is only `Content-Type`, and `allowed_headers` doesn't include `If-None-Match`. That is fine as long as the frontend lets the browser HTTP cache do the revalidation: the browser adds `If-None-Match` itself, turns a `304` into a `200` from cache, and JS never needs to read `ETag`. Only if the frontend sets `If-None-Match` by hand (which forces a preflight) or reads `ETag` must those be added to `allowed_headers` / `exposed_headers`.
 5. **304 / ETag through the proxies:** Oathkeeper is a Go `httputil.ReverseProxy` and passes `ETag`, `Cache-Control` and `304` through unchanged. If the TLS edge is Caddy, `encode` skips responses that already carry `Content-Encoding`. The tracker compresses anything over 1 KiB for gzip/br clients, so the edge shouldn't re-encode (and so shouldn't rewrite the `ETag`). Verify once on the live edge with `curl -sI -H 'Accept-Encoding: gzip' …overview` and then again with `If-None-Match`.
@@ -248,10 +262,12 @@ Recorded from `Team-Haruki/Haruki-Toolbox-Backend` (`external/oathkeeper/*.yml`,
 
 1. **Tracker:** merge #77 and then this change, and deploy the CN reader behind the Toolbox (`haruki-toolbox-event-tracker`) and the other trackers. Nothing else has to change at the same time: old clients ignore `version`, WS request frames are unchanged, and REST calls only gain headers.
 2. **Config (optional, anytime):** `realtime.push_min_interval_secs: 2`–`5` on the CN reader.
-3. **Oathkeeper (Toolbox-Backend):** add `top100|borders|growth` to both alternatives of the `haruki-public-tracker-web-v2-prefixed` rule, e.g. `total/(overview|replay/overview|top100|borders|growth|details/rank/[^/]+|details/user/[^/]+|users/search)` and the same for `world-bloom/[^/]+/(…)`, then deploy the rules (see the ops runbook: back up, replace, restart Oathkeeper, and probe).
-4. **Verify the edge:** `ETag` present, `If-None-Match` → `304`, `Content-Encoding: gzip` on the overview, and `immutable` only with the current `v` (take it from a live `updated` push).
+3. **Oathkeeper (Toolbox-Backend):** add `top100|borders|growth|status` to both alternatives of the `haruki-public-tracker-web-v2-prefixed` rule, e.g. `total/(overview|replay/overview|top100|borders|growth|status|details/rank/[^/]+|details/user/[^/]+|users/search)` and the same for `world-bloom/[^/]+/(…)`, then deploy the rules (see the ops runbook: back up, replace, restart Oathkeeper, and probe).
+4. **Verify the edge:** `ETag` present, `If-None-Match` → `304`, `Content-Encoding: gzip` on `top100`, and `immutable` only with the current `v` (take it from a live `updated` push).
 5. **Toolbox frontend:**
-   - On `updated` with a `version`, fetch the parts the view shows, `GET …/{top100|borders|growth}?interval=…&v=<version>`, over HTTP with the browser's default cache mode. Use the same `interval` for all of them; `…/overview?…&v=` still works for views that need everything. Drop `_t` and `cache: "no-store"`.
+   - On `updated` with a `version`, fetch the parts the view shows, `GET …/{top100|borders|growth}?interval=…&v=<version>`, over HTTP with the browser's default cache mode. Use the same `interval` for all of them. Drop `_t` and `cache: "no-store"`.
+   - Without a `version`, fetch the same URLs without `v` (short-lived).
+   - Tracker health: `GET …/status` (short-lived; `status.timestamp`, `timeAgo`). The parts no longer carry `status`, and their `meta.fetchedAt` is the data's as-of time, not the request time.
    - If `version` is missing (an older tracker), keep the WS request frame.
    - Pause refreshes while `document.hidden` and refresh once on `visibilitychange`.
    - Don't set `If-None-Match` or read `ETag` by hand; otherwise extend the Oathkeeper CORS headers first.

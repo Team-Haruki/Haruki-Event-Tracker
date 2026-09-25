@@ -148,6 +148,10 @@ pub fn web_v2_routes(trust: Arc<ProxyTrust>) -> Router<AppState> {
             get(leaderboard::web::total_growth),
         )
         .route(
+            "/api/v2/web/events/{server}/{event_id}/leaderboards/total/status",
+            get(leaderboard::web::total_status),
+        )
+        .route(
             "/api/v2/web/events/{server}/{event_id}/leaderboards/total/details/rank/{rank}",
             get(leaderboard::web::total_rank_detail),
         )
@@ -182,6 +186,10 @@ pub fn web_v2_routes(trust: Arc<ProxyTrust>) -> Router<AppState> {
         .route(
             "/api/v2/web/events/{server}/{event_id}/leaderboards/world-bloom/{character_id}/growth",
             get(leaderboard::web::world_bloom_growth),
+        )
+        .route(
+            "/api/v2/web/events/{server}/{event_id}/leaderboards/world-bloom/{character_id}/status",
+            get(leaderboard::web::world_bloom_status),
         )
         .route(
             "/api/v2/web/events/{server}/{event_id}/leaderboards/world-bloom/{character_id}/details/rank/{rank}",
@@ -356,6 +364,8 @@ mod tests {
                             format!("/api/v2/web/events/jp/{WORLD_BLOOM_EVENT}/leaderboards/world-bloom/17/top100"),
                             format!("/api/v2/web/events/jp/{WORLD_BLOOM_EVENT}/leaderboards/world-bloom/17/borders?at=1710000060"),
                             format!("/api/v2/web/events/jp/{WORLD_BLOOM_EVENT}/leaderboards/world-bloom/17/growth?interval=60"),
+                            format!("/api/v2/web/events/jp/{NORMAL_EVENT}/leaderboards/total/status"),
+                            format!("/api/v2/web/events/jp/{WORLD_BLOOM_EVENT}/leaderboards/world-bloom/17/status?at=1710000060"),
                             format!("/api/v2/web/events/jp/{NORMAL_EVENT}/leaderboards/total/details/rank/1?at=1710000060"),
                             format!("/api/v2/web/events/jp/{NORMAL_EVENT}/leaderboards/total/details/user/{user}"),
                             format!("/api/v2/web/events/jp/{NORMAL_EVENT}/leaderboards/total/users/search?name=Alpha"),

@@ -5,7 +5,8 @@ use axum::response::{IntoResponse, Response};
 use crate::api::error::ApiError;
 use crate::api::handler::leaderboard::service::{
     OverviewPart, OverviewQuery, WebDetailQuery, web_check_room_for_scope, web_overview_for_scope,
-    web_overview_part_for_scope, web_rank_detail_for_scope, web_user_detail_for_scope,
+    web_overview_part_for_scope, web_rank_detail_for_scope, web_status_for_scope,
+    web_user_detail_for_scope,
 };
 use crate::api::handler::web::UserSearchQuery;
 use crate::api::http_cache;
@@ -118,6 +119,30 @@ macro_rules! overview_part_handlers {
             .await
         }
     )*};
+}
+
+#[tracing::instrument(skip(state, query), fields(server, event_id))]
+pub async fn total_status(
+    State(state): State<AppState>,
+    Path((server, event_id)): Path<(String, i64)>,
+    Query(query): Query<OverviewQuery>,
+) -> Result<Response, ApiError> {
+    Ok(web_status_for_scope(state, server, event_id, None, query)
+        .await?
+        .into_response())
+}
+
+#[tracing::instrument(skip(state, query), fields(server, event_id, character_id))]
+pub async fn world_bloom_status(
+    State(state): State<AppState>,
+    Path((server, event_id, character_id)): Path<(String, i64, i64)>,
+    Query(query): Query<OverviewQuery>,
+) -> Result<Response, ApiError> {
+    Ok(
+        web_status_for_scope(state, server, event_id, Some(character_id), query)
+            .await?
+            .into_response(),
+    )
 }
 
 overview_part_handlers! {

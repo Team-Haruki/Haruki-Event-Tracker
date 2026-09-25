@@ -107,3 +107,31 @@ pub async fn fetch_latest_heartbeat_before(
         .await?;
     Ok(row.map(|r| (r.timestamp, r.status)))
 }
+
+#[derive(FromQueryResult)]
+struct SnapshotTimeRow {
+    timestamp: i64,
+}
+
+/// The sample timestamp of `time_id` (equal to it for rows written under
+/// the `time_id = timestamp` rule; looked up so legacy ids work too).
+#[tracing::instrument(skip(engine), fields(event_id, time_id))]
+pub async fn fetch_time_id_timestamp(
+    engine: &DatabaseEngine,
+    event_id: i64,
+    time_id: i64,
+) -> Result<Option<i64>, DbErr> {
+    let stmt = Query::select()
+        .expr_as(
+            Expr::col(time_id::Column::Timestamp),
+            Alias::new("timestamp"),
+        )
+        .from(Alias::new(intern(TableKind::TimeId, event_id)))
+        .and_where(Expr::col(time_id::Column::TimeId).eq(time_id))
+        .limit(1)
+        .to_owned();
+    let row = SnapshotTimeRow::find_by_statement(engine.backend().build(&stmt))
+        .one(engine.conn())
+        .await?;
+    Ok(row.map(|r| r.timestamp))
+}

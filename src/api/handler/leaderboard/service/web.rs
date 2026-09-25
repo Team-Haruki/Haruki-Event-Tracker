@@ -2,9 +2,13 @@ use serde::Deserialize;
 
 use crate::api::error::ApiError;
 use crate::api::extract::{ApiAudience, prepare_audience_user_id_mode, resolve_region_engine};
-use crate::api::handler::web::{build_overview, build_world_bloom_overview, cached_overview_bytes};
+use crate::api::handler::web::{
+    build_overview, build_overview_until, build_world_bloom_overview,
+    build_world_bloom_overview_until, cached_overview_bytes, overview_status,
+};
 use crate::api::json::{EncodedJson, Json};
 use crate::api::state::AppState;
+use crate::db::query::heartbeat::fetch_time_id_timestamp;
 use crate::model::api::{
     LeaderboardOverviewSchema, RecordedRankData, WebRankDetailResponseSchema, WebRankingItemSchema,
     WebSubjectSchema, WebUserDetailResponseSchema,
@@ -25,10 +29,12 @@ pub struct OverviewQuery {
 }
 
 /// A slice of the overview served as its own resource (`.../top100`,
-/// `.../borders`, `.../growth`). Parts are cut out of the cached overview
-/// of the same version, so every part of one `version` comes from one
-/// computation, and the overview's builders (and any fix to them) are the
-/// only source of the data.
+/// `.../borders`, `.../growth`). Parts are cut out of one cached
+/// "as-of" overview per version: the same builders as the overview, but
+/// with the growth window and `meta.fetchedAt` anchored to the newest
+/// ranking sample instead of the wall clock, and without `status`. So a
+/// part is a pure function of the data behind its cache epoch: every fetch
+/// of one `v` is byte-identical and all parts of one `v` agree.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum OverviewPart {
     Top100,
@@ -52,16 +58,8 @@ impl OverviewPart {
     /// overview skips when empty come back as `[]`.
     fn fields(self) -> &'static [PartField] {
         match self {
-            Self::Top100 => &[
-                ("meta", None),
-                ("topRankings", Some("[]")),
-                ("status", None),
-            ],
-            Self::Borders => &[
-                ("meta", None),
-                ("borderLines", Some("[]")),
-                ("status", None),
-            ],
+            Self::Top100 => &[("meta", None), ("topRankings", Some("[]"))],
+            Self::Borders => &[("meta", None), ("borderLines", Some("[]"))],
             Self::Growth => &[
                 ("meta", None),
                 ("topPlayerGrowths", Some("[]")),
@@ -137,18 +135,15 @@ pub(crate) async fn web_overview_part_for_scope(
     let fetch = async {
         // Boxed: the overview's own cache + build future nested inline makes
         // this handler's future (and debug-build stack frames) very large.
-        let overview = Box::pin(web_overview_for_scope(
-            state.clone(),
-            server.clone(),
+        let overview = Box::pin(as_of_overview_bytes(
+            &state,
+            &server,
             event_id,
             character_id,
-            query,
-            WEB_OVERVIEW_PREFIX,
-            false,
+            interval,
+            at,
         ))
-        .await?
-        .into_identity_bytes()
-        .ok_or_else(|| ApiError::ServiceUnavailable("overview encoding mismatch".into()))?;
+        .await?;
         project_overview_part(&overview, part).map(RawJsonText)
     };
     cached_overview_bytes(
@@ -164,6 +159,106 @@ pub(crate) async fn web_overview_part_for_scope(
 }
 
 pub(crate) const WEB_OVERVIEW_PREFIX: &str = "web:v2";
+const AS_OF_OVERVIEW_PREFIX: &str = "web:v2:asof";
+
+/// The overview the parts are cut from (see `OverviewPart`), as identity
+/// JSON. Live: the window ends at the newest ranking sample; with `at`: at
+/// `at`, as for the replay overview.
+async fn as_of_overview_bytes(
+    state: &AppState,
+    server: &str,
+    event_id: i64,
+    character_id: Option<i64>,
+    interval: i64,
+    at: Option<i64>,
+) -> Result<bytes::Bytes, ApiError> {
+    let (region, engine) = resolve_region_engine(state, server)?;
+    // The per-epoch commit cut (#80) fixes both which rows are read and,
+    // through its sample's timestamp, where the growth window ends.
+    let cut = Box::pin(resolve_rank_cut(
+        state,
+        server,
+        &engine,
+        event_id,
+        character_id,
+        at,
+    ))
+    .await?;
+    let suffix = overview_suffix(
+        AS_OF_OVERVIEW_PREFIX,
+        character_id,
+        interval,
+        at,
+        cut.as_of_time_id,
+    );
+    let fetch = async {
+        let mode =
+            prepare_audience_user_id_mode(state, &engine, region, event_id, ApiAudience::Web)
+                .await?;
+        let as_of = match cut.as_of_time_id {
+            Some(time_id) => fetch_time_id_timestamp(&engine, event_id, time_id).await?,
+            None => None,
+        };
+        // An event without samples has nothing to anchor to; its lists are
+        // empty either way.
+        let end_time = at
+            .or(as_of)
+            .unwrap_or_else(|| chrono::Utc::now().timestamp());
+        let overview = match character_id {
+            Some(character_id) => {
+                build_world_bloom_overview_until(
+                    &engine,
+                    event_id,
+                    character_id,
+                    mode,
+                    interval,
+                    cut,
+                    end_time,
+                )
+                .await?
+            }
+            None => build_overview_until(&engine, event_id, mode, interval, cut, end_time).await?,
+        };
+        Ok(LeaderboardOverviewSchema {
+            meta: meta(server, event_id, character_id, end_time),
+            overview,
+            window_start: end_time - interval,
+            window_end: end_time,
+        })
+    };
+    cached_overview_bytes(state, server, event_id, suffix, at.is_some(), false, fetch)
+        .await?
+        .into_identity_bytes()
+        .ok_or_else(|| ApiError::ServiceUnavailable("overview encoding mismatch".into()))
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct WebStatusSchema {
+    meta: crate::model::api::LeaderboardMetaSchema,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    status: Option<crate::model::api::EventStatusResponseSchema>,
+}
+
+/// `.../status`: the tracker heartbeat, computed per request. It moves
+/// without a cache epoch bump (idle and error heartbeats) and carries
+/// `timeAgo`, so it is never versioned.
+pub(crate) async fn web_status_for_scope(
+    state: AppState,
+    server: String,
+    event_id: i64,
+    character_id: Option<i64>,
+    query: OverviewQuery,
+) -> Result<Json<WebStatusSchema>, ApiError> {
+    let at = positive_timestamp(query.at);
+    let (_, engine) = resolve_region_engine(&state, &server)?;
+    let status = overview_status(&engine, event_id, at).await?;
+    let now = at.unwrap_or_else(|| chrono::Utc::now().timestamp());
+    Ok(Json(WebStatusSchema {
+        meta: meta(&server, event_id, character_id, now),
+        status,
+    }))
+}
 
 fn overview_suffix(
     cache_prefix: &str,
@@ -278,6 +373,9 @@ pub(crate) async fn web_overview_for_scope(
             window_end: end_time,
         })
     };
+    // Live overviews end their window at the wall clock and carry
+    // `status.timeAgo`, so they are never marked immutable; only the
+    // epoch-pure parts are.
     cached_overview_bytes(
         &state,
         &cache_server,
@@ -288,6 +386,7 @@ pub(crate) async fn web_overview_for_scope(
         fetch,
     )
     .await
+    .map(|overview| overview.at_epoch(None))
 }
 
 pub(crate) async fn web_rank_detail_for_scope(
@@ -1055,9 +1154,13 @@ mod tests {
                                         .all(|key| part.fields().iter().any(|(n, _)| n == key))
                                 );
                             }
-                            // Every overview field lives in some part.
+                            // Every overview field lives in some part, except
+                            // the wall-clock `status` (its own endpoint).
                             for key in overview.as_object().unwrap().keys() {
-                                assert!(covered.contains(key.as_str()), "{key} is in no part");
+                                assert!(
+                                    key == "status" || covered.contains(key.as_str()),
+                                    "{key} is in no part"
+                                );
                             }
                         }
                     });

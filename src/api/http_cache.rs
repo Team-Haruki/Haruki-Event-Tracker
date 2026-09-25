@@ -413,13 +413,8 @@ mod tests {
         });
     }
 
-    async fn overview_meta(response: Response) -> serde_json::Value {
-        let value: serde_json::Value = serde_json::from_slice(&body(response).await).unwrap();
-        value["meta"].clone()
-    }
-
     #[test]
-    fn versioned_overview_is_immutable_for_the_current_epoch_only() {
+    fn versioned_parts_are_immutable_epoch_pure_and_consistent() {
         run(|| async {
             let Ok(url) = std::env::var("HARUKI_COVERAGE_REDIS_URL") else {
                 return;
@@ -431,7 +426,9 @@ mod tests {
                 ApiCacheConfig {
                     enabled: true,
                     precompress_min_bytes: 1,
-                    latest_rank_ttl_secs: 60,
+                    // Short TTLs so a version is recomputed within the test.
+                    latest_rank_ttl_secs: 1,
+                    local_value_ttl_ms: 100,
                     ..ApiCacheConfig::default()
                 },
             );
@@ -440,42 +437,68 @@ mod tests {
             let epoch = finish_event_update(&mut conn, SekaiServerRegion::Jp, NORMAL_EVENT)
                 .await
                 .unwrap();
-            let uri = format!(
-                "/api/v2/web/events/jp/{NORMAL_EVENT}/leaderboards/total/overview?interval=60"
-            );
+            let base = format!("/api/v2/web/events/jp/{NORMAL_EVENT}/leaderboards/total");
+            let part = |name: &str, v: i64| format!("{base}/{name}?interval=60&v={v}");
             let gzip = [("accept-encoding", "gzip, br")];
 
             // Fresh fetch (accepted into the cache), then a cache hit.
-            for _ in 0..2 {
-                let current = get_with(&router, &format!("{uri}&v={epoch}"), &gzip).await;
-                assert_eq!(current.status(), StatusCode::OK);
-                assert_eq!(header(&current, "content-encoding"), Some("gzip"));
-                assert_eq!(
-                    header(&current, "cache-control"),
-                    Some(VERSIONED_CACHE_CONTROL)
-                );
+            let mut first = Vec::new();
+            for name in ["top100", "borders", "growth"] {
+                for _ in 0..2 {
+                    let response = get_with(&router, &part(name, epoch), &gzip).await;
+                    assert_eq!(response.status(), StatusCode::OK, "{name}");
+                    assert_eq!(header(&response, "content-encoding"), Some("gzip"));
+                    assert_eq!(
+                        header(&response, "cache-control"),
+                        Some(VERSIONED_CACHE_CONTROL),
+                        "{name}"
+                    );
+                }
+                let plain = get_with(&router, &part(name, epoch), &[]).await;
+                // Identity bodies are served too, but never immutable.
+                assert_eq!(header(&plain, "cache-control"), Some(LIVE_CACHE_CONTROL));
+                first.push((name, body(plain).await));
             }
-            let stale = get_with(&router, &format!("{uri}&v={}", epoch - 1), &gzip).await;
-            assert_eq!(header(&stale, "cache-control"), Some(LIVE_CACHE_CONTROL));
 
-            // Every part of one version is immutable too, and all of them
-            // are cut from the same cached overview computation.
-            let expected_meta =
-                overview_meta(get_with(&router, &format!("{uri}&v={epoch}"), &[]).await).await;
-            for part in ["top100", "borders", "growth"] {
-                let part_uri = format!(
-                    "/api/v2/web/events/jp/{NORMAL_EVENT}/leaderboards/total/{part}?interval=60&v={epoch}"
-                );
-                let response = get_with(&router, &part_uri, &gzip).await;
-                assert_eq!(response.status(), StatusCode::OK, "{part}");
-                assert_eq!(
-                    header(&response, "cache-control"),
-                    Some(VERSIONED_CACHE_CONTROL),
-                    "{part}"
-                );
-                let plain = get_with(&router, &part_uri, &[]).await;
-                assert_eq!(overview_meta(plain).await, expected_meta, "{part}");
+            // All parts of one version share one as-of time: the newest
+            // sample, not the wall clock.
+            let metas: Vec<serde_json::Value> = first
+                .iter()
+                .map(|(_, bytes)| {
+                    serde_json::from_slice::<serde_json::Value>(bytes).unwrap()["meta"].clone()
+                })
+                .collect();
+            assert!(metas.windows(2).all(|pair| pair[0] == pair[1]), "{metas:?}");
+            let as_of = metas[0]["fetchedAt"].as_i64().unwrap();
+            assert!(as_of < chrono::Utc::now().timestamp() - 3600, "{as_of}");
+            let growth: serde_json::Value = serde_json::from_slice(&first[2].1).unwrap();
+            assert_eq!(growth["windowEnd"].as_i64(), Some(as_of));
+            assert!(growth.get("status").is_none());
+
+            // Recomputed at a later wall time (past every TTL): the same
+            // version yields the same bytes and the same tags.
+            tokio::time::sleep(std::time::Duration::from_millis(2100)).await;
+            for (name, bytes) in &first {
+                let again = get_with(&router, &part(name, epoch), &[]).await;
+                assert_eq!(&body(again).await, bytes, "{name}");
             }
+
+            // The wall-clock overview never claims a version.
+            let overview = get_with(
+                &router,
+                &format!("{base}/overview?interval=60&v={epoch}"),
+                &gzip,
+            )
+            .await;
+            assert_eq!(overview.status(), StatusCode::OK);
+            assert_eq!(header(&overview, "cache-control"), Some(LIVE_CACHE_CONTROL));
+            // Nor does the live status.
+            let status = get_with(&router, &format!("{base}/status?v={epoch}"), &gzip).await;
+            assert_eq!(status.status(), StatusCode::OK);
+            assert_eq!(header(&status, "cache-control"), Some(LIVE_CACHE_CONTROL));
+
+            let stale = get_with(&router, &part("top100", epoch - 1), &gzip).await;
+            assert_eq!(header(&stale, "cache-control"), Some(LIVE_CACHE_CONTROL));
 
             // After the next write the old version is no longer vouched for.
             let next = finish_event_update(&mut conn, SekaiServerRegion::Jp, NORMAL_EVENT)
@@ -483,16 +506,10 @@ mod tests {
                 .unwrap();
             assert_eq!(next, epoch + 1);
             tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-            let old = get_with(&router, &format!("{uri}&v={epoch}"), &gzip).await;
+            let old = get_with(&router, &part("top100", epoch), &gzip).await;
             assert_eq!(header(&old, "cache-control"), Some(LIVE_CACHE_CONTROL));
-            let new = get_with(&router, &format!("{uri}&v={next}"), &gzip).await;
+            let new = get_with(&router, &part("top100", next), &gzip).await;
             assert_eq!(header(&new, "cache-control"), Some(VERSIONED_CACHE_CONTROL));
-            // Clients that can't take the precompressed variant get the
-            // short lifetime rather than an unvouched immutable response.
-            let identity = get_with(&router, &format!("{uri}&v={next}"), &[]).await;
-            assert_eq!(identity.status(), StatusCode::OK);
-            assert!(header(&identity, "content-encoding").is_none());
-            assert_eq!(header(&identity, "cache-control"), Some(LIVE_CACHE_CONTROL));
         });
     }
 }

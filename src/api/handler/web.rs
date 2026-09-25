@@ -296,9 +296,22 @@ pub async fn build_overview(
     interval: i64,
     cut: RankSnapshotCut,
 ) -> Result<WebOverviewSchema, ApiError> {
+    let end_time = cut.at.unwrap_or_else(|| Utc::now().timestamp());
+    build_overview_until(engine, event_id, mode, interval, cut, end_time).await
+}
+
+/// `build_overview` with the growth window ending at `end_time` instead of
+/// the wall clock (versioned parts pass the cut's as-of time).
+pub async fn build_overview_until(
+    engine: &DatabaseEngine,
+    event_id: i64,
+    mode: PublicUserIdMode,
+    interval: i64,
+    cut: RankSnapshotCut,
+    end_time: i64,
+) -> Result<WebOverviewSchema, ApiError> {
     let at = cut.at;
     let top_rows = rank_snapshot_rows(engine, event_id, &top_ranks(), cut, mode).await?;
-    let end_time = at.unwrap_or_else(|| Utc::now().timestamp());
     let start_time = end_time - interval;
     let growth_ranks = overview_growth_ranks(SEKAI_EVENT_RANKING_LINES_NORMAL);
     let (top_player_growths, border_lines, rank_growths, status) = tokio::try_join!(
@@ -347,11 +360,34 @@ pub async fn build_world_bloom_overview(
     interval: i64,
     cut: RankSnapshotCut,
 ) -> Result<WebOverviewSchema, ApiError> {
+    let end_time = cut.at.unwrap_or_else(|| Utc::now().timestamp());
+    build_world_bloom_overview_until(
+        engine,
+        event_id,
+        character_id,
+        mode,
+        interval,
+        cut,
+        end_time,
+    )
+    .await
+}
+
+/// `build_world_bloom_overview` with an explicit window end (see
+/// `build_overview_until`).
+pub async fn build_world_bloom_overview_until(
+    engine: &DatabaseEngine,
+    event_id: i64,
+    character_id: i64,
+    mode: PublicUserIdMode,
+    interval: i64,
+    cut: RankSnapshotCut,
+    end_time: i64,
+) -> Result<WebOverviewSchema, ApiError> {
     let at = cut.at;
     let top_rows =
         world_bloom_rank_snapshot_rows(engine, event_id, character_id, &top_ranks(), cut, mode)
             .await?;
-    let end_time = at.unwrap_or_else(|| Utc::now().timestamp());
     let start_time = end_time - interval;
     let growth_ranks = overview_growth_ranks(SEKAI_EVENT_RANKING_LINES_WORLD_BLOOM);
     let (top_player_growths, border_lines, rank_growths, status) = tokio::try_join!(
@@ -436,7 +472,7 @@ fn filter_growths(
         .collect()
 }
 
-async fn overview_status(
+pub(crate) async fn overview_status(
     engine: &DatabaseEngine,
     event_id: i64,
     at: Option<i64>,

@@ -10,5 +10,6 @@ pub(crate) use cloud::{
 };
 pub(crate) use web::{
     OverviewPart, OverviewQuery, WebDetailQuery, web_check_room_for_scope, web_overview_for_scope,
-    web_overview_part_for_scope, web_rank_detail_for_scope, web_user_detail_for_scope,
+    web_overview_part_for_scope, web_rank_detail_for_scope, web_status_for_scope,
+    web_user_detail_for_scope,
 };
