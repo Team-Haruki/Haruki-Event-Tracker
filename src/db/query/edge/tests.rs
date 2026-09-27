@@ -12,13 +12,18 @@ use sea_orm::{ConnectOptions, ConnectionTrait, Database, DatabaseBackend, FromQu
 
 use crate::db::engine::DatabaseEngine;
 use crate::db::query::lines::{RankEdge, RankEdgeSpec, grouped_rank_edge_select, rank_edge_select};
+use crate::db::query::ranking::{fetch_all_rankings, fetch_latest_ranking};
 use crate::db::query::user::PublicUserIdMode;
 use crate::db::query::web::{
-    PlayerGrowthRow, RankingPageRow, WebRankingCursor, WebRankingFilter, WebTraceFilter,
-    WorldBloomRankingPageRow, earliest_player_rows_select, grouped_latest_rank,
+    PlayerGrowthRow, RankSnapshotCut, RankingPageRow, WebRankingCursor, WebRankingFilter,
+    WebTraceFilter, WorldBloomRankingPageRow, earliest_player_rows_select, grouped_latest_rank,
     grouped_latest_world_bloom_rank, latest_rank_window_join, latest_world_bloom_rank_window_join,
     legacy_player_rows_select, search_rank_trace, search_ranking_rows, search_user_trace,
     search_world_bloom_rank_trace, search_world_bloom_ranking_rows, search_world_bloom_user_trace,
+    user_rank_as_of,
+};
+use crate::db::query::world_bloom::{
+    fetch_all_world_bloom_rankings, fetch_latest_world_bloom_ranking,
 };
 use crate::db::schema::create_event_tables;
 use crate::db::table_name::{TableKind, intern};
@@ -628,6 +633,113 @@ async fn check_traces(engine: &DatabaseEngine, fx: &Fixture, rng: &mut Rng) {
     );
 }
 
+/// The per-player lookups that resolve the player's key first
+/// (`user::user_key_lookup`) against brute force: latest row, full
+/// history and rank at a cut — by raw id and by
+/// `unique_id`, for known players and ids nobody has.
+async fn check_user_lookups(engine: &DatabaseEngine, fx: &Fixture, rng: &mut Rng) {
+    let user = rng.range(1, USERS + 2);
+    let (subject, mode) = if rng.chance(50) {
+        (format!("{user}"), PublicUserIdMode::Raw)
+    } else {
+        (format!("u-{user}"), PublicUserIdMode::Unique)
+    };
+    let character_id = CHARACTERS[rng.below(2) as usize];
+    let label = format!("user {subject} ({mode:?}) wb={character_id}");
+
+    // Joined selects only see rows that have a time row.
+    let history = |rows: &[Row], keep: &dyn Fn(&Row) -> bool| -> Vec<(i64, String, i64, i64)> {
+        let mut out: Vec<_> = rows
+            .iter()
+            .filter(|r| r.user == user && keep(r))
+            .filter_map(|r| fx.times.get(&r.time_id).map(|ts| (r.time_id, *ts, r)))
+            .collect();
+        out.sort_by_key(|(time_id, _, _)| *time_id);
+        out.into_iter()
+            .map(|(_, ts, r)| (ts, subject.clone(), r.score, r.rank))
+            .collect()
+    };
+    let expected = history(&fx.rows, &|_| true);
+    let got = fetch_all_rankings(engine, fx.event_id, &subject, mode)
+        .await
+        .unwrap();
+    assert_eq!(
+        got.iter()
+            .map(|r| (r.timestamp, r.user_id.clone(), r.score, r.rank))
+            .collect::<Vec<_>>(),
+        expected,
+        "all rankings {label}"
+    );
+    let got = fetch_latest_ranking(engine, fx.event_id, &subject, mode)
+        .await
+        .unwrap();
+    assert_eq!(
+        got.map(|r| (r.timestamp, r.user_id, r.score, r.rank)),
+        expected.last().cloned(),
+        "latest ranking {label}"
+    );
+
+    let expected = history(&fx.wl_rows, &|r| r.character == character_id);
+    let got = fetch_all_world_bloom_rankings(engine, fx.event_id, &subject, character_id, mode)
+        .await
+        .unwrap();
+    assert!(got.iter().all(|r| r.character_id == Some(character_id)));
+    assert_eq!(
+        got.iter()
+            .map(|r| (r.timestamp, r.user_id.clone(), r.score, r.rank))
+            .collect::<Vec<_>>(),
+        expected,
+        "all wb rankings {label}"
+    );
+    let got = fetch_latest_world_bloom_ranking(engine, fx.event_id, &subject, character_id, mode)
+        .await
+        .unwrap();
+    assert_eq!(
+        got.map(|r| (r.timestamp, r.user_id, r.score, r.rank)),
+        expected.last().cloned(),
+        "latest wb ranking {label}"
+    );
+
+    // The rank at a cut reads the ranking table alone (orphan rows count)
+    // and bounds `time_id` by the cut and by the replay point's time row.
+    let (lo, hi) = (
+        *fx.times.keys().next().unwrap(),
+        *fx.times.keys().next_back().unwrap(),
+    );
+    let cut = RankSnapshotCut {
+        at: bound(rng, fx),
+        as_of_time_id: rng.chance(50).then(|| rng.range(lo - 1, hi + 1)),
+    };
+    let at_bound = cut.at.map(|at| {
+        fx.times
+            .iter()
+            .filter(|(_, ts)| **ts <= at)
+            .map(|(time_id, _)| *time_id)
+            .max()
+    });
+    for (chapter, rows) in [(None, &fx.rows), (Some(character_id), &fx.wl_rows)] {
+        let expected = rows
+            .iter()
+            .filter(|r| r.user == user && chapter.is_none_or(|c| r.character == c))
+            .filter(|r| cut.as_of_time_id.is_none_or(|as_of| r.time_id <= as_of))
+            .filter(|r| match at_bound {
+                None => true,
+                Some(Some(bound)) => r.time_id <= bound,
+                // `at` before the first sample: the bound is NULL, no row passes.
+                Some(None) => false,
+            })
+            .max_by_key(|r| r.time_id)
+            .map(|r| r.rank);
+        let got = user_rank_as_of(engine, fx.event_id, chapter, &subject, cut, mode)
+            .await
+            .unwrap();
+        assert_eq!(
+            got, expected,
+            "rank as of {cut:?} {label} chapter={chapter:?}"
+        );
+    }
+}
+
 async fn drop_event(engine: &DatabaseEngine, event_id: i64) {
     for kind in [
         TableKind::WorldBloom,
@@ -655,6 +767,7 @@ async fn run_equivalence(engine: &DatabaseEngine, first_event_id: i64, seeds: u6
                 check_plain_search(engine, &fx, &mut rng).await;
                 check_player_growths(engine, &fx, &mut rng).await;
                 check_traces(engine, &fx, &mut rng).await;
+                check_user_lookups(engine, &fx, &mut rng).await;
             }
             drop_event(engine, event_id).await;
             event_id += 1;

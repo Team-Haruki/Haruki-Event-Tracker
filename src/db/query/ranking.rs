@@ -10,7 +10,7 @@ use sea_orm::{DbErr, ExprTrait, FromQueryResult};
 
 use crate::db::engine::DatabaseEngine;
 use crate::db::entity::{event, event_users, time_id};
-use crate::db::query::user::PublicUserIdMode;
+use crate::db::query::user::{PublicUserIdMode, user_key_lookup};
 use crate::db::table_name::{TableKind, intern};
 use crate::model::api::RecordedRankingSchema;
 
@@ -59,15 +59,19 @@ pub async fn fetch_latest_ranking(
     user_id: &str,
     mode: PublicUserIdMode,
 ) -> Result<Option<RecordedRankingSchema>, DbErr> {
-    let users_tbl = Alias::new(intern(TableKind::EventUsers, event_id));
     let event_tbl = Alias::new(intern(TableKind::Event, event_id));
     // `time_id` order == `timestamp` order is an invariant (the writer
     // assigns `time_id = timestamp`; `db::repair` renumbers legacy rows),
     // so ordering by the event table's own column gives identical results
     // while letting the `(user_id_key, time_id)` / `(rank, time_id)`
-    // indexes provide the order — no join-then-sort.
+    // indexes provide the order — no join-then-sort. The player is
+    // resolved to their key first (`user_key_lookup`) so that index is
+    // probed with a constant.
     let stmt = ranking_select(event_id, mode)
-        .and_where(Expr::col((users_tbl, mode.output_column())).eq(user_id))
+        .and_where(
+            Expr::col((event_tbl.clone(), event::Column::UserIdKey))
+                .eq(user_key_lookup(event_id, user_id, mode)),
+        )
         .order_by((event_tbl, event::Column::TimeId), Order::Desc)
         .limit(1)
         .to_owned();
@@ -85,10 +89,12 @@ pub async fn fetch_all_rankings(
     user_id: &str,
     mode: PublicUserIdMode,
 ) -> Result<Vec<RecordedRankingSchema>, DbErr> {
-    let users_tbl = Alias::new(intern(TableKind::EventUsers, event_id));
     let event_tbl = Alias::new(intern(TableKind::Event, event_id));
     let stmt = ranking_select(event_id, mode)
-        .and_where(Expr::col((users_tbl, mode.output_column())).eq(user_id))
+        .and_where(
+            Expr::col((event_tbl.clone(), event::Column::UserIdKey))
+                .eq(user_key_lookup(event_id, user_id, mode)),
+        )
         .order_by((event_tbl, event::Column::TimeId), Order::Asc)
         .to_owned();
 

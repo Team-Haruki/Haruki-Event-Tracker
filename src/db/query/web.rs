@@ -10,7 +10,7 @@ use crate::db::entity::{event, event_users, time_id, world_bloom};
 use crate::db::query::edge::{
     Edge, EdgeSpec, TimeWindow, and_where_time_id_within, edge_keys_select, time_id_upper_bound,
 };
-use crate::db::query::user::PublicUserIdMode;
+use crate::db::query::user::{PublicUserIdMode, user_key_lookup};
 use crate::db::table_name::{TableKind, intern};
 use crate::model::api::{
     RecordedRankData, RecordedRankingSchema, RecordedUserNameSchema,
@@ -1249,7 +1249,6 @@ pub async fn user_rank_as_of(
         Some(_) => intern(TableKind::WorldBloom, event_id),
         None => intern(TableKind::Event, event_id),
     });
-    let users_tbl = Alias::new(intern(TableKind::EventUsers, event_id));
     let time_id_col = Alias::new("time_id");
     let mut stmt = Query::select();
     stmt.expr_as(
@@ -1257,12 +1256,10 @@ pub async fn user_rank_as_of(
         Alias::new("rank"),
     )
     .from(tbl.clone())
-    .inner_join(
-        users_tbl.clone(),
+    .and_where(
         Expr::col((tbl.clone(), Alias::new("user_id_key")))
-            .equals((users_tbl.clone(), event_users::Column::UserIdKey)),
-    )
-    .and_where(Expr::col((users_tbl, mode.output_column())).eq(user_id));
+            .eq(user_key_lookup(event_id, user_id, mode)),
+    );
     if let Some(character_id) = character_id {
         stmt.and_where(Expr::col((tbl.clone(), Alias::new("character_id"))).eq(character_id));
     }
@@ -1465,13 +1462,18 @@ pub async fn search_user_trace(
     filter: &WebTraceFilter,
     mode: PublicUserIdMode,
 ) -> Result<Vec<RecordedRankData>, DbErr> {
-    let users_tbl = Alias::new(intern(TableKind::EventUsers, event_id));
+    let event_tbl = Alias::new(intern(TableKind::Event, event_id));
     let time_tbl = Alias::new(intern(TableKind::TimeId, event_id));
     // Traces only surface `(timestamp, user_id, score, rank)`; the lean
     // select skips the users-table profile columns (three of them multi-KB
-    // JSON blobs) that `ranking_select` drags along for page rows.
+    // JSON blobs) that `ranking_select` drags along for page rows. The
+    // player is resolved to their key first (`user_key_lookup`) so the
+    // `(user_id_key, time_id)` index is range-scanned with a constant.
     let mut stmt = crate::db::query::ranking::ranking_select(event_id, mode);
-    stmt.and_where(Expr::col((users_tbl, mode.output_column())).eq(user_id));
+    stmt.and_where(
+        Expr::col((event_tbl, event::Column::UserIdKey))
+            .eq(user_key_lookup(event_id, user_id, mode)),
+    );
     apply_trace_filters(
         &mut stmt,
         Expr::col((time_tbl.clone(), time_id::Column::Timestamp)),
@@ -1511,12 +1513,14 @@ pub async fn search_world_bloom_user_trace(
     filter: &WebTraceFilter,
     mode: PublicUserIdMode,
 ) -> Result<Vec<RecordedRankData>, DbErr> {
-    let users_tbl = Alias::new(intern(TableKind::EventUsers, event_id));
     let wl_tbl = Alias::new(intern(TableKind::WorldBloom, event_id));
     let time_tbl = Alias::new(intern(TableKind::TimeId, event_id));
     let mut stmt = crate::db::query::world_bloom::wl_select(event_id, mode);
-    stmt.and_where(Expr::col((users_tbl, mode.output_column())).eq(user_id))
-        .and_where(Expr::col((wl_tbl, world_bloom::Column::CharacterId)).eq(character_id));
+    stmt.and_where(
+        Expr::col((wl_tbl.clone(), world_bloom::Column::UserIdKey))
+            .eq(user_key_lookup(event_id, user_id, mode)),
+    )
+    .and_where(Expr::col((wl_tbl, world_bloom::Column::CharacterId)).eq(character_id));
     apply_trace_filters(
         &mut stmt,
         Expr::col((time_tbl.clone(), time_id::Column::Timestamp)),
