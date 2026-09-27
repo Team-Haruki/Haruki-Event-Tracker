@@ -806,6 +806,48 @@ where
     }
 }
 
+/// A subject trace's columns (`TraceColumns`) as cached JSON bytes, keyed
+/// and bucketed like the row trace they are derived from; a detail splices
+/// them in verbatim (`TracePayload::columns_from_json`).
+pub async fn cached_trace_columns_json<T, Fut>(
+    state: &AppState,
+    server: &str,
+    event_id: i64,
+    suffix: String,
+    fetch: Fut,
+) -> Result<Bytes, ApiError>
+where
+    T: serde::Serialize,
+    Fut: std::future::Future<Output = Result<T, ApiError>>,
+{
+    if let Some(cache) = state.cache() {
+        let ttl_secs = cache.ttl(CacheTtl::TraceRank);
+        let suffix = trace_bucketed_suffix(&suffix, ttl_secs, chrono::Utc::now().timestamp());
+        cache
+            .get_or_fetch_static_json_bytes_checked(
+                server,
+                event_id,
+                suffix,
+                ttl_secs,
+                Some(trace_columns_json_is_valid),
+                fetch,
+            )
+            .await
+    } else {
+        encode_fetched(fetch).await
+    }
+}
+
+fn trace_columns_json_is_valid(json: &Bytes) -> bool {
+    match crate::model::trace_columns::TraceColumns::json_is_well_formed(json) {
+        Ok(_) => true,
+        Err(err) => {
+            tracing::warn!(%err, "api cache cached trace columns are malformed");
+            false
+        }
+    }
+}
+
 fn subject_trace_json_is_valid(json: &Bytes) -> bool {
     match crate::model::api::SubjectTraceResponseSchema::json_is_well_formed(json) {
         Ok(_) => true,

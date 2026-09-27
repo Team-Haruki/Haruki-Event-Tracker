@@ -2,7 +2,7 @@ use serde::Deserialize;
 
 use crate::api::error::ApiError;
 use crate::api::extract::{ApiAudience, prepare_audience_user_id_mode, resolve_region_engine};
-use crate::api::handler::web::cached_subject_trace_json;
+use crate::api::handler::web::{cached_subject_trace_json, cached_trace_columns_json};
 use crate::api::state::AppState;
 use crate::db::engine::DatabaseEngine;
 use crate::db::query::ranking::{fetch_latest_ranking, fetch_latest_ranking_by_rank};
@@ -15,12 +15,13 @@ use crate::db::query::world_bloom::fetch_latest_world_bloom_ranking_by_rank;
 use crate::model::api::{
     RecordedRankData, SubjectTraceMetaSchema, SubjectTraceResponseSchema, WebRankingItemSchema,
 };
+use crate::model::trace_columns::TraceColumns;
 
 use super::util::{meta, rank_of_item, timestamp_of_rank_data, user_id_of_rank_data};
 
 const MAX_TRACE_LIMIT: u64 = 10_000;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SubjectTraceQuery {
     pub(super) subject_type: Option<String>,
@@ -71,30 +72,12 @@ pub(super) async fn build_subject_trace_json(
     cache_prefix: &str,
     audience: ApiAudience,
 ) -> Result<bytes::Bytes, ApiError> {
-    let subject_type = query.subject_type.as_deref().unwrap_or("user");
-    let include_current = query.include_current.unwrap_or(true);
-    // Cloud subjects are raw upstream UIDs; keep those out of the Redis
-    // keyspace by hashing. Web subjects are already public unique_ids.
-    let subject_key = match audience {
-        ApiAudience::Cloud => hashed_subject(&subject),
-        ApiAudience::Web => subject.clone(),
-    };
-    let filter = WebTraceFilter {
-        start_time: query.start_time,
-        end_time: query.end_time,
-        cursor: query.cursor,
-        limit: query.limit.map(|limit| limit.clamp(1, MAX_TRACE_LIMIT)),
-    };
-    let suffix = match character_id {
-        Some(character_id) => format!(
-            "{cache_prefix}:wb:{character_id}:subject:{subject_type}:{subject_key}:current={include_current}:start={:?}:end={:?}:cursor={:?}:limit={:?}",
-            filter.start_time, filter.end_time, filter.cursor, filter.limit
-        ),
-        None => format!(
-            "{cache_prefix}:total:subject:{subject_type}:{subject_key}:current={include_current}:start={:?}:end={:?}:cursor={:?}:limit={:?}",
-            filter.start_time, filter.end_time, filter.cursor, filter.limit
-        ),
-    };
+    let SubjectTraceKey {
+        subject_type,
+        include_current,
+        filter,
+        suffix,
+    } = subject_trace_key(&query, &subject, character_id, cache_prefix, audience);
     let cache_server = server.clone();
     let fetch = async {
         let (region, engine) = resolve_region_engine(&state, &server)?;
@@ -190,6 +173,95 @@ pub(super) async fn build_subject_trace_json(
         })
     };
     cached_subject_trace_json(&state, &cache_server, event_id, suffix, fetch).await
+}
+
+/// The subject trace as cached columnar JSON (`TraceColumns`): encoded
+/// once per cached row trace, under the trace's key plus `:columns` in the
+/// same bucketed keyspace, from the cached row bytes. A subject without
+/// rows is the same 404 the row form answers.
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn build_subject_trace_columns_json(
+    state: AppState,
+    server: String,
+    event_id: i64,
+    character_id: Option<i64>,
+    subject: String,
+    query: SubjectTraceQuery,
+    cache_prefix: &str,
+    audience: ApiAudience,
+) -> Result<bytes::Bytes, ApiError> {
+    let suffix = format!(
+        "{}:columns",
+        subject_trace_key(&query, &subject, character_id, cache_prefix, audience).suffix
+    );
+    let cache_server = server.clone();
+    let cache_state = state.clone();
+    let fetch = async {
+        // Boxed: the row trace's own cache + fetch future nested inline
+        // makes this future (and debug-build stack frames) very large.
+        let json = Box::pin(build_subject_trace_json(
+            state,
+            server,
+            event_id,
+            character_id,
+            subject,
+            query,
+            cache_prefix,
+            audience,
+        ))
+        .await?;
+        TraceColumns::from_trace_json(&json).map_err(|err| {
+            tracing::warn!(%err, "cached subject trace has no usable rankData");
+            ApiError::ServiceUnavailable("api cache decode failed".into())
+        })
+    };
+    cached_trace_columns_json(&cache_state, &cache_server, event_id, suffix, fetch).await
+}
+
+struct SubjectTraceKey<'a> {
+    subject_type: &'a str,
+    include_current: bool,
+    filter: WebTraceFilter,
+    suffix: String,
+}
+
+fn subject_trace_key<'a>(
+    query: &'a SubjectTraceQuery,
+    subject: &str,
+    character_id: Option<i64>,
+    cache_prefix: &str,
+    audience: ApiAudience,
+) -> SubjectTraceKey<'a> {
+    let subject_type = query.subject_type.as_deref().unwrap_or("user");
+    let include_current = query.include_current.unwrap_or(true);
+    // Cloud subjects are raw upstream UIDs; keep those out of the Redis
+    // keyspace by hashing. Web subjects are already public unique_ids.
+    let subject_key = match audience {
+        ApiAudience::Cloud => hashed_subject(subject),
+        ApiAudience::Web => subject.to_owned(),
+    };
+    let filter = WebTraceFilter {
+        start_time: query.start_time,
+        end_time: query.end_time,
+        cursor: query.cursor,
+        limit: query.limit.map(|limit| limit.clamp(1, MAX_TRACE_LIMIT)),
+    };
+    let suffix = match character_id {
+        Some(character_id) => format!(
+            "{cache_prefix}:wb:{character_id}:subject:{subject_type}:{subject_key}:current={include_current}:start={:?}:end={:?}:cursor={:?}:limit={:?}",
+            filter.start_time, filter.end_time, filter.cursor, filter.limit
+        ),
+        None => format!(
+            "{cache_prefix}:total:subject:{subject_type}:{subject_key}:current={include_current}:start={:?}:end={:?}:cursor={:?}:limit={:?}",
+            filter.start_time, filter.end_time, filter.cursor, filter.limit
+        ),
+    };
+    SubjectTraceKey {
+        subject_type,
+        include_current,
+        filter,
+        suffix,
+    }
 }
 
 pub(super) fn hashed_subject(subject: &str) -> String {
