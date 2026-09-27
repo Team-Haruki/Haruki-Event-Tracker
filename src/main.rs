@@ -6,7 +6,7 @@ use axum_server::Handle;
 use axum_server::accept::NoDelayAcceptor;
 use axum_server::tls_rustls::{RustlsAcceptor, RustlsConfig};
 
-use haruki_event_tracker::db::engine::DatabaseEngine;
+use haruki_event_tracker::db::engine::{DatabaseEngine, EngineRole};
 use haruki_event_tracker::db::repair::repair_time_ids;
 use haruki_event_tracker::model::enums::SekaiServerRegion;
 use haruki_event_tracker::{api, app, config, logger, shutdown};
@@ -194,7 +194,7 @@ async fn repair_time_ids_cli(args: impl Iterator<Item = String>) -> ExitCode {
         eprintln!("region {region} is not configured in {cfg_location}");
         return ExitCode::from(1);
     };
-    let engine = match DatabaseEngine::connect(&server_cfg.db).await {
+    let engine = match DatabaseEngine::connect(&server_cfg.db, EngineRole::Serving).await {
         Ok(engine) => engine,
         Err(err) => {
             eprintln!("failed to connect {region} database: {err}");

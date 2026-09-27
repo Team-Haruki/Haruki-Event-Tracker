@@ -1321,6 +1321,7 @@ dependencies = [
  "rustls",
  "sea-orm",
  "sea-query",
+ "sea-query-sqlx",
  "serde",
  "serde_json",
  "sha2 0.11.0",
