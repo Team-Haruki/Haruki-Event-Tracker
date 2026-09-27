@@ -1,3 +1,7 @@
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, PoisonError};
+use std::time::{Duration, Instant};
+
 use reqwest::StatusCode;
 use reqwest::header::{ACCEPT, AUTHORIZATION, HeaderMap, HeaderValue, USER_AGENT};
 use serde::Deserialize;
@@ -11,6 +15,60 @@ pub struct PrivateLookupVerifier {
     base_url: String,
     auth_proxy_secret: Option<String>,
     client: reqwest::Client,
+    bound: Arc<Mutex<BoundUserCache>>,
+}
+
+/// Positive `verify_bound_user` answers, reused for a TTL so a viewer's
+/// every push (each private detail refresh and WebSocket frame) doesn't
+/// cost Toolbox a `/api/user/me`. Rejections are never stored: a binding
+/// that was just made shows up on the next request, an unbinding within a
+/// TTL.
+struct BoundUserCache {
+    ttl: Duration,
+    max_entries: usize,
+    entries: HashMap<BoundUserKey, Instant>,
+}
+
+type BoundUserKey = (String, SekaiServerRegion, String);
+
+impl BoundUserCache {
+    fn new(ttl: Duration, max_entries: usize) -> Self {
+        Self {
+            ttl,
+            max_entries,
+            entries: HashMap::new(),
+        }
+    }
+
+    fn is_bound(&mut self, key: &BoundUserKey, now: Instant) -> bool {
+        match self.entries.get(key) {
+            Some(verified_at) if now.duration_since(*verified_at) < self.ttl => true,
+            Some(_) => {
+                self.entries.remove(key);
+                false
+            }
+            None => false,
+        }
+    }
+
+    fn insert(&mut self, key: BoundUserKey, now: Instant) {
+        if self.ttl.is_zero() || self.max_entries == 0 {
+            return;
+        }
+        if self.entries.len() >= self.max_entries && !self.entries.contains_key(&key) {
+            let ttl = self.ttl;
+            self.entries
+                .retain(|_, verified_at| now.duration_since(*verified_at) < ttl);
+            if self.entries.len() >= self.max_entries {
+                // Still full of live answers: drop one arbitrary entry
+                // rather than grow without bound; its owner re-verifies.
+                if let Some(victim) = self.entries.keys().next().cloned() {
+                    self.entries.remove(&victim);
+                }
+            }
+        }
+        self.entries.insert(key, now);
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -75,6 +133,10 @@ impl PrivateLookupVerifier {
             base_url,
             auth_proxy_secret,
             client,
+            bound: Arc::new(Mutex::new(BoundUserCache::new(
+                Duration::from_secs(config.verify_cache_ttl_secs),
+                config.verify_cache_max_entries,
+            ))),
         })
     }
 
@@ -96,6 +158,31 @@ impl PrivateLookupVerifier {
             return Err(PrivateLookupError::Forbidden);
         }
 
+        let key: BoundUserKey = (subject.to_owned(), server, user_id.trim().to_owned());
+        if self.cached_bound(&key) {
+            return Ok(());
+        }
+        self.lookup_bound_user(subject, server, user_id).await?;
+        self.bound
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(key, Instant::now());
+        Ok(())
+    }
+
+    fn cached_bound(&self, key: &BoundUserKey) -> bool {
+        self.bound
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .is_bound(key, Instant::now())
+    }
+
+    async fn lookup_bound_user(
+        &self,
+        subject: &str,
+        server: SekaiServerRegion,
+        user_id: &str,
+    ) -> Result<(), PrivateLookupError> {
         let url = format!("{}/api/user/me", self.base_url);
         let mut request = self.client.get(url).header("X-Kratos-Identity-Id", subject);
         if let Some(secret) = &self.auth_proxy_secret {
@@ -191,8 +278,8 @@ pub(crate) mod tests {
         let verifier = PrivateLookupVerifier::from_config(&ToolboxConfig {
             base_url,
             auth_proxy_secret: "shared-secret".to_owned(),
-            authorization: String::new(),
             user_agent: "verifier-test".to_owned(),
+            ..ToolboxConfig::default()
         })
         .expect("verifier");
 
@@ -221,9 +308,7 @@ pub(crate) mod tests {
         .await;
         let verifier = PrivateLookupVerifier::from_config(&ToolboxConfig {
             base_url,
-            auth_proxy_secret: String::new(),
-            authorization: String::new(),
-            user_agent: String::new(),
+            ..ToolboxConfig::default()
         })
         .expect("verifier");
 
@@ -251,9 +336,7 @@ pub(crate) mod tests {
         .await;
         let verifier = PrivateLookupVerifier::from_config(&ToolboxConfig {
             base_url,
-            auth_proxy_secret: String::new(),
-            authorization: String::new(),
-            user_agent: String::new(),
+            ..ToolboxConfig::default()
         })
         .expect("verifier");
 
@@ -263,6 +346,125 @@ pub(crate) mod tests {
             .expect_err("unbound account should reject");
 
         assert!(matches!(err, PrivateLookupError::Forbidden));
+    }
+
+    #[tokio::test]
+    async fn positive_answers_are_cached_per_subject_server_and_uid() {
+        let headers_seen = Arc::new(Mutex::new(Vec::new()));
+        let base_url = spawn_toolbox(
+            r#"{"updatedData":{"kratosIdentityId":"identity-1","gameAccountBindings":[{"server":"jp","userId":123456789},{"server":"en","userId":5}]}}"#,
+            headers_seen.clone(),
+        )
+        .await;
+        let verifier = PrivateLookupVerifier::from_config(&ToolboxConfig {
+            base_url,
+            ..ToolboxConfig::default()
+        })
+        .expect("verifier");
+
+        for _ in 0..3 {
+            verifier
+                .verify_bound_user("identity-1", None, SekaiServerRegion::Jp, "123456789")
+                .await
+                .expect("bound account should verify");
+        }
+        assert_eq!(headers_seen.lock().await.len(), 1);
+
+        // Another uid or server of the same subject is its own lookup.
+        verifier
+            .verify_bound_user("identity-1", None, SekaiServerRegion::En, "5")
+            .await
+            .expect("bound account should verify");
+        assert_eq!(headers_seen.lock().await.len(), 2);
+
+        // The owner check still runs on a cached answer.
+        let err = verifier
+            .verify_bound_user(
+                "identity-1",
+                Some("identity-2"),
+                SekaiServerRegion::Jp,
+                "123456789",
+            )
+            .await
+            .expect_err("owner mismatch should reject");
+        assert!(matches!(err, PrivateLookupError::Forbidden));
+        assert!(matches!(
+            verifier
+                .verify_bound_user(" ", None, SekaiServerRegion::Jp, "123456789")
+                .await,
+            Err(PrivateLookupError::Unauthorized)
+        ));
+        assert_eq!(headers_seen.lock().await.len(), 2);
+
+        // A rejection is asked again every time; a subject is only cached
+        // for the uid it was verified for.
+        for _ in 0..2 {
+            let err = verifier
+                .verify_bound_user("identity-1", None, SekaiServerRegion::Jp, "42")
+                .await
+                .expect_err("unbound uid should reject");
+            assert!(matches!(err, PrivateLookupError::Forbidden));
+        }
+        assert_eq!(headers_seen.lock().await.len(), 4);
+        assert_eq!(headers_seen.lock().await[3].0, "identity-1");
+    }
+
+    #[tokio::test]
+    async fn a_zero_ttl_disables_the_cache() {
+        let headers_seen = Arc::new(Mutex::new(Vec::new()));
+        let base_url = spawn_toolbox(
+            r#"{"updatedData":{"kratosIdentityId":"identity-1","gameAccountBindings":[{"server":"jp","userId":123456789}]}}"#,
+            headers_seen.clone(),
+        )
+        .await;
+        let verifier = PrivateLookupVerifier::from_config(&ToolboxConfig {
+            base_url,
+            verify_cache_ttl_secs: 0,
+            ..ToolboxConfig::default()
+        })
+        .expect("verifier");
+        for _ in 0..2 {
+            verifier
+                .verify_bound_user("identity-1", None, SekaiServerRegion::Jp, "123456789")
+                .await
+                .expect("bound account should verify");
+        }
+        assert_eq!(headers_seen.lock().await.len(), 2);
+    }
+
+    #[test]
+    fn bound_user_cache_expires_and_stays_bounded() {
+        let key = |uid: &str| ("s".to_owned(), SekaiServerRegion::Jp, uid.to_owned());
+        let start = Instant::now();
+        let mut cache = BoundUserCache::new(Duration::from_secs(45), 2);
+        assert!(!cache.is_bound(&key("1"), start));
+        cache.insert(key("1"), start);
+        assert!(cache.is_bound(&key("1"), start + Duration::from_secs(44)));
+        assert!(!cache.is_bound(&key("1"), start + Duration::from_secs(45)));
+        assert!(
+            cache.entries.is_empty(),
+            "expired entries are dropped on read"
+        );
+
+        cache.insert(key("1"), start);
+        cache.insert(key("2"), start + Duration::from_secs(10));
+        // Full of live answers: something is evicted, nothing grows.
+        cache.insert(key("3"), start + Duration::from_secs(20));
+        assert_eq!(cache.entries.len(), 2);
+        assert!(cache.is_bound(&key("3"), start + Duration::from_secs(20)));
+        // Full of expired answers: they are swept instead.
+        cache.insert(key("4"), start + Duration::from_secs(70));
+        assert_eq!(cache.entries.len(), 1);
+        assert!(cache.is_bound(&key("4"), start + Duration::from_secs(70)));
+        // Re-verifying a cached key refreshes it without counting twice.
+        cache.insert(key("5"), start + Duration::from_secs(70));
+        cache.insert(key("5"), start + Duration::from_secs(80));
+        assert_eq!(cache.entries.len(), 2);
+        assert!(cache.is_bound(&key("5"), start + Duration::from_secs(124)));
+
+        let mut disabled = BoundUserCache::new(Duration::ZERO, 2);
+        disabled.insert(key("1"), start);
+        assert!(disabled.entries.is_empty());
     }
 
     pub(crate) async fn spawn_toolbox(

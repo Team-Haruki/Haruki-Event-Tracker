@@ -71,6 +71,8 @@ toolbox:
   auth_proxy_secret: ""      # Toolbox 后端 AUTH_PROXY_TRUSTED_VALUE / Oathkeeper shared secret
   authorization: ""          # 如需兼容旧内部鉴权可填写 Authorization 完整值，通常留空
   user_agent: "Haruki-Event-Tracker/private-lookup"
+  verify_cache_ttl_secs: 45      # 「该登录身份绑定了该区服 UID」的肯定结果在进程内复用的秒数；0 表示每次请求都问 Toolbox。否定结果从不缓存；解绑最多延迟一个 TTL 生效
+  verify_cache_max_entries: 4096 # 进程内肯定结果缓存的条数上限
 
 # ============================================================================
 # 后端 API 服务器配置

@@ -242,13 +242,32 @@ pub struct PrivacyConfig {
     pub uid_anonymization: UidAnonymizationConfig,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct ToolboxConfig {
     pub base_url: String,
     pub auth_proxy_secret: String,
     pub authorization: String,
     pub user_agent: String,
+    /// How long a successful "subject owns this (server, uid)" answer from
+    /// Toolbox is reused before asking again (seconds). `0` asks on every
+    /// request. Rejections are never cached.
+    pub verify_cache_ttl_secs: u64,
+    /// Upper bound on cached positive answers held in memory.
+    pub verify_cache_max_entries: usize,
+}
+
+impl Default for ToolboxConfig {
+    fn default() -> Self {
+        Self {
+            base_url: String::new(),
+            auth_proxy_secret: String::new(),
+            authorization: String::new(),
+            user_agent: String::new(),
+            verify_cache_ttl_secs: 45,
+            verify_cache_max_entries: 4096,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -423,6 +442,8 @@ mod tests {
         assert_eq!(cfg.api_cache.default_ttl_secs, 2);
         assert_eq!(cfg.api_query.trace_global_max_concurrency, 32);
         assert_eq!(cfg.backend.access_log_sample_rate, 1.0);
+        assert_eq!(cfg.toolbox.verify_cache_ttl_secs, 45);
+        assert_eq!(cfg.toolbox.verify_cache_max_entries, 4096);
         assert_eq!(
             TrackerConfig::default().post_end_user_refresh_interval_secs,
             3600
