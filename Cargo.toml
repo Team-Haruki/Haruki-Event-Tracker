@@ -58,6 +58,10 @@ sea-orm = { version = "2.0.0-rc.38", default-features = false, features = [
     "sqlite-use-returning-for-3_35",
 ] }
 sea-query = "=1.0.0-rc.33"
+# Binds sea-query values on a raw sqlx connection (writer flush session).
+sea-query-sqlx = { version = "=0.8.0-rc.15", default-features = false, features = [
+    "sqlx-postgres",
+] }
 
 # Allocator: musl's malloc serialises concurrent allocation, which dominated
 # CPU on large cached responses (see src/main.rs).

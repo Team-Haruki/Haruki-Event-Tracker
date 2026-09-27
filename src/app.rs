@@ -23,7 +23,7 @@ use crate::api::ws_ticket::WsTicketStore;
 use crate::cluster::subscriber::{SubscriberConfig, SubscriberDeps};
 use crate::cluster::{ClusterLink, UpdateBus};
 use crate::config::{ClusterRole, Config, RedisConfig, ServerConfig};
-use crate::db::engine::{DatabaseEngine, EngineError};
+use crate::db::engine::{DatabaseEngine, EngineError, EngineRole};
 use crate::model::enums::SekaiServerRegion;
 use crate::privacy::UidAnonymizer;
 use crate::sekai_api::client::{BuildError as SekaiClientError, HarukiSekaiAPIClient};
@@ -295,8 +295,13 @@ async fn configure_server(
         return Ok(());
     }
     tracing::info!(%server, read_only = role.is_reader(), "connecting database");
+    let engine_role = if role.is_writer() {
+        EngineRole::Writer
+    } else {
+        EngineRole::Serving
+    };
     let engine = Arc::new(
-        DatabaseEngine::connect(&server_cfg.db)
+        DatabaseEngine::connect(&server_cfg.db, engine_role)
             .await?
             .with_read_only(role.is_reader()),
     );
