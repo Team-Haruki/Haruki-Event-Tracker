@@ -1,5 +1,6 @@
 use serde::Deserialize;
 
+use crate::api::cache::CachedJson;
 use crate::api::error::ApiError;
 use crate::api::extract::{ApiAudience, prepare_audience_user_id_mode, resolve_region_engine};
 use crate::api::handler::web::{cached_subject_trace_json, cached_trace_columns_json};
@@ -54,13 +55,14 @@ pub(super) async fn build_subject_trace_response(
         audience,
     )
     .await?;
-    sonic_rs::from_slice(&json).map_err(|err| {
+    sonic_rs::from_slice(&json.bytes).map_err(|err| {
         tracing::warn!(%err, "api cache decoded invalid subject trace");
         ApiError::ServiceUnavailable("api cache decode failed".into())
     })
 }
 
-/// The subject trace as cached JSON bytes (see `cached_subject_trace_json`).
+/// The subject trace as cached JSON bytes with the located `rankData`
+/// range (see `cached_subject_trace_json`).
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn build_subject_trace_json(
     state: AppState,
@@ -71,7 +73,7 @@ pub(super) async fn build_subject_trace_json(
     query: SubjectTraceQuery,
     cache_prefix: &str,
     audience: ApiAudience,
-) -> Result<bytes::Bytes, ApiError> {
+) -> Result<CachedJson, ApiError> {
     let SubjectTraceKey {
         subject_type,
         include_current,
@@ -210,7 +212,7 @@ pub(super) async fn build_subject_trace_columns_json(
             audience,
         ))
         .await?;
-        TraceColumns::from_trace_json(&json).map_err(|err| {
+        TraceColumns::from_trace_json(&json.bytes).map_err(|err| {
             tracing::warn!(%err, "cached subject trace has no usable rankData");
             ApiError::ServiceUnavailable("api cache decode failed".into())
         })

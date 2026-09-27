@@ -35,8 +35,11 @@ api_cache:
   pool_size: 2               # API cache Redis 连接池大小；生产热点可从 4 起观察
   command_timeout_ms: 100    # Redis cache 命令超时；超时后降级查库/回填
   local_control_ttl_ms: 100  # event epoch/dirty 本地短缓存
-  local_value_ttl_ms: 250    # API value 本地短缓存；0 表示禁用 L1 value
-  local_max_entries: 4096
+  local_value_ttl_ms: 250    # epoch key 的 L1 寿命（不超过其 L2 TTL）；0 表示禁用 L1 value
+  local_static_value_ttl_secs: 60 # static/时间桶 key 的 L1 寿命上限（同样不超过 L2 剩余 TTL）；0 表示沿用 local_value_ttl_ms
+  local_max_entries: 4096    # L1 control 条目上限，同时作为 value 条目数的估算；0 表示禁用 L1
+  local_max_bytes: 201326592 # L1 value 字节预算（192 MiB），超出按 S3-FIFO 淘汰
+  local_sweep_interval_ms: 1000 # 定期清扫过期 L1 条目的间隔；0 表示只在读到时清理
   precompress_gzip_enabled: true # 热点 trace JSON 是否缓存 gzip 预压缩响应
   precompress_min_bytes: 4096    # 原始 JSON 小于该值时不预压缩
   gzip_level: 1                  # 预压缩 gzip 等级；1 优先降低 CPU
