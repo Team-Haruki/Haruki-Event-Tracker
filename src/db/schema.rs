@@ -371,7 +371,9 @@ async fn build_covering_index(
     };
     if !dry_run && action != CoveringIndexAction::Skipped {
         if action == CoveringIndexAction::Rebuilt {
-            conn.execute_unprepared(&format!("DROP INDEX \"{}\"", index.name))
+            // CONCURRENTLY, like the build: a plain DROP INDEX takes an
+            // ACCESS EXCLUSIVE lock on a live event table.
+            conn.execute_unprepared(&format!("DROP INDEX CONCURRENTLY \"{}\"", index.name))
                 .await?;
         }
         conn.execute_unprepared(&index.create_sql(true)).await?;

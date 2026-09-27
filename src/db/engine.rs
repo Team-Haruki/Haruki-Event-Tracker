@@ -66,9 +66,7 @@ impl DatabaseEngine {
             .await
             .map_err(EngineError::Connect)?;
         let write_timeout = match role {
-            EngineRole::Writer => parse_simple_duration(&cfg.write_timeout)
-                .or(Some(DEFAULT_WRITE_TIMEOUT))
-                .filter(|d| !d.is_zero()),
+            EngineRole::Writer => writer_timeout(&cfg.write_timeout),
             EngineRole::Serving => None,
         };
         Ok(Self {
@@ -192,6 +190,19 @@ fn parse_backend(dialect: &str) -> Result<DatabaseBackend, EngineError> {
 /// Minimal Go-style duration parser: accepts `<digits><unit>` with units
 /// `ns`/`us`/`µs`/`ms`/`s`/`m`/`h`. No composites (`1h30m`) — Go config files
 /// in this repo only ever use the single-unit form (`1h`, `200ms`).
+/// The writer's flush timeout: `0` (with or without a unit) disables it,
+/// an empty or unparseable value keeps the default.
+fn writer_timeout(raw: &str) -> Option<Duration> {
+    let parsed = if raw.trim() == "0" {
+        Some(Duration::ZERO)
+    } else {
+        parse_simple_duration(raw)
+    };
+    parsed
+        .or(Some(DEFAULT_WRITE_TIMEOUT))
+        .filter(|d| !d.is_zero())
+}
+
 fn parse_simple_duration(s: &str) -> Option<Duration> {
     let s = s.trim();
     if s.is_empty() {
@@ -218,6 +229,17 @@ fn parse_simple_duration(s: &str) -> Option<Duration> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn writer_timeout_zero_disables_with_or_without_unit() {
+        assert_eq!(writer_timeout("0"), None);
+        assert_eq!(writer_timeout(" 0 "), None);
+        assert_eq!(writer_timeout("0s"), None);
+        assert_eq!(writer_timeout("0ms"), None);
+        assert_eq!(writer_timeout(""), Some(DEFAULT_WRITE_TIMEOUT));
+        assert_eq!(writer_timeout("junk"), Some(DEFAULT_WRITE_TIMEOUT));
+        assert_eq!(writer_timeout("8s"), Some(Duration::from_secs(8)));
+    }
 
     #[test]
     fn parses_durations() {

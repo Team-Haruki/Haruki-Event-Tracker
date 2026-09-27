@@ -90,12 +90,16 @@ pub async fn fetch_user_score_samples(
             stmt.and_where(Expr::col((time_tbl, time_id::Column::Timestamp)).lte(end_time));
         }
     }
-    and_where_time_id_within(
-        &mut stmt,
-        Expr::col((tbl.clone(), time_id_col.clone())),
-        intern(TableKind::TimeId, event_id),
-        TimeWindow::new(None, end_time),
-    );
+    if !aligned {
+        // Aligned ids are bounded by `time_id <= end` above; legacy ids go
+        // through the time table's timestamp index.
+        and_where_time_id_within(
+            &mut stmt,
+            Expr::col((tbl.clone(), time_id_col.clone())),
+            intern(TableKind::TimeId, event_id),
+            TimeWindow::new(None, end_time),
+        );
+    }
     stmt.order_by((tbl, time_id_col), Order::Asc);
     ScoreSample::find_by_statement(engine.backend().build(&stmt))
         .all(engine.conn())
