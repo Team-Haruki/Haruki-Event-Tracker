@@ -1,5 +1,6 @@
 pub mod engine;
 pub mod entity;
+pub mod maintenance;
 pub mod pg_session;
 pub mod privacy;
 pub mod query;
