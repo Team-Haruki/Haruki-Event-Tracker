@@ -483,13 +483,31 @@ fn collect_users<'a, I>(
 where
     I: Iterator<Item = &'a PlayerEventRankingRecordSchema>,
 {
-    let mut users = HashMap::new();
+    // A coalesced flush carries several samples of one user; the dimension
+    // row must reflect the newest one (a rename mid-window, a card swap).
+    // Latest timestamp wins, ties go to the later occurrence — the main and
+    // World Bloom buffers are chained, so plain iteration order is not
+    // sample order.
+    let mut latest: HashMap<&str, &PlayerEventRankingRecordSchema> = HashMap::new();
     for r in records {
-        users
-            .entry(r.user_id.clone())
-            .or_insert_with(|| UserDimRow::from_record(server, event_id, anonymizer, r));
+        latest
+            .entry(r.user_id.as_str())
+            .and_modify(|cur| {
+                if r.timestamp >= cur.timestamp {
+                    *cur = r;
+                }
+            })
+            .or_insert(r);
     }
-    users
+    latest
+        .into_iter()
+        .map(|(user_id, r)| {
+            (
+                user_id.to_owned(),
+                UserDimRow::from_record(server, event_id, anonymizer, r),
+            )
+        })
+        .collect()
 }
 
 #[tracing::instrument(skip(engine, records), fields(event_id, n = records.len()))]
@@ -1023,6 +1041,47 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(count.n, 0);
+    }
+
+    #[test]
+    fn collect_users_keeps_the_newest_sample_of_each_user() {
+        let t = 1_710_000_000;
+        let mut newest = record(t + 2, "100", 1, 1_200);
+        newest.name = "renamed".into();
+        newest.cheerful_team_id = Some(2);
+        let mut older = record(t + 1, "100", 1, 1_100);
+        older.name = "old".into();
+        older.cheerful_team_id = Some(1);
+        let mut oldest = record(t, "100", 1, 1_000);
+        oldest.name = "oldest".into();
+        let other = record(t, "200", 2, 900);
+
+        // Main buffer in sample order, then the World Bloom buffer chained
+        // after it carrying an *earlier* sample of the same user.
+        let main = vec![oldest.clone(), newest.clone(), other.clone()];
+        let wl = vec![older.clone()];
+        let users = collect_users(
+            SekaiServerRegion::Jp,
+            1,
+            &UidAnonymizer::disabled(),
+            main.iter().chain(wl.iter()),
+        );
+        assert_eq!(users.len(), 2);
+        assert_eq!(users["100"].name, "renamed");
+        assert_eq!(users["100"].cheerful_team_id, Some(2));
+        assert_eq!(users["200"].name, "player-200");
+
+        // Same timestamp: the later occurrence wins.
+        let mut same_ts = record(t + 2, "100", 1, 1_300);
+        same_ts.name = "later".into();
+        let main = vec![newest, same_ts];
+        let users = collect_users(
+            SekaiServerRegion::Jp,
+            1,
+            &UidAnonymizer::disabled(),
+            main.iter(),
+        );
+        assert_eq!(users["100"].name, "later");
     }
 
     #[tokio::test]
