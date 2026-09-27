@@ -110,7 +110,9 @@ impl TraceRows {
     pub fn is_empty(&self) -> bool {
         match self {
             Self::Rows(rows) => rows.is_empty(),
-            Self::Raw { text, .. } => text.trim_start_matches('[').trim_start().starts_with(']'),
+            Self::Raw { text, .. } => text
+                .strip_prefix('[')
+                .is_some_and(|rest| rest.trim_start().starts_with(']')),
         }
     }
 
@@ -381,6 +383,45 @@ pub struct SubjectTraceResponseSchema {
     pub rank_data: Vec<RecordedRankData>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub user_data: Option<RecordedUserNameSchema>,
+}
+
+/// Every field of a cached `SubjectTraceResponseSchema` except the rows,
+/// which stay a lazily skipped raw slice.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[allow(dead_code)] // decoded only to check the shape
+struct SubjectTraceShape<'a> {
+    meta: LeaderboardMetaSchema,
+    subject: SubjectTraceMetaSchema,
+    #[serde(default)]
+    current: Option<WebRankingItemSchema>,
+    #[serde(borrow, default)]
+    rank_data: Option<sonic_rs::LazyValue<'a>>,
+    #[serde(default)]
+    user_data: Option<RecordedUserNameSchema>,
+}
+
+impl SubjectTraceResponseSchema {
+    /// Whether cached bytes decode as this schema, without decoding every row:
+    /// the small fields are decoded in full, `rankData` must be an array and
+    /// its first row must decode. Cheap enough for every L2 hit, and strict
+    /// enough that typed callers and raw splicing never meet a stale shape.
+    pub fn json_is_well_formed(json: &[u8]) -> sonic_rs::Result<()> {
+        let shape: SubjectTraceShape<'_> = sonic_rs::from_slice(json)?;
+        let Some(rows) = shape.rank_data else {
+            return Ok(());
+        };
+        if !sonic_rs::JsonValueTrait::is_array(&rows) {
+            return Err(<sonic_rs::Error as serde::de::Error>::custom(
+                "rankData is not an array",
+            ));
+        }
+        match sonic_rs::get_from_str(rows.as_raw_str(), sonic_rs::pointer![0]) {
+            Ok(first) => sonic_rs::from_str::<RecordedRankData>(first.as_raw_str()).map(|_| ()),
+            Err(err) if err.is_not_found() => Ok(()),
+            Err(err) => Err(err),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -677,6 +718,58 @@ mod trace_rows_tests {
             TraceRows::from_trace_json(&bytes::Bytes::from_static(br#"{"rankData":{}}"#)).is_err()
         );
         assert!(TraceRows::from_trace_json(&bytes::Bytes::from_static(b"not json")).is_err());
+    }
+
+    #[test]
+    fn raw_is_empty_strips_only_one_bracket() {
+        let nested =
+            TraceRows::from_trace_json(&bytes::Bytes::from_static(br#"{"rankData":[[],[]]}"#))
+                .unwrap();
+        assert!(!nested.is_empty());
+    }
+
+    fn subject_trace(rows: Vec<RecordedRankData>) -> Vec<u8> {
+        sonic_rs::to_vec(&SubjectTraceResponseSchema {
+            meta: LeaderboardMetaSchema {
+                server: "jp".into(),
+                event_id: 1,
+                scope: "total".into(),
+                character_id: None,
+                fetched_at: 1,
+            },
+            subject: SubjectTraceMetaSchema {
+                subject_type: "rank".into(),
+                subject: "3".into(),
+                resolved_user_id: Some("u1".into()),
+                resolved_rank: Some(3),
+            },
+            current: None,
+            rank_data: rows,
+            user_data: None,
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn subject_trace_shape_check_accepts_valid_and_rejects_stale_shapes() {
+        let valid = subject_trace(vec![normal(1), normal(2)]);
+        SubjectTraceResponseSchema::json_is_well_formed(&valid).unwrap();
+        SubjectTraceResponseSchema::json_is_well_formed(&subject_trace(Vec::new())).unwrap();
+        let text = String::from_utf8(valid).unwrap();
+        let rejected = [
+            text.replacen(r#""meta":"#, r#""metaOld":"#, 1),
+            text.replacen(r#""subjectType":"rank""#, r#""subjectType":7"#, 1),
+            text.replacen(r#""rankData":["#, r#""rankData":{"rows":["#, 1)
+                .replacen("]}", "]}}", 1),
+            text.replacen(r#""score":10"#, r#""points":10"#, 1),
+            "not json".to_owned(),
+        ];
+        for bad in rejected {
+            assert!(
+                SubjectTraceResponseSchema::json_is_well_formed(bad.as_bytes()).is_err(),
+                "{bad}"
+            );
+        }
     }
 
     #[test]

@@ -775,7 +775,8 @@ where
 /// A subject trace as the cached JSON bytes of a `SubjectTraceResponseSchema`.
 /// Callers decode it (cloud, profile lookups) or splice its `rankData` array
 /// into a web detail without decoding the rows (`TraceRows::from_trace_json`).
-/// Cached L2 values are checked by locating that array, not by a full decode.
+/// Cached L2 values are checked for shape (every field but the rows, plus the
+/// first row), not by decoding every row.
 pub async fn cached_subject_trace_json<T, Fut>(
     state: &AppState,
     server: &str,
@@ -806,7 +807,7 @@ where
 }
 
 fn subject_trace_json_is_valid(json: &Bytes) -> bool {
-    match crate::model::api::TraceRows::from_trace_json(json) {
+    match crate::model::api::SubjectTraceResponseSchema::json_is_well_formed(json) {
         Ok(_) => true,
         Err(err) => {
             tracing::warn!(%err, "api cache cached subject trace is malformed");
