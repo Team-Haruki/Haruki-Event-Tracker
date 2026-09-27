@@ -98,7 +98,7 @@ GET .../leaderboards/total/private/details/user/{user_id}
 GET .../leaderboards/world-bloom/{character_id}/private/details/user/{user_id}
 ```
 
-Guarded by `private::require_subject`: the subject comes from the WebSocket proxy extension or trusted-proxy (Oathkeeper) headers, and ownership of `(server, user_id)` is verified against the Toolbox backend (`toolbox` config). 401 without a subject.
+Guarded by `private::require_subject`: the subject comes from the WebSocket proxy extension or trusted-proxy (Oathkeeper) headers, and ownership of `(server, user_id)` is verified against the Toolbox backend (`toolbox` config; a positive answer is reused for `verify_cache_ttl_secs`, rejections are re-checked every time). 401 without a subject. Query params: `includeTrace`, `includeProfile`, `cursor`, `limit` — the trace pages exactly like the public detail's `playerTrace` (`cursor` = last seen timestamp, strictly newer rows, `limit` clamped to 10000, oldest first); without `cursor`/`limit` the whole history is returned. A cursor poll with nothing newer is an empty `playerTrace` for a tracked player, not a 404. Responses are never cached.
 
 ### Realtime (WebSocket)
 
