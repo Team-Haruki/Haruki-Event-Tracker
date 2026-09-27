@@ -17,10 +17,10 @@ use crate::db::query::heartbeat::fetch_latest_heartbeat_before;
 use crate::db::query::lines::{fetch_ranking_lines_at, fetch_world_bloom_ranking_lines_at};
 use crate::db::query::user::PublicUserIdMode;
 use crate::db::query::web::{
-    RankSnapshotCut, WebRankingCursor, WebRankingFilter, WebTraceFilter, WebUserSearchFilter,
-    fetch_top_player_growths, fetch_world_bloom_top_player_growths, rank_snapshot_rows,
-    search_rankings, search_user_trace, search_users, search_world_bloom_rankings,
-    search_world_bloom_user_trace, world_bloom_rank_snapshot_rows,
+    RankSnapshotCut, UserProjection, WebRankingCursor, WebRankingFilter, WebTraceFilter,
+    WebUserSearchFilter, fetch_top_player_growths, fetch_world_bloom_top_player_growths,
+    rank_snapshot_rows, search_rankings, search_user_trace, search_users,
+    search_world_bloom_rankings, search_world_bloom_user_trace, world_bloom_rank_snapshot_rows,
 };
 use crate::model::api::{
     EventStatusResponseSchema, RecordedRankData, UserAllRankingDataQueryResponseSchema,
@@ -311,7 +311,15 @@ pub async fn build_overview_until(
     end_time: i64,
 ) -> Result<WebOverviewSchema, ApiError> {
     let at = cut.at;
-    let top_rows = rank_snapshot_rows(engine, event_id, &top_ranks(), cut, mode).await?;
+    let top_rows = rank_snapshot_rows(
+        engine,
+        event_id,
+        &top_ranks(),
+        cut,
+        mode,
+        UserProjection::Profile,
+    )
+    .await?;
     let start_time = end_time - interval;
     let growth_ranks = overview_growth_ranks(SEKAI_EVENT_RANKING_LINES_NORMAL);
     let (top_player_growths, border_lines, rank_growths, status) = tokio::try_join!(
@@ -385,9 +393,16 @@ pub async fn build_world_bloom_overview_until(
     end_time: i64,
 ) -> Result<WebOverviewSchema, ApiError> {
     let at = cut.at;
-    let top_rows =
-        world_bloom_rank_snapshot_rows(engine, event_id, character_id, &top_ranks(), cut, mode)
-            .await?;
+    let top_rows = world_bloom_rank_snapshot_rows(
+        engine,
+        event_id,
+        character_id,
+        &top_ranks(),
+        cut,
+        mode,
+        UserProjection::Profile,
+    )
+    .await?;
     let start_time = end_time - interval;
     let growth_ranks = overview_growth_ranks(SEKAI_EVENT_RANKING_LINES_WORLD_BLOOM);
     let (top_player_growths, border_lines, rank_growths, status) = tokio::try_join!(

@@ -266,12 +266,47 @@ pub(crate) struct PlayerGrowthRow {
     pub(crate) score: i64,
 }
 
-fn select_user_profile_columns(stmt: &mut SelectStatement, users_tbl: Alias) {
+/// Which users-table columns a page row carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UserProjection {
+    /// Name and the whole profile (card, word, honours, missions, frames —
+    /// three of them multi-KB JSON blobs): what web pages show.
+    Profile,
+    /// Name only; the profile fields come back empty. For consumers that
+    /// never look at them (cloud snapshots), so the blobs are not read
+    /// from the users table, decoded, or cached.
+    NameOnly,
+}
+
+fn select_user_profile_columns(
+    stmt: &mut SelectStatement,
+    users_tbl: Alias,
+    projection: UserProjection,
+) {
     stmt.expr_as(
         Expr::col((users_tbl.clone(), event_users::Column::Name)),
         Alias::new("name"),
-    )
-    .expr_as(
+    );
+    if projection == UserProjection::NameOnly {
+        // Typed NULL parameters: the row decoder still sees every column,
+        // and a bare `NULL` literal would be text-typed on PostgreSQL.
+        for (col, null) in [
+            ("cheerful_team_id", Expr::val(None::<i64>)),
+            ("card_id", Expr::val(None::<i64>)),
+            ("card_level", Expr::val(None::<i64>)),
+            ("card_master_rank", Expr::val(None::<i64>)),
+            ("card_special_training_status", Expr::val(None::<String>)),
+            ("card_default_image", Expr::val(None::<String>)),
+            ("profile_word", Expr::val(None::<String>)),
+            ("profile_honors_json", Expr::val(None::<String>)),
+            ("honor_missions_json", Expr::val(None::<String>)),
+            ("player_frames_json", Expr::val(None::<String>)),
+        ] {
+            stmt.expr_as(null, Alias::new(col));
+        }
+        return;
+    }
+    stmt.expr_as(
         Expr::col((users_tbl.clone(), event_users::Column::CheerfulTeamId)),
         Alias::new("cheerful_team_id"),
     )
@@ -342,7 +377,7 @@ fn ranking_select(event_id: i64, mode: PublicUserIdMode) -> SelectStatement {
         Expr::col((event_tbl.clone(), event::Column::Rank)),
         Alias::new("rank"),
     );
-    select_user_profile_columns(&mut stmt, users_tbl.clone());
+    select_user_profile_columns(&mut stmt, users_tbl.clone(), UserProjection::Profile);
     stmt.from(event_tbl.clone())
         .inner_join(
             time_tbl.clone(),
@@ -387,7 +422,7 @@ fn world_bloom_select(event_id: i64, mode: PublicUserIdMode) -> SelectStatement 
         Expr::col((wl_tbl.clone(), world_bloom::Column::CharacterId)),
         Alias::new("character_id"),
     );
-    select_user_profile_columns(&mut stmt, users_tbl.clone());
+    select_user_profile_columns(&mut stmt, users_tbl.clone(), UserProjection::Profile);
     stmt.from(wl_tbl.clone())
         .inner_join(
             time_tbl.clone(),
@@ -615,6 +650,7 @@ pub(crate) fn latest_rank_window_select(
     event_id: i64,
     filter: &WebRankingFilter,
     mode: PublicUserIdMode,
+    projection: UserProjection,
 ) -> SelectStatement {
     let latest = match window_rank_keys(filter) {
         Some(ranks) => edge_keys_select(&EdgeSpec {
@@ -632,7 +668,7 @@ pub(crate) fn latest_rank_window_select(
         }),
         None => grouped_latest_rank(backend, event_id, filter, true),
     };
-    latest_rank_window_join(event_id, filter, mode, latest)
+    latest_rank_window_join(event_id, filter, mode, projection, latest)
 }
 
 /// `MAX(time_id) GROUP BY rank`: the fallback for rank windows too wide
@@ -711,6 +747,7 @@ pub(crate) fn latest_rank_window_join(
     event_id: i64,
     filter: &WebRankingFilter,
     mode: PublicUserIdMode,
+    projection: UserProjection,
     latest: SelectStatement,
 ) -> SelectStatement {
     let event_tbl = Alias::new(intern(TableKind::Event, event_id));
@@ -739,7 +776,7 @@ pub(crate) fn latest_rank_window_join(
         Expr::col((event_tbl.clone(), event::Column::Rank)),
         Alias::new("rank"),
     );
-    select_user_profile_columns(&mut stmt, users_tbl.clone());
+    select_user_profile_columns(&mut stmt, users_tbl.clone(), projection);
     stmt.from(event_tbl.clone())
         .inner_join(
             time_tbl.clone(),
@@ -789,6 +826,7 @@ fn latest_world_bloom_rank_window_select(
     character_id: i64,
     filter: &WebRankingFilter,
     mode: PublicUserIdMode,
+    projection: UserProjection,
 ) -> SelectStatement {
     let latest = match window_rank_keys(filter) {
         Some(ranks) => edge_keys_select(&EdgeSpec {
@@ -806,7 +844,7 @@ fn latest_world_bloom_rank_window_select(
         }),
         None => grouped_latest_world_bloom_rank(backend, event_id, character_id, filter, true),
     };
-    latest_world_bloom_rank_window_join(event_id, character_id, filter, mode, latest)
+    latest_world_bloom_rank_window_join(event_id, character_id, filter, mode, projection, latest)
 }
 
 pub(crate) fn grouped_latest_world_bloom_rank(
@@ -880,6 +918,7 @@ pub(crate) fn latest_world_bloom_rank_window_join(
     character_id: i64,
     filter: &WebRankingFilter,
     mode: PublicUserIdMode,
+    projection: UserProjection,
     latest: SelectStatement,
 ) -> SelectStatement {
     let wl_tbl = Alias::new(intern(TableKind::WorldBloom, event_id));
@@ -912,7 +951,7 @@ pub(crate) fn latest_world_bloom_rank_window_join(
         Expr::col((wl_tbl.clone(), world_bloom::Column::CharacterId)),
         Alias::new("character_id"),
     );
-    select_user_profile_columns(&mut stmt, users_tbl.clone());
+    select_user_profile_columns(&mut stmt, users_tbl.clone(), projection);
     stmt.from(wl_tbl.clone())
         .inner_join(
             time_tbl.clone(),
@@ -984,7 +1023,13 @@ pub async fn search_ranking_rows(
     let time_tbl = Alias::new(intern(TableKind::TimeId, event_id));
     let users_tbl = Alias::new(intern(TableKind::EventUsers, event_id));
     let stmt = if filter.is_rank_window() {
-        latest_rank_window_select(engine.backend(), event_id, filter, mode)
+        latest_rank_window_select(
+            engine.backend(),
+            event_id,
+            filter,
+            mode,
+            UserProjection::Profile,
+        )
     } else {
         let mut stmt = ranking_select(event_id, mode);
         apply_common_filters(
@@ -1060,6 +1105,7 @@ pub async fn search_world_bloom_ranking_rows(
             character_id,
             filter,
             mode,
+            UserProjection::Profile,
         )
     } else {
         let mut stmt = world_bloom_select(event_id, mode);
@@ -1205,7 +1251,8 @@ fn dedupe_snapshot<R>(rows: Vec<R>, rank: impl Fn(&R) -> i64, user: impl Fn(&R) 
 /// The ranking at one consistent cut: for each requested rank, its latest
 /// row within `cut`, unless that row's player has a newer row elsewhere
 /// (then the rank is left out rather than show the player twice). Ranks
-/// without rows are absent too. Ordered by rank.
+/// without rows are absent too. Ordered by rank. `projection` picks how
+/// much of the users row comes along.
 #[tracing::instrument(skip(engine, ranks), fields(event_id, n = ranks.len()))]
 pub async fn rank_snapshot_rows(
     engine: &DatabaseEngine,
@@ -1213,12 +1260,13 @@ pub async fn rank_snapshot_rows(
     ranks: &[i64],
     cut: RankSnapshotCut,
     mode: PublicUserIdMode,
+    projection: UserProjection,
 ) -> Result<Vec<RankingPageRow>, DbErr> {
     if ranks.is_empty() {
         return Ok(Vec::new());
     }
     let filter = rank_snapshot_filter(ranks, cut);
-    let stmt = latest_rank_window_select(engine.backend(), event_id, &filter, mode);
+    let stmt = latest_rank_window_select(engine.backend(), event_id, &filter, mode, projection);
     let rows = RankingPageRow::find_by_statement(engine.backend().build(&stmt))
         .all(engine.conn())
         .await?;
@@ -1234,6 +1282,7 @@ pub async fn world_bloom_rank_snapshot_rows(
     ranks: &[i64],
     cut: RankSnapshotCut,
     mode: PublicUserIdMode,
+    projection: UserProjection,
 ) -> Result<Vec<WorldBloomRankingPageRow>, DbErr> {
     if ranks.is_empty() {
         return Ok(Vec::new());
@@ -1245,6 +1294,7 @@ pub async fn world_bloom_rank_snapshot_rows(
         character_id,
         &filter,
         mode,
+        projection,
     );
     let rows = WorldBloomRankingPageRow::find_by_statement(engine.backend().build(&stmt))
         .all(engine.conn())

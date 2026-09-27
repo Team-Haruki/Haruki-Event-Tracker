@@ -10,8 +10,8 @@ use crate::db::query::growth::{
 };
 use crate::db::query::user::PublicUserIdMode;
 use crate::db::query::web::{
-    RankSnapshotCut, is_missing_table_error, latest_rank_cut, rank_snapshot_rows, user_rank_as_of,
-    world_bloom_rank_snapshot_rows,
+    RankSnapshotCut, UserProjection, is_missing_table_error, latest_rank_cut, rank_snapshot_rows,
+    user_rank_as_of, world_bloom_rank_snapshot_rows,
 };
 use crate::model::api::{
     RankSnapshotSchema, RankSnapshotsResponseSchema, RankingScoreGrowthSchema, WebRankingItemSchema,
@@ -95,8 +95,22 @@ pub(super) async fn build_rank_snapshots_response(
     let fetch = async {
         let mode =
             prepare_audience_user_id_mode(&state, &engine, region, event_id, audience).await?;
-        let current =
-            fetch_snapshot_items(&engine, event_id, character_id, &all_ranks, mode, cut).await?;
+        // Cloud consumers read only the name off a snapshot row
+        // (`cloud::cloud_info_from_item`); the web keeps the profile.
+        let projection = match audience {
+            ApiAudience::Cloud => UserProjection::NameOnly,
+            ApiAudience::Web => UserProjection::Profile,
+        };
+        let current = fetch_snapshot_items(
+            &engine,
+            event_id,
+            character_id,
+            &all_ranks,
+            mode,
+            cut,
+            projection,
+        )
+        .await?;
         let metrics = if include_metrics {
             fetch_snapshot_metrics(
                 &engine,
@@ -148,16 +162,23 @@ async fn fetch_snapshot_items(
     ranks: &[i64],
     mode: PublicUserIdMode,
     cut: RankSnapshotCut,
+    projection: UserProjection,
 ) -> Result<BTreeMap<i64, WebRankingItemSchema>, ApiError> {
     let items: Vec<WebRankingItemSchema> = match character_id {
-        Some(character_id) => {
-            world_bloom_rank_snapshot_rows(engine, event_id, character_id, ranks, cut, mode)
-                .await?
-                .into_iter()
-                .map(|row| row.into_web_item())
-                .collect()
-        }
-        None => rank_snapshot_rows(engine, event_id, ranks, cut, mode)
+        Some(character_id) => world_bloom_rank_snapshot_rows(
+            engine,
+            event_id,
+            character_id,
+            ranks,
+            cut,
+            mode,
+            projection,
+        )
+        .await?
+        .into_iter()
+        .map(|row| row.into_web_item())
+        .collect(),
+        None => rank_snapshot_rows(engine, event_id, ranks, cut, mode, projection)
             .await?
             .into_iter()
             .map(|row| row.into_web_item())

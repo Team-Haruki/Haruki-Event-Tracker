@@ -16,12 +16,12 @@ use crate::db::query::ranking::{fetch_all_rankings, fetch_latest_ranking};
 use crate::db::query::score_samples::{ScoreSample, fetch_user_score_samples};
 use crate::db::query::user::PublicUserIdMode;
 use crate::db::query::web::{
-    PlayerGrowthRow, RankSnapshotCut, RankingPageRow, WebRankingCursor, WebRankingFilter,
-    WebTraceFilter, WorldBloomRankingPageRow, earliest_player_rows_select, grouped_latest_rank,
-    grouped_latest_world_bloom_rank, latest_rank_window_join, latest_world_bloom_rank_window_join,
-    legacy_player_rows_select, search_rank_trace, search_ranking_rows, search_user_trace,
-    search_world_bloom_rank_trace, search_world_bloom_ranking_rows, search_world_bloom_user_trace,
-    user_rank_as_of,
+    PlayerGrowthRow, RankSnapshotCut, RankingPageRow, UserProjection, WebRankingCursor,
+    WebRankingFilter, WebTraceFilter, WorldBloomRankingPageRow, earliest_player_rows_select,
+    grouped_latest_rank, grouped_latest_world_bloom_rank, latest_rank_window_join,
+    latest_world_bloom_rank_window_join, legacy_player_rows_select, search_rank_trace,
+    search_ranking_rows, search_user_trace, search_world_bloom_rank_trace,
+    search_world_bloom_ranking_rows, search_world_bloom_user_trace, user_rank_as_of,
 };
 use crate::db::query::world_bloom::{
     fetch_all_world_bloom_rankings, fetch_latest_world_bloom_ranking,
@@ -494,12 +494,14 @@ async fn check_rank_window(engine: &DatabaseEngine, fx: &Fixture, rng: &mut Rng)
         fx.event_id,
         &filter,
         mode,
+        UserProjection::Profile,
         grouped_latest_rank(backend, fx.event_id, &filter, false),
     );
     let bounded_stmt = latest_rank_window_join(
         fx.event_id,
         &filter,
         mode,
+        UserProjection::Profile,
         grouped_latest_rank(backend, fx.event_id, &filter, true),
     );
     let mut old: Vec<RankingPageRow> = fetch(engine, &old_stmt).await;
@@ -523,6 +525,7 @@ async fn check_rank_window(engine: &DatabaseEngine, fx: &Fixture, rng: &mut Rng)
         character_id,
         &filter,
         mode,
+        UserProjection::Profile,
         grouped_latest_world_bloom_rank(backend, fx.event_id, character_id, &filter, false),
     );
     let mut old: Vec<WorldBloomRankingPageRow> = fetch(engine, &old_stmt).await;
