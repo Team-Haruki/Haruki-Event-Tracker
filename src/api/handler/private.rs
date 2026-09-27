@@ -388,7 +388,7 @@ async fn web_user_detail_for_scope(
         current,
         previous,
         next,
-        player_trace,
+        player_trace: player_trace.into(),
         profile,
     }))
 }
@@ -577,7 +577,7 @@ mod tests {
         .0;
         assert!(total.current.is_some());
         assert!(total.next.is_some());
-        assert_eq!(total.player_trace.len(), 2);
+        assert_eq!(total.player_trace.rows().len(), 2);
         assert_eq!(total.profile.unwrap().user_id, "100");
 
         let world = web_world_bloom_user_detail(
@@ -624,10 +624,11 @@ mod tests {
             assert!(detail.current.is_none());
             assert!(detail.previous.is_none());
             assert!(detail.next.is_none());
-            assert_eq!(detail.player_trace.len(), 2);
+            assert_eq!(detail.player_trace.rows().len(), 2);
             assert!(
                 detail
                     .player_trace
+                    .rows()
                     .iter()
                     .all(|row| user_id_of(row) == "100")
             );

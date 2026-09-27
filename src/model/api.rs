@@ -28,11 +28,139 @@ pub struct RecordedWorldBloomRankingSchema {
     pub character_id: Option<i64>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(untagged)]
 pub enum RecordedRankData {
     Normal(RecordedRankingSchema),
     WorldBloom(RecordedWorldBloomRankingSchema),
+}
+
+/// Decodes each row once into the superset shape and picks the variant by
+/// `characterId`. Untagged deserialization buffered every row into an
+/// intermediate tree first (slow and allocation-heavy on large cached traces)
+/// and, because `Normal` accepts unknown fields, decoded World Bloom rows as
+/// `Normal`, dropping `characterId` from every cached World Bloom trace.
+impl<'de> Deserialize<'de> for RecordedRankData {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let row = RecordedWorldBloomRankingSchema::deserialize(deserializer)?;
+        Ok(match row.character_id {
+            Some(_) => RecordedRankData::WorldBloom(row),
+            None => RecordedRankData::Normal(RecordedRankingSchema {
+                timestamp: row.timestamp,
+                user_id: row.user_id,
+                score: row.score,
+                rank: row.rank,
+            }),
+        })
+    }
+}
+
+/// The trace rows of a web detail response. A cached trace is spliced in as
+/// its raw `rankData` JSON array (`Raw`), so serving a detail never decodes
+/// and re-encodes thousands of rows per request; `Rows` holds typed rows.
+///
+/// `Raw` serializes verbatim only through sonic-rs (the service's JSON
+/// encoder); other serializers would see sonic's lazy-value wrapper.
+#[derive(Debug, Clone)]
+pub enum TraceRows {
+    Rows(Vec<RecordedRankData>),
+    Raw {
+        /// The array's JSON text, used to decode on demand.
+        text: sonic_rs::FastStr,
+        /// The same array, serialized verbatim.
+        value: sonic_rs::OwnedLazyValue,
+    },
+}
+
+impl Default for TraceRows {
+    fn default() -> Self {
+        Self::Rows(Vec::new())
+    }
+}
+
+impl From<Vec<RecordedRankData>> for TraceRows {
+    fn from(rows: Vec<RecordedRankData>) -> Self {
+        Self::Rows(rows)
+    }
+}
+
+impl TraceRows {
+    /// Borrows the `rankData` array of a cached trace response without
+    /// decoding its rows. A response without `rankData` has no rows.
+    pub fn from_trace_json(json: &bytes::Bytes) -> sonic_rs::Result<Self> {
+        let value = match sonic_rs::get_from_bytes(json, ["rankData"]) {
+            Ok(value) => value,
+            Err(err) if err.is_not_found() => return Ok(Self::default()),
+            Err(err) => return Err(err),
+        };
+        if !sonic_rs::JsonValueTrait::is_array(&value) {
+            return Err(<sonic_rs::Error as serde::de::Error>::custom(
+                "rankData is not an array",
+            ));
+        }
+        Ok(Self::Raw {
+            text: value.as_raw_faststr(),
+            value: value.into(),
+        })
+    }
+
+    pub fn is_empty(&self) -> bool {
+        match self {
+            Self::Rows(rows) => rows.is_empty(),
+            Self::Raw { text, .. } => text
+                .strip_prefix('[')
+                .is_some_and(|rest| rest.trim_start().starts_with(']')),
+        }
+    }
+
+    /// The rows, decoding a raw array (O(rows); not for the hot path).
+    pub fn to_rows(&self) -> sonic_rs::Result<std::borrow::Cow<'_, [RecordedRankData]>> {
+        match self {
+            Self::Rows(rows) => Ok(std::borrow::Cow::Borrowed(rows)),
+            Self::Raw { text, .. } => sonic_rs::from_str(text).map(std::borrow::Cow::Owned),
+        }
+    }
+
+    /// Decoded rows for assertions.
+    #[cfg(test)]
+    pub fn rows(&self) -> Vec<RecordedRankData> {
+        self.to_rows().expect("trace rows decode").into_owned()
+    }
+
+    /// Mutable typed rows, decoding a raw array in place first.
+    pub fn rows_mut(&mut self) -> sonic_rs::Result<&mut Vec<RecordedRankData>> {
+        if let Self::Raw { text, .. } = self {
+            *self = Self::Rows(sonic_rs::from_str(text)?);
+        }
+        match self {
+            Self::Rows(rows) => Ok(rows),
+            Self::Raw { .. } => unreachable!("raw rows were just decoded"),
+        }
+    }
+}
+
+impl Serialize for TraceRows {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match self {
+            Self::Rows(rows) => rows.serialize(serializer),
+            Self::Raw { value, .. } => value.serialize(serializer),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for TraceRows {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Vec::<RecordedRankData>::deserialize(deserializer).map(Self::Rows)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -257,6 +385,45 @@ pub struct SubjectTraceResponseSchema {
     pub user_data: Option<RecordedUserNameSchema>,
 }
 
+/// Every field of a cached `SubjectTraceResponseSchema` except the rows,
+/// which stay a lazily skipped raw slice.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[allow(dead_code)] // decoded only to check the shape
+struct SubjectTraceShape<'a> {
+    meta: LeaderboardMetaSchema,
+    subject: SubjectTraceMetaSchema,
+    #[serde(default)]
+    current: Option<WebRankingItemSchema>,
+    #[serde(borrow, default)]
+    rank_data: Option<sonic_rs::LazyValue<'a>>,
+    #[serde(default)]
+    user_data: Option<RecordedUserNameSchema>,
+}
+
+impl SubjectTraceResponseSchema {
+    /// Whether cached bytes decode as this schema, without decoding every row:
+    /// the small fields are decoded in full, `rankData` must be an array and
+    /// its first row must decode. Cheap enough for every L2 hit, and strict
+    /// enough that typed callers and raw splicing never meet a stale shape.
+    pub fn json_is_well_formed(json: &[u8]) -> sonic_rs::Result<()> {
+        let shape: SubjectTraceShape<'_> = sonic_rs::from_slice(json)?;
+        let Some(rows) = shape.rank_data else {
+            return Ok(());
+        };
+        if !sonic_rs::JsonValueTrait::is_array(&rows) {
+            return Err(<sonic_rs::Error as serde::de::Error>::custom(
+                "rankData is not an array",
+            ));
+        }
+        match sonic_rs::get_from_str(rows.as_raw_str(), sonic_rs::pointer![0]) {
+            Ok(first) => sonic_rs::from_str::<RecordedRankData>(first.as_raw_str()).map(|_| ()),
+            Err(err) if err.is_not_found() => Ok(()),
+            Err(err) => Err(err),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CloudRankInfoSchema {
@@ -350,10 +517,10 @@ pub struct WebRankDetailResponseSchema {
     pub next: Option<WebRankingItemSchema>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metrics: Option<RankingScoreGrowthSchema>,
-    #[serde(skip_serializing_if = "Vec::is_empty", default)]
-    pub rank_trace: Vec<RecordedRankData>,
-    #[serde(skip_serializing_if = "Vec::is_empty", default)]
-    pub player_trace: Vec<RecordedRankData>,
+    #[serde(skip_serializing_if = "TraceRows::is_empty", default)]
+    pub rank_trace: TraceRows,
+    #[serde(skip_serializing_if = "TraceRows::is_empty", default)]
+    pub player_trace: TraceRows,
     pub interval_seconds: i64,
     pub window_start: i64,
     pub window_end: i64,
@@ -385,8 +552,8 @@ pub struct WebUserDetailResponseSchema {
     pub previous: Option<WebRankingItemSchema>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next: Option<WebRankingItemSchema>,
-    #[serde(skip_serializing_if = "Vec::is_empty", default)]
-    pub player_trace: Vec<RecordedRankData>,
+    #[serde(skip_serializing_if = "TraceRows::is_empty", default)]
+    pub player_trace: TraceRows,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub profile: Option<RecordedUserNameSchema>,
 }
@@ -448,5 +615,171 @@ mod tests {
         let bytes = sonic_rs::to_vec(&response).unwrap();
         let decoded: LeaderboardOverviewSchema = sonic_rs::from_slice(&bytes).unwrap();
         assert_eq!(decoded.overview.top_rankings.len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod trace_rows_tests {
+    use super::*;
+
+    fn normal(ts: i64) -> RecordedRankData {
+        RecordedRankData::Normal(RecordedRankingSchema {
+            timestamp: ts,
+            user_id: "u1".into(),
+            score: ts * 10,
+            rank: 3,
+        })
+    }
+
+    fn world_bloom(ts: i64) -> RecordedRankData {
+        RecordedRankData::WorldBloom(RecordedWorldBloomRankingSchema {
+            timestamp: ts,
+            user_id: "u2".into(),
+            score: ts * 20,
+            rank: 5,
+            character_id: Some(17),
+        })
+    }
+
+    #[derive(Serialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Detail {
+        #[serde(skip_serializing_if = "TraceRows::is_empty")]
+        rank_trace: TraceRows,
+        tail: i64,
+    }
+
+    fn trace_json(rows: Vec<RecordedRankData>) -> bytes::Bytes {
+        let trace = UserAllRankingDataQueryResponseSchema {
+            rank_data: rows,
+            user_data: None,
+        };
+        bytes::Bytes::from(sonic_rs::to_vec(&trace).unwrap())
+    }
+
+    #[test]
+    fn rank_data_decode_keeps_world_bloom_character_id() {
+        let rows = vec![normal(1), world_bloom(2)];
+        let json = sonic_rs::to_string(&rows).unwrap();
+        let back: Vec<RecordedRankData> = sonic_rs::from_str(&json).unwrap();
+        assert!(matches!(back[0], RecordedRankData::Normal(_)));
+        match &back[1] {
+            RecordedRankData::WorldBloom(row) => assert_eq!(row.character_id, Some(17)),
+            RecordedRankData::Normal(_) => panic!("world bloom row decoded as normal"),
+        }
+        assert_eq!(sonic_rs::to_string(&back).unwrap(), json);
+        let via_serde_json: Vec<RecordedRankData> = serde_json::from_str(&json).unwrap();
+        assert_eq!(sonic_rs::to_string(&via_serde_json).unwrap(), json);
+    }
+
+    #[test]
+    fn raw_trace_rows_serialize_like_typed_rows() {
+        for rows in [
+            vec![normal(1), normal(2)],
+            vec![world_bloom(1), world_bloom(2)],
+        ] {
+            let raw = TraceRows::from_trace_json(&trace_json(rows.clone())).unwrap();
+            assert!(matches!(raw, TraceRows::Raw { .. }));
+            assert!(!raw.is_empty());
+            let spliced = sonic_rs::to_string(&Detail {
+                rank_trace: raw.clone(),
+                tail: 7,
+            })
+            .unwrap();
+            let typed = sonic_rs::to_string(&Detail {
+                rank_trace: rows.clone().into(),
+                tail: 7,
+            })
+            .unwrap();
+            assert_eq!(spliced, typed);
+            assert_eq!(
+                sonic_rs::to_string(&raw.rows()).unwrap(),
+                sonic_rs::to_string(&rows).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn raw_trace_rows_handle_empty_missing_and_malformed_rank_data() {
+        let missing = TraceRows::from_trace_json(&trace_json(Vec::new())).unwrap();
+        assert!(missing.is_empty());
+        let empty =
+            TraceRows::from_trace_json(&bytes::Bytes::from_static(br#"{"rankData":[ ]}"#)).unwrap();
+        assert!(empty.is_empty());
+        assert_eq!(
+            sonic_rs::to_string(&Detail {
+                rank_trace: empty,
+                tail: 1
+            })
+            .unwrap(),
+            r#"{"tail":1}"#
+        );
+        assert!(
+            TraceRows::from_trace_json(&bytes::Bytes::from_static(br#"{"rankData":{}}"#)).is_err()
+        );
+        assert!(TraceRows::from_trace_json(&bytes::Bytes::from_static(b"not json")).is_err());
+    }
+
+    #[test]
+    fn raw_is_empty_strips_only_one_bracket() {
+        let nested =
+            TraceRows::from_trace_json(&bytes::Bytes::from_static(br#"{"rankData":[[],[]]}"#))
+                .unwrap();
+        assert!(!nested.is_empty());
+    }
+
+    fn subject_trace(rows: Vec<RecordedRankData>) -> Vec<u8> {
+        sonic_rs::to_vec(&SubjectTraceResponseSchema {
+            meta: LeaderboardMetaSchema {
+                server: "jp".into(),
+                event_id: 1,
+                scope: "total".into(),
+                character_id: None,
+                fetched_at: 1,
+            },
+            subject: SubjectTraceMetaSchema {
+                subject_type: "rank".into(),
+                subject: "3".into(),
+                resolved_user_id: Some("u1".into()),
+                resolved_rank: Some(3),
+            },
+            current: None,
+            rank_data: rows,
+            user_data: None,
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn subject_trace_shape_check_accepts_valid_and_rejects_stale_shapes() {
+        let valid = subject_trace(vec![normal(1), normal(2)]);
+        SubjectTraceResponseSchema::json_is_well_formed(&valid).unwrap();
+        SubjectTraceResponseSchema::json_is_well_formed(&subject_trace(Vec::new())).unwrap();
+        let text = String::from_utf8(valid).unwrap();
+        let rejected = [
+            text.replacen(r#""meta":"#, r#""metaOld":"#, 1),
+            text.replacen(r#""subjectType":"rank""#, r#""subjectType":7"#, 1),
+            text.replacen(r#""rankData":["#, r#""rankData":{"rows":["#, 1)
+                .replacen("]}", "]}}", 1),
+            text.replacen(r#""score":10"#, r#""points":10"#, 1),
+            "not json".to_owned(),
+        ];
+        for bad in rejected {
+            assert!(
+                SubjectTraceResponseSchema::json_is_well_formed(bad.as_bytes()).is_err(),
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn rows_mut_decodes_raw_rows_in_place() {
+        let mut rows = TraceRows::from_trace_json(&trace_json(vec![normal(1)])).unwrap();
+        rows.rows_mut().unwrap()[0] = normal(9);
+        assert!(matches!(rows, TraceRows::Rows(_)));
+        assert_eq!(
+            sonic_rs::to_string(&rows).unwrap(),
+            sonic_rs::to_string(&vec![normal(9)]).unwrap()
+        );
     }
 }

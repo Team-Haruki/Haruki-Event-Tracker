@@ -772,25 +772,47 @@ where
     }
 }
 
-pub async fn cached_trace<T, Fut>(
+/// A subject trace as the cached JSON bytes of a `SubjectTraceResponseSchema`.
+/// Callers decode it (cloud, profile lookups) or splice its `rankData` array
+/// into a web detail without decoding the rows (`TraceRows::from_trace_json`).
+/// Cached L2 values are checked for shape (every field but the rows, plus the
+/// first row), not by decoding every row.
+pub async fn cached_subject_trace_json<T, Fut>(
     state: &AppState,
     server: &str,
     event_id: i64,
     suffix: String,
     fetch: Fut,
-) -> Result<T, ApiError>
+) -> Result<Bytes, ApiError>
 where
-    T: serde::Serialize + serde::de::DeserializeOwned,
+    T: serde::Serialize,
     Fut: std::future::Future<Output = Result<T, ApiError>>,
 {
     if let Some(cache) = state.cache() {
         let ttl_secs = cache.ttl(CacheTtl::TraceRank);
         let suffix = trace_bucketed_suffix(&suffix, ttl_secs, chrono::Utc::now().timestamp());
         cache
-            .get_or_fetch_static(server, event_id, suffix, ttl_secs, fetch)
+            .get_or_fetch_static_json_bytes_checked(
+                server,
+                event_id,
+                suffix,
+                ttl_secs,
+                Some(subject_trace_json_is_valid),
+                fetch,
+            )
             .await
     } else {
-        fetch.await
+        encode_fetched(fetch).await
+    }
+}
+
+fn subject_trace_json_is_valid(json: &Bytes) -> bool {
+    match crate::model::api::SubjectTraceResponseSchema::json_is_well_formed(json) {
+        Ok(_) => true,
+        Err(err) => {
+            tracing::warn!(%err, "api cache cached subject trace is malformed");
+            false
+        }
     }
 }
 

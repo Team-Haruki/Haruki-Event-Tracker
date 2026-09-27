@@ -2,7 +2,7 @@ use serde::Deserialize;
 
 use crate::api::error::ApiError;
 use crate::api::extract::{ApiAudience, prepare_audience_user_id_mode, resolve_region_engine};
-use crate::api::handler::web::cached_trace;
+use crate::api::handler::web::cached_subject_trace_json;
 use crate::api::state::AppState;
 use crate::db::engine::DatabaseEngine;
 use crate::db::query::ranking::{fetch_latest_ranking, fetch_latest_ranking_by_rank};
@@ -42,6 +42,35 @@ pub(super) async fn build_subject_trace_response(
     cache_prefix: &str,
     audience: ApiAudience,
 ) -> Result<SubjectTraceResponseSchema, ApiError> {
+    let json = build_subject_trace_json(
+        state,
+        server,
+        event_id,
+        character_id,
+        subject,
+        query,
+        cache_prefix,
+        audience,
+    )
+    .await?;
+    sonic_rs::from_slice(&json).map_err(|err| {
+        tracing::warn!(%err, "api cache decoded invalid subject trace");
+        ApiError::ServiceUnavailable("api cache decode failed".into())
+    })
+}
+
+/// The subject trace as cached JSON bytes (see `cached_subject_trace_json`).
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn build_subject_trace_json(
+    state: AppState,
+    server: String,
+    event_id: i64,
+    character_id: Option<i64>,
+    subject: String,
+    query: SubjectTraceQuery,
+    cache_prefix: &str,
+    audience: ApiAudience,
+) -> Result<bytes::Bytes, ApiError> {
     let subject_type = query.subject_type.as_deref().unwrap_or("user");
     let include_current = query.include_current.unwrap_or(true);
     // Cloud subjects are raw upstream UIDs; keep those out of the Redis
@@ -148,7 +177,7 @@ pub(super) async fn build_subject_trace_response(
             user_data,
         })
     };
-    cached_trace(&state, &cache_server, event_id, suffix, fetch).await
+    cached_subject_trace_json(&state, &cache_server, event_id, suffix, fetch).await
 }
 
 pub(super) fn hashed_subject(subject: &str) -> String {

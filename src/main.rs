@@ -11,6 +11,12 @@ use haruki_event_tracker::db::repair::repair_time_ids;
 use haruki_event_tracker::model::enums::SekaiServerRegion;
 use haruki_event_tracker::{api, app, config, logger, shutdown};
 
+/// The release image is a musl build, whose malloc serialises allocations
+/// across threads: under concurrent load, decoding and encoding large cached
+/// payloads spent most of its CPU contending on the allocator lock.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
 
 #[tokio::main]

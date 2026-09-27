@@ -253,6 +253,27 @@ impl ApiCache {
         T: Serialize,
         Fut: Future<Output = Result<T, ApiError>>,
     {
+        self.get_or_fetch_static_json_bytes_checked(server, event_id, suffix, ttl_secs, None, fetch)
+            .await
+    }
+
+    /// Like [`Self::get_or_fetch_static_json_bytes`], treating an L2 value
+    /// that fails `validate` as a miss. Callers that consume the bytes
+    /// without decoding them into `T` pass a check cheaper than a full
+    /// typed decode.
+    pub async fn get_or_fetch_static_json_bytes_checked<T, Fut>(
+        &self,
+        server: &str,
+        event_id: i64,
+        suffix: String,
+        ttl_secs: u64,
+        validate: Option<fn(&Bytes) -> bool>,
+        fetch: Fut,
+    ) -> Result<Bytes, ApiError>
+    where
+        T: Serialize,
+        Fut: Future<Output = Result<T, ApiError>>,
+    {
         let fetch_bytes = async move {
             let value = fetch.await?;
             encode_json_bytes(&value)
@@ -266,7 +287,7 @@ impl ApiCache {
             CacheOptions {
                 max_value_bytes: self.cfg.batch_max_value_bytes,
                 is_batch: false,
-                validate_cached_bytes: None,
+                validate_cached_bytes: validate,
             },
         )
         .await
