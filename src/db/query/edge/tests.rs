@@ -457,6 +457,7 @@ fn expected_search(fx: &Fixture, rows: &[Row], f: &WebRankingFilter) -> Vec<(i64
 async fn check_rank_edges(engine: &DatabaseEngine, fx: &Fixture, rng: &mut Rng) {
     let character_id = rng.chance(50).then(|| CHARACTERS[rng.below(2) as usize]);
     let spec = RankEdgeSpec {
+        backend: engine.backend(),
         tbl: match character_id {
             Some(_) => intern(TableKind::WorldBloom, fx.event_id),
             None => intern(TableKind::Event, fx.event_id),
@@ -488,17 +489,18 @@ async fn check_rank_window(engine: &DatabaseEngine, fx: &Fixture, rng: &mut Rng)
     let (new, _) = search_ranking_rows(engine, fx.event_id, &filter, mode)
         .await
         .unwrap();
+    let backend = engine.backend();
     let old_stmt = latest_rank_window_join(
         fx.event_id,
         &filter,
         mode,
-        grouped_latest_rank(fx.event_id, &filter, false),
+        grouped_latest_rank(backend, fx.event_id, &filter, false),
     );
     let bounded_stmt = latest_rank_window_join(
         fx.event_id,
         &filter,
         mode,
-        grouped_latest_rank(fx.event_id, &filter, true),
+        grouped_latest_rank(backend, fx.event_id, &filter, true),
     );
     let mut old: Vec<RankingPageRow> = fetch(engine, &old_stmt).await;
     let mut bounded: Vec<RankingPageRow> = fetch(engine, &bounded_stmt).await;
@@ -521,7 +523,7 @@ async fn check_rank_window(engine: &DatabaseEngine, fx: &Fixture, rng: &mut Rng)
         character_id,
         &filter,
         mode,
-        grouped_latest_world_bloom_rank(fx.event_id, character_id, &filter, false),
+        grouped_latest_world_bloom_rank(backend, fx.event_id, character_id, &filter, false),
     );
     let mut old: Vec<WorldBloomRankingPageRow> = fetch(engine, &old_stmt).await;
     old.truncate(limit);
@@ -565,7 +567,15 @@ async fn check_player_growths(engine: &DatabaseEngine, fx: &Fixture, rng: &mut R
     keys.push(keys[0]);
     let start = bound(rng, fx).unwrap_or(fx.first_ts());
     let end = bound(rng, fx);
-    let new = earliest_player_rows_select(tbl, time_tbl, character_id, &keys, start, end);
+    let new = earliest_player_rows_select(
+        engine.backend(),
+        tbl,
+        time_tbl,
+        character_id,
+        &keys,
+        start,
+        end,
+    );
     let old = legacy_player_rows_select(tbl, time_tbl, character_id, &keys, start, end);
     assert_eq!(
         earliest(fetch(engine, &new).await),

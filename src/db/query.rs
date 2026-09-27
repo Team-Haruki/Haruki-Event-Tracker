@@ -2,6 +2,7 @@ pub mod batch;
 pub(crate) mod edge;
 pub mod growth;
 pub mod heartbeat;
+pub(crate) mod keys;
 pub mod lines;
 pub mod ranking;
 pub mod score_samples;

@@ -3,13 +3,14 @@ use std::collections::HashMap;
 use sea_orm::sea_query::{
     Alias, Expr, IntoCondition, JoinType, Order, Query, SelectStatement, SimpleExpr,
 };
-use sea_orm::{DbErr, ExprTrait, FromQueryResult};
+use sea_orm::{DatabaseBackend, DbErr, ExprTrait, FromQueryResult};
 
 use crate::db::engine::DatabaseEngine;
 use crate::db::entity::{event, event_users, time_id, world_bloom};
 use crate::db::query::edge::{
     Edge, EdgeSpec, TimeWindow, and_where_time_id_within, edge_keys_select, time_id_upper_bound,
 };
+use crate::db::query::keys::col_in_keys;
 use crate::db::query::user::{PublicUserIdMode, user_key_lookup};
 use crate::db::table_name::{TableKind, intern};
 use crate::model::api::{
@@ -610,12 +611,14 @@ fn and_where_not_superseded(
 }
 
 pub(crate) fn latest_rank_window_select(
+    backend: DatabaseBackend,
     event_id: i64,
     filter: &WebRankingFilter,
     mode: PublicUserIdMode,
 ) -> SelectStatement {
     let latest = match window_rank_keys(filter) {
         Some(ranks) => edge_keys_select(&EdgeSpec {
+            backend,
             tbl: intern(TableKind::Event, event_id),
             time_tbl: intern(TableKind::TimeId, event_id),
             key_col: "rank",
@@ -627,7 +630,7 @@ pub(crate) fn latest_rank_window_select(
             score_max: filter.score_max,
             max_time_id: filter.as_of_time_id,
         }),
-        None => grouped_latest_rank(event_id, filter, true),
+        None => grouped_latest_rank(backend, event_id, filter, true),
     };
     latest_rank_window_join(event_id, filter, mode, latest)
 }
@@ -637,6 +640,7 @@ pub(crate) fn latest_rank_window_select(
 /// `derive_time_id_bounds` adds the `time_id` range implied by the time
 /// filters (off only for the pre-`edge` reference in tests).
 pub(crate) fn grouped_latest_rank(
+    backend: DatabaseBackend,
     event_id: i64,
     filter: &WebRankingFilter,
     derive_time_id_bounds: bool,
@@ -685,9 +689,11 @@ pub(crate) fn grouped_latest_rank(
         latest.and_where(Expr::col((event_tbl.clone(), event::Column::Rank)).lte(rank_max));
     }
     if let Some(ranks) = &filter.rank_in {
-        latest.and_where(
-            Expr::col((event_tbl.clone(), event::Column::Rank)).is_in(ranks.iter().copied()),
-        );
+        latest.and_where(col_in_keys(
+            backend,
+            Expr::col((event_tbl.clone(), event::Column::Rank)),
+            ranks,
+        ));
     }
     if let Some(cut) = filter.as_of_time_id {
         latest.and_where(Expr::col((event_tbl.clone(), event::Column::TimeId)).lte(cut));
@@ -778,6 +784,7 @@ pub(crate) fn latest_rank_window_join(
 }
 
 fn latest_world_bloom_rank_window_select(
+    backend: DatabaseBackend,
     event_id: i64,
     character_id: i64,
     filter: &WebRankingFilter,
@@ -785,6 +792,7 @@ fn latest_world_bloom_rank_window_select(
 ) -> SelectStatement {
     let latest = match window_rank_keys(filter) {
         Some(ranks) => edge_keys_select(&EdgeSpec {
+            backend,
             tbl: intern(TableKind::WorldBloom, event_id),
             time_tbl: intern(TableKind::TimeId, event_id),
             key_col: "rank",
@@ -796,12 +804,13 @@ fn latest_world_bloom_rank_window_select(
             score_max: filter.score_max,
             max_time_id: filter.as_of_time_id,
         }),
-        None => grouped_latest_world_bloom_rank(event_id, character_id, filter, true),
+        None => grouped_latest_world_bloom_rank(backend, event_id, character_id, filter, true),
     };
     latest_world_bloom_rank_window_join(event_id, character_id, filter, mode, latest)
 }
 
 pub(crate) fn grouped_latest_world_bloom_rank(
+    backend: DatabaseBackend,
     event_id: i64,
     character_id: i64,
     filter: &WebRankingFilter,
@@ -848,9 +857,11 @@ pub(crate) fn grouped_latest_world_bloom_rank(
         latest.and_where(Expr::col((wl_tbl.clone(), world_bloom::Column::Rank)).lte(rank_max));
     }
     if let Some(ranks) = &filter.rank_in {
-        latest.and_where(
-            Expr::col((wl_tbl.clone(), world_bloom::Column::Rank)).is_in(ranks.iter().copied()),
-        );
+        latest.and_where(col_in_keys(
+            backend,
+            Expr::col((wl_tbl.clone(), world_bloom::Column::Rank)),
+            ranks,
+        ));
     }
     if let Some(cut) = filter.as_of_time_id {
         latest.and_where(Expr::col((wl_tbl.clone(), world_bloom::Column::TimeId)).lte(cut));
@@ -973,7 +984,7 @@ pub async fn search_ranking_rows(
     let time_tbl = Alias::new(intern(TableKind::TimeId, event_id));
     let users_tbl = Alias::new(intern(TableKind::EventUsers, event_id));
     let stmt = if filter.is_rank_window() {
-        latest_rank_window_select(event_id, filter, mode)
+        latest_rank_window_select(engine.backend(), event_id, filter, mode)
     } else {
         let mut stmt = ranking_select(event_id, mode);
         apply_common_filters(
@@ -1043,7 +1054,13 @@ pub async fn search_world_bloom_ranking_rows(
     let time_tbl = Alias::new(intern(TableKind::TimeId, event_id));
     let users_tbl = Alias::new(intern(TableKind::EventUsers, event_id));
     let stmt = if filter.is_rank_window() {
-        latest_world_bloom_rank_window_select(event_id, character_id, filter, mode)
+        latest_world_bloom_rank_window_select(
+            engine.backend(),
+            event_id,
+            character_id,
+            filter,
+            mode,
+        )
     } else {
         let mut stmt = world_bloom_select(event_id, mode);
         stmt.and_where(
@@ -1201,7 +1218,7 @@ pub async fn rank_snapshot_rows(
         return Ok(Vec::new());
     }
     let filter = rank_snapshot_filter(ranks, cut);
-    let stmt = latest_rank_window_select(event_id, &filter, mode);
+    let stmt = latest_rank_window_select(engine.backend(), event_id, &filter, mode);
     let rows = RankingPageRow::find_by_statement(engine.backend().build(&stmt))
         .all(engine.conn())
         .await?;
@@ -1222,7 +1239,13 @@ pub async fn world_bloom_rank_snapshot_rows(
         return Ok(Vec::new());
     }
     let filter = rank_snapshot_filter(ranks, cut);
-    let stmt = latest_world_bloom_rank_window_select(event_id, character_id, &filter, mode);
+    let stmt = latest_world_bloom_rank_window_select(
+        engine.backend(),
+        event_id,
+        character_id,
+        &filter,
+        mode,
+    );
     let rows = WorldBloomRankingPageRow::find_by_statement(engine.backend().build(&stmt))
         .all(engine.conn())
         .await?;
@@ -1284,6 +1307,7 @@ pub async fn user_rank_as_of(
 /// back for the score and timestamp. Only the earliest row is used by the
 /// growth, so the window's other rows are never read.
 pub(crate) fn earliest_player_rows_select(
+    backend: DatabaseBackend,
     tbl: &'static str,
     time_tbl: &'static str,
     character_id: Option<i64>,
@@ -1295,6 +1319,7 @@ pub(crate) fn earliest_player_rows_select(
     keys.sort_unstable();
     keys.dedup();
     let edge = edge_keys_select(&EdgeSpec {
+        backend,
         tbl,
         time_tbl,
         key_col: "user_id_key",
@@ -1405,6 +1430,7 @@ pub async fn fetch_top_player_growths(
         .map(RankingPageRow::user_id_key)
         .collect::<Vec<_>>();
     let stmt = earliest_player_rows_select(
+        engine.backend(),
         intern(TableKind::Event, event_id),
         intern(TableKind::TimeId, event_id),
         None,
@@ -1436,6 +1462,7 @@ pub async fn fetch_world_bloom_top_player_growths(
         .map(WorldBloomRankingPageRow::user_id_key)
         .collect::<Vec<_>>();
     let stmt = earliest_player_rows_select(
+        engine.backend(),
         intern(TableKind::WorldBloom, event_id),
         intern(TableKind::TimeId, event_id),
         Some(character_id),

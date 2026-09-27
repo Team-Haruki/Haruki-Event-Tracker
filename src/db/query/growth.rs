@@ -73,6 +73,7 @@ pub async fn fetch_ranking_score_growths(
     end_time: Option<i64>,
 ) -> Result<Vec<RankingScoreGrowthSchema>, DbErr> {
     let spec = RankEdgeSpec {
+        backend: engine.backend(),
         tbl: intern(TableKind::Event, event_id),
         time_tbl: intern(TableKind::TimeId, event_id),
         character_id: None,
@@ -90,6 +91,7 @@ pub async fn fetch_world_bloom_ranking_score_growths(
     end_time: Option<i64>,
 ) -> Result<Vec<RankingScoreGrowthSchema>, DbErr> {
     let spec = RankEdgeSpec {
+        backend: engine.backend(),
         tbl: intern(TableKind::WorldBloom, event_id),
         time_tbl: intern(TableKind::TimeId, event_id),
         character_id: Some(character_id),

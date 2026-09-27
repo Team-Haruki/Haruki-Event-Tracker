@@ -10,6 +10,7 @@ use sea_orm::{DbErr, ExprTrait, FromQueryResult};
 
 use crate::db::engine::DatabaseEngine;
 use crate::db::entity::{event_users, time_id, world_bloom};
+use crate::db::query::keys::col_in_keys;
 use crate::db::query::user::{PublicUserIdMode, user_key_lookup};
 use crate::db::table_name::{TableKind, intern};
 use crate::model::api::RecordedWorldBloomRankingSchema;
@@ -164,7 +165,11 @@ pub async fn fetch_all_world_bloom_rankings_by_ranks(
 
     let wl_tbl = Alias::new(intern(TableKind::WorldBloom, event_id));
     let stmt = wl_select(event_id, mode)
-        .and_where(Expr::col((wl_tbl.clone(), world_bloom::Column::Rank)).is_in(ranks.to_vec()))
+        .and_where(col_in_keys(
+            engine.backend(),
+            Expr::col((wl_tbl.clone(), world_bloom::Column::Rank)),
+            ranks,
+        ))
         .and_where(Expr::col((wl_tbl.clone(), world_bloom::Column::CharacterId)).eq(character_id))
         .order_by((wl_tbl.clone(), world_bloom::Column::Rank), Order::Asc)
         .order_by((wl_tbl, world_bloom::Column::TimeId), Order::Asc)
