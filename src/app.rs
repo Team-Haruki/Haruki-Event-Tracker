@@ -17,7 +17,7 @@ use tokio_cron_scheduler::{Job, JobScheduler, JobSchedulerError};
 use crate::api::cache::ApiCache;
 use crate::api::limiter::ApiQueryLimiter;
 use crate::api::private_lookup::PrivateLookupVerifier;
-use crate::api::realtime::RealtimeHub;
+use crate::api::realtime::{RealtimeHub, RealtimeSettings};
 use crate::api::state::{AppState, ClusterState};
 use crate::api::ws_ticket::WsTicketStore;
 use crate::cluster::subscriber::{SubscriberConfig, SubscriberDeps};
@@ -64,9 +64,7 @@ pub async fn build(cfg: &Config) -> Result<AppContext, BootstrapError> {
     validate_cluster_config(cfg)?;
     let anonymizer = build_anonymizer(cfg)?;
     let private_lookup = PrivateLookupVerifier::from_config(&cfg.toolbox);
-    let realtime = RealtimeHub::with_min_push_interval(std::time::Duration::from_secs(
-        cfg.realtime.push_min_interval_secs,
-    ));
+    let realtime = RealtimeHub::with_settings(RealtimeSettings::from(&cfg.realtime));
     // A reader never tracks, whatever the per-server flags say.
     let tracker_enabled = !role.is_reader()
         && cfg

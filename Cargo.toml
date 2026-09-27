@@ -34,6 +34,7 @@ tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.7", features = [
     "compression-gzip",
     "compression-br",
+    "compression-zstd",
     "trace",
     "catch-panic",
 ] }
@@ -109,6 +110,8 @@ opendal = { version = "0.57", default-features = false, features = ["services-fs
 
 [dev-dependencies]
 tokio = { version = "1.52", features = ["full", "test-util", "macros"] }
+# Decoders for the compression tests; the same features tower-http enables.
+async-compression = { version = "0.4", features = ["tokio", "gzip", "brotli", "zstd"] }
 
 [profile.release]
 lto = "thin"

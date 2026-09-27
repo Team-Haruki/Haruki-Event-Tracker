@@ -1,5 +1,6 @@
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::Router;
 use axum::body::Body;
@@ -8,9 +9,12 @@ use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Query, Request, State};
 use axum::http::{HeaderMap, Method, StatusCode, Uri};
 use axum::response::IntoResponse;
+use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use sonic_rs::JsonValueTrait;
 use tokio::sync::broadcast;
+use tokio::task::JoinSet;
+use tokio::time::{Instant, Interval, MissedTickBehavior};
 use tower::ServiceExt;
 
 use crate::api::access_log::ProxyTrust;
@@ -20,6 +24,16 @@ use crate::api::router::web_v2_routes;
 use crate::api::state::AppState;
 use crate::api::ws_ticket::{peer_from_connect_info, resolve_trusted_subject, unauthorized};
 use crate::model::enums::SekaiServerRegion;
+
+/// Client frames are small JSON commands; anything larger is a mistake or
+/// abuse. tungstenite's default 128 KiB read buffer was zeroed per socket
+/// and its 64 MiB message cap let any signed-in client pin that much.
+const READ_BUFFER_BYTES: usize = 4096;
+const MAX_MESSAGE_BYTES: usize = 64 * 1024;
+/// Proxied requests one socket runs at once, and how many more may wait
+/// for a slot before the socket answers 429.
+const MAX_INFLIGHT_PROXY: usize = 4;
+const MAX_QUEUED_PROXY: usize = 64;
 
 const OATHKEEPER_SUBJECT_HEADERS: &[&str] = &[
     "x-user-id",
@@ -131,7 +145,10 @@ pub async fn connect(
         return unauthorized().into_response();
     };
 
-    ws.on_upgrade(move |socket| handle_socket(socket, state, trust, subject))
+    ws.read_buffer_size(READ_BUFFER_BYTES)
+        .max_message_size(MAX_MESSAGE_BYTES)
+        .max_frame_size(MAX_MESSAGE_BYTES)
+        .on_upgrade(move |socket| handle_socket(socket, state, trust, subject))
         .into_response()
 }
 
@@ -156,6 +173,7 @@ async fn handle_socket(
         })
         .clone();
     let hub = state.realtime().clone();
+    let settings = *hub.settings();
     let mut rx = hub.subscribe();
     let mut topics: HashSet<RealtimeTopic> = HashSet::new();
     let total_online = hub.connection_opened();
@@ -182,6 +200,9 @@ async fn handle_socket(
         return;
     }
 
+    let mut proxy = ProxyPool::new(router, subject);
+    let mut keepalive = Keepalive::new(settings.ws_ping_interval, settings.ws_idle_timeout);
+
     loop {
         tokio::select! {
             message = socket.recv() => {
@@ -195,7 +216,29 @@ async fn handle_socket(
                         break;
                     }
                 };
-                if handle_client_message(&mut socket, &router, &hub, &mut topics, &subject, message).await.is_err() {
+                keepalive.saw_frame();
+                let reply = match handle_client_message(&hub, &mut topics, message).await {
+                    ClientAction::Reply(reply) => Some(reply),
+                    ClientAction::Proxy(request) => proxy.submit(request),
+                    ClientAction::Pong(payload) => {
+                        if socket.send(Message::Pong(payload)).await.is_err() {
+                            break;
+                        }
+                        None
+                    }
+                    ClientAction::Close => break,
+                    ClientAction::Ignore => None,
+                };
+                if let Some(reply) = reply
+                    && send_reply(&mut socket, reply).await.is_err()
+                {
+                    break;
+                }
+            }
+            reply = proxy.next_reply(), if proxy.has_inflight() => {
+                if let Some(text) = reply
+                    && socket.send(Message::Text(text.into())).await.is_err()
+                {
                     break;
                 }
             }
@@ -207,9 +250,21 @@ async fn handle_socket(
                         }
                     }
                     Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                        tracing::debug!(skipped, "websocket realtime receiver lagged");
+                        tracing::warn!(skipped, topics = topics.len(), "websocket realtime receiver lagged; resyncing subscribed topics");
+                        if send_lagged_resync(&mut socket, &topics).await.is_err() {
+                            break;
+                        }
                     }
                     Err(broadcast::error::RecvError::Closed) => break,
+                }
+            }
+            _ = keepalive.tick() => {
+                if keepalive.idle() {
+                    tracing::debug!("websocket idle; closing");
+                    break;
+                }
+                if socket.send(Message::Ping(Bytes::new())).await.is_err() {
+                    break;
                 }
             }
         }
@@ -219,28 +274,178 @@ async fn handle_socket(
     hub.connection_closed(&topics).await;
 }
 
+/// Server-side ping cadence plus the silence after which a socket is
+/// dropped. Neither side used to send keepalives, so a half-open socket
+/// stayed counted as online until its TCP state timed out.
+struct Keepalive {
+    ping: Option<Interval>,
+    idle_timeout: Duration,
+    last_seen: Instant,
+}
+
+impl Keepalive {
+    fn new(ping_interval: Duration, idle_timeout: Duration) -> Self {
+        let ping = (!ping_interval.is_zero()).then(|| {
+            let mut interval =
+                tokio::time::interval_at(Instant::now() + ping_interval, ping_interval);
+            interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+            interval
+        });
+        Self {
+            ping,
+            idle_timeout,
+            last_seen: Instant::now(),
+        }
+    }
+
+    fn saw_frame(&mut self) {
+        self.last_seen = Instant::now();
+    }
+
+    fn idle(&self) -> bool {
+        !self.idle_timeout.is_zero() && self.last_seen.elapsed() >= self.idle_timeout
+    }
+
+    async fn tick(&mut self) {
+        match self.ping.as_mut() {
+            Some(interval) => {
+                interval.tick().await;
+            }
+            None => std::future::pending().await,
+        }
+    }
+}
+
+/// Proxied requests of one socket, run off the socket task so a slow
+/// private detail no longer stalls the realtime feed (and the client's
+/// other requests) behind it. Clients match replies by `id`, so replies
+/// go back in completion order.
+struct ProxyPool {
+    router: Router,
+    subject: Arc<str>,
+    inflight: JoinSet<String>,
+    queued: VecDeque<WsRequest>,
+}
+
+impl ProxyPool {
+    fn new(router: Router, subject: String) -> Self {
+        Self {
+            router,
+            subject: subject.into(),
+            inflight: JoinSet::new(),
+            queued: VecDeque::new(),
+        }
+    }
+
+    fn has_inflight(&self) -> bool {
+        !self.inflight.is_empty()
+    }
+
+    /// Starts the request, or parks it until a slot frees up. Returns a
+    /// reply to send right away only when the queue is full.
+    fn submit(&mut self, request: WsRequest) -> Option<WsReply> {
+        if self.inflight.len() < MAX_INFLIGHT_PROXY {
+            self.spawn(request);
+            return None;
+        }
+        if self.queued.len() >= MAX_QUEUED_PROXY {
+            return Some(
+                WsResponse::error(
+                    &request.id,
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "too many pending requests",
+                )
+                .into(),
+            );
+        }
+        self.queued.push_back(request);
+        None
+    }
+
+    fn spawn(&mut self, request: WsRequest) {
+        let router = self.router.clone();
+        let subject = self.subject.clone();
+        self.inflight.spawn(async move {
+            handle_proxy_request(&router, request, &subject)
+                .await
+                .into_text()
+        });
+    }
+
+    /// The next finished reply text. Pends while nothing is in flight;
+    /// `None` when a task failed (logged; the client's own timeout covers
+    /// that id).
+    async fn next_reply(&mut self) -> Option<String> {
+        let result = match self.inflight.join_next().await {
+            Some(result) => result,
+            None => std::future::pending().await,
+        };
+        if let Some(request) = self.queued.pop_front() {
+            self.spawn(request);
+        }
+        match result {
+            Ok(text) => Some(text),
+            Err(err) => {
+                tracing::error!(%err, "websocket proxy task failed");
+                None
+            }
+        }
+    }
+}
+
+/// What one client frame asks the socket task to do.
+enum ClientAction {
+    Reply(WsReply),
+    Proxy(WsRequest),
+    Pong(Bytes),
+    Close,
+    Ignore,
+}
+
 async fn handle_client_message(
-    socket: &mut WebSocket,
-    router: &Router,
     hub: &crate::api::realtime::RealtimeHub,
     topics: &mut HashSet<RealtimeTopic>,
-    subject: &str,
     message: Message,
-) -> Result<(), ()> {
-    let response = match message {
-        Message::Text(text) => {
-            handle_text_request(router, hub, topics, subject, text.as_str()).await
-        }
+) -> ClientAction {
+    match message {
+        Message::Text(text) => classify_text_request(hub, topics, text.as_str()).await,
         Message::Binary(bytes) => match std::str::from_utf8(&bytes) {
-            Ok(text) => handle_text_request(router, hub, topics, subject, text).await,
-            Err(_) => WsResponse::error("", StatusCode::BAD_REQUEST, "invalid utf-8").into(),
+            Ok(text) => classify_text_request(hub, topics, text).await,
+            Err(_) => ClientAction::Reply(
+                WsResponse::error("", StatusCode::BAD_REQUEST, "invalid utf-8").into(),
+            ),
         },
-        Message::Ping(payload) => return socket.send(Message::Pong(payload)).await.map_err(|_| ()),
-        Message::Pong(_) => return Ok(()),
-        Message::Close(_) => return Err(()),
-    };
+        Message::Ping(payload) => ClientAction::Pong(payload),
+        Message::Pong(_) => ClientAction::Ignore,
+        Message::Close(_) => ClientAction::Close,
+    }
+}
 
-    send_reply(socket, response).await.map_err(|_| ())
+/// After the broadcast channel overran this socket, any subscribed topic
+/// may have missed an `updated`. A version-less `updated` per topic makes
+/// the client refetch over its uncached path; nothing else recovers a
+/// missed push.
+async fn send_lagged_resync(
+    socket: &mut WebSocket,
+    topics: &HashSet<RealtimeTopic>,
+) -> Result<(), axum::Error> {
+    let timestamp = chrono::Utc::now().timestamp();
+    for topic in topics {
+        send_event(
+            socket,
+            &WsEvent {
+                kind: "updated",
+                subject: None,
+                server: Some(topic.server),
+                event_id: Some(topic.event_id),
+                timestamp: Some(timestamp),
+                version: None,
+                online: None,
+            },
+        )
+        .await?;
+    }
+    Ok(())
 }
 
 async fn handle_realtime_message(
@@ -301,6 +506,40 @@ async fn handle_realtime_message(
     Ok(())
 }
 
+async fn classify_text_request(
+    hub: &crate::api::realtime::RealtimeHub,
+    topics: &mut HashSet<RealtimeTopic>,
+    text: &str,
+) -> ClientAction {
+    let request = match sonic_rs::from_str::<WsRequest>(text) {
+        Ok(request) => request,
+        Err(_) => {
+            return ClientAction::Reply(
+                WsResponse::error("", StatusCode::BAD_REQUEST, "invalid request").into(),
+            );
+        }
+    };
+
+    match request.kind.as_str() {
+        "subscribe" => ClientAction::Reply(subscribe_topic(hub, topics, request).await.into()),
+        "unsubscribe" => ClientAction::Reply(unsubscribe_topic(hub, topics, request).await.into()),
+        "ping" => ClientAction::Reply(
+            WsResponse {
+                id: request.id,
+                ok: true,
+                data: sonic_rs::from_str(r#"{"type":"pong"}"#).ok(),
+                error: None,
+                status: StatusCode::OK.as_u16(),
+            }
+            .into(),
+        ),
+        _ => ClientAction::Proxy(request),
+    }
+}
+
+/// The inline form of one frame's handling (proxied requests awaited in
+/// place), for tests.
+#[cfg(test)]
 async fn handle_text_request(
     router: &Router,
     hub: &crate::api::realtime::RealtimeHub,
@@ -308,23 +547,12 @@ async fn handle_text_request(
     subject: &str,
     text: &str,
 ) -> WsReply {
-    let request = match sonic_rs::from_str::<WsRequest>(text) {
-        Ok(request) => request,
-        Err(_) => return WsResponse::error("", StatusCode::BAD_REQUEST, "invalid request").into(),
-    };
-
-    match request.kind.as_str() {
-        "subscribe" => subscribe_topic(hub, topics, request).await.into(),
-        "unsubscribe" => unsubscribe_topic(hub, topics, request).await.into(),
-        "ping" => WsResponse {
-            id: request.id,
-            ok: true,
-            data: sonic_rs::from_str(r#"{"type":"pong"}"#).ok(),
-            error: None,
-            status: StatusCode::OK.as_u16(),
+    match classify_text_request(hub, topics, text).await {
+        ClientAction::Reply(reply) => reply,
+        ClientAction::Proxy(request) => handle_proxy_request(router, request, subject).await,
+        ClientAction::Pong(_) | ClientAction::Close | ClientAction::Ignore => {
+            unreachable!("text frames never map to control actions")
         }
-        .into(),
-        _ => handle_proxy_request(router, request, subject).await,
     }
 }
 
@@ -599,15 +827,251 @@ mod tests {
     }
 
     fn state() -> AppState {
+        state_with(RealtimeHub::new())
+    }
+
+    fn state_with(hub: RealtimeHub) -> AppState {
         AppState::new(
             HashMap::new(),
             None,
             ApiQueryLimiter::new(ApiQueryConfig::default(), []),
             UidAnonymizer::disabled(),
             None,
-            RealtimeHub::new(),
+            hub,
             WsTicketStore::default(),
         )
+    }
+
+    /// Serves `/ws` for `state` on a loopback port; returns the address.
+    async fn serve(state: AppState) -> std::net::SocketAddr {
+        let (trust, invalid) = ProxyTrust::from_config(false, &[], "X-Forwarded-For", 1.0, 1000);
+        assert!(invalid.is_empty());
+        let app = Router::new().route("/ws", get(connect).with_state((state, Arc::new(trust))));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
+        address
+    }
+
+    async fn connect_as(
+        address: std::net::SocketAddr,
+        subject: &str,
+    ) -> tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>
+    {
+        let mut request = format!("ws://{address}/ws").into_client_request().unwrap();
+        request
+            .headers_mut()
+            .insert("x-oathkeeper-subject", subject.parse().unwrap());
+        let (socket, _) = tokio_tungstenite::connect_async(request).await.unwrap();
+        socket
+    }
+
+    /// A router whose `/api/v2/web/slow` route sleeps `delay` and records
+    /// the peak number of concurrently running calls.
+    fn slow_router(delay: Duration, peak: Arc<std::sync::atomic::AtomicUsize>) -> Router {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let running = Arc::new(AtomicUsize::new(0));
+        router().route(
+            "/api/v2/web/slow",
+            get(move || {
+                let running = running.clone();
+                let peak = peak.clone();
+                async move {
+                    let now = running.fetch_add(1, Ordering::SeqCst) + 1;
+                    peak.fetch_max(now, Ordering::SeqCst);
+                    tokio::time::sleep(delay).await;
+                    running.fetch_sub(1, Ordering::SeqCst);
+                    Json(json!({"slow": true}))
+                }
+            }),
+        )
+    }
+
+    fn proxy_request(id: &str, path: &str) -> WsRequest {
+        WsRequest {
+            id: id.into(),
+            path: path.into(),
+            kind: String::new(),
+            server: None,
+            event_id: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn proxy_pool_caps_concurrency_and_replies_in_completion_order() {
+        let peak = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut pool = ProxyPool::new(
+            slow_router(Duration::from_millis(60), peak.clone()),
+            "owner".into(),
+        );
+        assert!(!pool.has_inflight());
+        assert!(
+            pool.submit(proxy_request("slow-0", "/api/v2/web/slow"))
+                .is_none()
+        );
+        assert!(
+            pool.submit(proxy_request("fast", "/api/v2/web/ok"))
+                .is_none()
+        );
+        for i in 1..6 {
+            assert!(
+                pool.submit(proxy_request(&format!("slow-{i}"), "/api/v2/web/slow"))
+                    .is_none()
+            );
+        }
+        assert!(pool.has_inflight());
+
+        // The fast request is not stuck behind the slow one sent first.
+        let first: ParsedReply = sonic_rs::from_str(&pool.next_reply().await.unwrap()).unwrap();
+        assert!(first.ok);
+        assert_eq!(first.data.unwrap()["value"].as_i64(), Some(42));
+        let mut slow_replies = 0;
+        while pool.has_inflight() {
+            if let Some(text) = pool.next_reply().await {
+                let reply: ParsedReply = sonic_rs::from_str(&text).unwrap();
+                assert!(reply.ok);
+                slow_replies += 1;
+            }
+        }
+        assert_eq!(slow_replies, 6);
+        assert_eq!(
+            peak.load(std::sync::atomic::Ordering::SeqCst),
+            MAX_INFLIGHT_PROXY
+        );
+    }
+
+    #[tokio::test]
+    async fn proxy_pool_rejects_requests_beyond_the_queue() {
+        let peak = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut pool = ProxyPool::new(slow_router(Duration::from_secs(30), peak), "owner".into());
+        for i in 0..(MAX_INFLIGHT_PROXY + MAX_QUEUED_PROXY) {
+            assert!(
+                pool.submit(proxy_request(&format!("r{i}"), "/api/v2/web/slow"))
+                    .is_none()
+            );
+        }
+        let rejected = pool
+            .submit(proxy_request("overflow", "/api/v2/web/slow"))
+            .expect("the queue is full")
+            .parsed();
+        assert!(!rejected.ok);
+        assert_eq!(rejected.status, StatusCode::TOO_MANY_REQUESTS.as_u16());
+        assert_eq!(pool.queued.len(), MAX_QUEUED_PROXY);
+        // Dropping the pool aborts what is in flight.
+    }
+
+    #[tokio::test]
+    async fn keepalive_pings_responsive_sockets_and_closes_silent_ones() {
+        use crate::api::realtime::RealtimeSettings;
+        let state = state_with(RealtimeHub::with_settings(RealtimeSettings {
+            ws_ping_interval: Duration::from_millis(40),
+            ws_idle_timeout: Duration::from_millis(100),
+            ..RealtimeSettings::immediate()
+        }));
+        let hub = state.realtime().clone();
+        let address = serve(state).await;
+
+        // A client that keeps reading answers pings (tokio-tungstenite
+        // does so on read) and stays connected well past the idle timeout.
+        let mut alive = connect_as(address, "alive").await;
+        assert_eq!(next_json(&mut alive).await["type"].as_str(), Some("ready"));
+        let mut pings = 0;
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(400);
+        while tokio::time::Instant::now() < deadline {
+            match tokio::time::timeout_at(deadline, alive.next()).await {
+                Ok(Some(Ok(ClientMessage::Ping(_)))) => pings += 1,
+                Ok(Some(Ok(ClientMessage::Close(_)))) | Ok(None) | Ok(Some(Err(_))) => {
+                    panic!("responsive socket was closed")
+                }
+                Ok(Some(Ok(_))) => {}
+                Err(_) => break,
+            }
+        }
+        assert!(pings >= 3, "{pings}");
+        assert_eq!(hub.total_online(), 1);
+        // Keep answering pings in the background while the silent socket
+        // is exercised; a client that stops reading is silent too.
+        let alive_closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let alive_task = tokio::spawn({
+            let alive_closed = alive_closed.clone();
+            async move {
+                while let Some(Ok(message)) = alive.next().await {
+                    if matches!(message, ClientMessage::Close(_)) {
+                        break;
+                    }
+                }
+                alive_closed.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        });
+
+        // A client that never reads never pongs; the server drops it.
+        let mut silent = connect_as(address, "silent").await;
+        assert_eq!(hub.total_online(), 2);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let mut closed = false;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            match tokio::time::timeout_at(deadline, silent.next()).await {
+                Ok(Some(Ok(ClientMessage::Close(_)))) | Ok(None) | Ok(Some(Err(_))) => {
+                    closed = true;
+                    break;
+                }
+                Ok(Some(Ok(_))) => {}
+                Err(_) => break,
+            }
+        }
+        assert!(closed, "silent socket was not closed");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(hub.total_online(), 1);
+        assert!(!alive_closed.load(std::sync::atomic::Ordering::SeqCst));
+        alive_task.abort();
+    }
+
+    #[tokio::test]
+    async fn lagged_receivers_resync_their_subscribed_topics() {
+        let state = state();
+        let hub = state.realtime().clone();
+        let address = serve(state).await;
+        let mut socket = connect_as(address, "viewer").await;
+        assert_eq!(next_json(&mut socket).await["type"].as_str(), Some("ready"));
+        socket
+            .send(ClientMessage::Text(
+                r#"{"id":"sub","type":"subscribe","server":"jp","eventId":99}"#.into(),
+            ))
+            .await
+            .unwrap();
+        for _ in 0..2 {
+            next_json(&mut socket).await;
+        }
+
+        // Flood another topic without yielding: the socket task's receiver
+        // overruns the 1024-message channel before it can drain it.
+        let other = RealtimeTopic::new(SekaiServerRegion::En, 1);
+        for i in 0..2000 {
+            hub.notify_update(other.clone(), i, Some(i));
+        }
+        let resync = next_json(&mut socket).await;
+        assert_eq!(resync["type"].as_str(), Some("updated"));
+        assert_eq!(resync["server"].as_str(), Some("jp"));
+        assert_eq!(resync["eventId"].as_i64(), Some(99));
+        assert!(resync["timestamp"].as_i64().is_some());
+        assert!(resync.get("version").is_none());
+
+        // The socket is still serving: nothing from the flooded topic
+        // leaks through and the next frame is the ping reply.
+        socket
+            .send(ClientMessage::Text(r#"{"id":"p","type":"ping"}"#.into()))
+            .await
+            .unwrap();
+        assert_eq!(next_json(&mut socket).await["id"].as_str(), Some("p"));
+        socket.close(None).await.unwrap();
     }
 
     async fn next_json<S>(socket: &mut tokio_tungstenite::WebSocketStream<S>) -> sonic_rs::Value

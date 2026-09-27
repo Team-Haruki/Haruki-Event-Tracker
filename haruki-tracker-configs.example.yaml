@@ -71,6 +71,8 @@ toolbox:
   auth_proxy_secret: ""      # Toolbox 后端 AUTH_PROXY_TRUSTED_VALUE / Oathkeeper shared secret
   authorization: ""          # 如需兼容旧内部鉴权可填写 Authorization 完整值，通常留空
   user_agent: "Haruki-Event-Tracker/private-lookup"
+  verify_cache_ttl_secs: 45      # 「该登录身份绑定了该区服 UID」的肯定结果在进程内复用的秒数；0 表示每次请求都问 Toolbox。否定结果从不缓存；解绑最多延迟一个 TTL 生效
+  verify_cache_max_entries: 4096 # 进程内肯定结果缓存的条数上限
 
 # ============================================================================
 # 后端 API 服务器配置
@@ -109,6 +111,9 @@ backend:
 # ============================================================================
 realtime:
   push_min_interval_secs: 0 # 每个 (server, event) topic 的 updated 事件最小推送间隔（秒）；窗口内的多次更新合并为一条尾随推送（携带最新时间戳，不会漏掉最后一次变更）。0 表示每次落库都推（旧行为）。CN 每秒落库，建议 2–5：客户端的 overview 刷新次数按同样倍数下降
+  online_broadcast_interval_secs: 2 # 每个 topic 的 online 人数至多每 N 秒推一次（推当时的人数）；0 表示每次订阅/退订都推
+  ws_ping_interval_secs: 30  # 服务端 WebSocket ping 间隔；0 关闭 keepalive 与下面的空闲断开
+  ws_idle_timeout_secs: 75   # 超过这么久没收到任何帧（含 pong）的连接会被服务端关闭，半开连接不再计入 online
 
 # ============================================================================
 # 集群角色配置
