@@ -805,15 +805,33 @@ async fn check_user_lookups(engine: &DatabaseEngine, fx: &Fixture, rng: &mut Rng
             .map(|(_, ts, r)| (ts, subject.clone(), r.score, r.rank))
             .collect()
     };
+    // Full histories and metric samples go through the trace query, which on
+    // timestamp-id tables reads the ranking table alone: an orphan row (no
+    // time row) then counts, with its `time_id` as the timestamp — the same
+    // rule `check_trace` models. Sequence-id tables keep the join.
+    let aligned_history =
+        |rows: &[Row], keep: &dyn Fn(&Row) -> bool| -> Vec<(i64, String, i64, i64)> {
+            if fx.mode != IdMode::Timestamp {
+                return history(rows, keep);
+            }
+            let mut out: Vec<_> = rows
+                .iter()
+                .filter(|r| r.user == user && keep(r))
+                .map(|r| (r.time_id, subject.clone(), r.score, r.rank))
+                .collect();
+            out.sort_by_key(|t| t.0);
+            out
+        };
     let expected = history(&fx.rows, &|_| true);
-    let got = fetch_all_rankings(engine, fx.event_id, &subject, mode)
+    let expected_all = aligned_history(&fx.rows, &|_| true);
+    let got = fetch_all_rankings(engine, REGION, fx.event_id, &subject, mode)
         .await
         .unwrap();
     assert_eq!(
         got.iter()
             .map(|r| (r.timestamp, r.user_id.clone(), r.score, r.rank))
             .collect::<Vec<_>>(),
-        expected,
+        expected_all,
         "all rankings {label}"
     );
     let got = fetch_latest_ranking(engine, fx.event_id, &subject, mode)
@@ -826,15 +844,17 @@ async fn check_user_lookups(engine: &DatabaseEngine, fx: &Fixture, rng: &mut Rng
     );
 
     let expected = history(&fx.wl_rows, &|r| r.character == character_id);
-    let got = fetch_all_world_bloom_rankings(engine, fx.event_id, &subject, character_id, mode)
-        .await
-        .unwrap();
+    let expected_all = aligned_history(&fx.wl_rows, &|r| r.character == character_id);
+    let got =
+        fetch_all_world_bloom_rankings(engine, REGION, fx.event_id, &subject, character_id, mode)
+            .await
+            .unwrap();
     assert!(got.iter().all(|r| r.character_id == Some(character_id)));
     assert_eq!(
         got.iter()
             .map(|r| (r.timestamp, r.user_id.clone(), r.score, r.rank))
             .collect::<Vec<_>>(),
-        expected,
+        expected_all,
         "all wb rankings {label}"
     );
     let got = fetch_latest_world_bloom_ranking(engine, fx.event_id, &subject, character_id, mode)
@@ -850,14 +870,15 @@ async fn check_user_lookups(engine: &DatabaseEngine, fx: &Fixture, rng: &mut Rng
     let end = bound(rng, fx);
     for (chapter, rows) in [(None, &fx.rows), (Some(character_id), &fx.wl_rows)] {
         let expected: Vec<ScoreSample> =
-            history(rows, &|r| chapter.is_none_or(|c| r.character == c))
+            aligned_history(rows, &|r| chapter.is_none_or(|c| r.character == c))
                 .into_iter()
                 .filter(|(ts, ..)| end.is_none_or(|end| *ts <= end))
                 .map(|(timestamp, _, score, _)| ScoreSample { timestamp, score })
                 .collect();
-        let got = fetch_user_score_samples(engine, fx.event_id, chapter, &subject, end, mode)
-            .await
-            .unwrap();
+        let got =
+            fetch_user_score_samples(engine, REGION, fx.event_id, chapter, &subject, end, mode)
+                .await
+                .unwrap();
         assert_eq!(
             got, expected,
             "score samples {label} chapter={chapter:?} end={end:?}"

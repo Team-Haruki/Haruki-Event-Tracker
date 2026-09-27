@@ -72,6 +72,18 @@ pub struct WebTraceFilter {
     pub limit: Option<u64>,
 }
 
+impl WebTraceFilter {
+    /// The whole history: no time bounds, cursor or limit.
+    pub fn unbounded() -> Self {
+        Self {
+            start_time: None,
+            end_time: None,
+            cursor: None,
+            limit: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct WebUserSearchFilter {
     pub unique_id: Option<String>,

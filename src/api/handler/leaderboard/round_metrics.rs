@@ -56,6 +56,7 @@ pub(super) async fn enrich_cloud_rank_infos_with_trace_metrics(
             };
             let samples = fetch_user_score_samples(
                 &engine,
+                region,
                 event_id,
                 character_id,
                 user_id.as_str(),
@@ -352,6 +353,7 @@ mod tests {
                     .collect();
                 let samples = fetch_user_score_samples(
                     &engine,
+                    SekaiServerRegion::Jp,
                     event,
                     chapter,
                     user,

@@ -220,7 +220,7 @@ pub async fn trace_by_user(
     .await?;
     let mode = prepare_private_user_id_mode(&state, &engine, region, event_id).await?;
     let _permit = state.query_limiter().acquire_trace(region).await?;
-    let rankings = fetch_all_rankings(&engine, event_id, &user_id, mode).await?;
+    let rankings = fetch_all_rankings(&engine, region, event_id, &user_id, mode).await?;
     let user_data = get_user_data(&engine, event_id, &user_id, mode)
         .await
         .ok()
@@ -254,7 +254,8 @@ pub async fn trace_world_bloom_by_user(
     let mode = prepare_private_user_id_mode(&state, &engine, region, event_id).await?;
     let _permit = state.query_limiter().acquire_trace(region).await?;
     let rankings =
-        fetch_all_world_bloom_rankings(&engine, event_id, &user_id, character_id, mode).await?;
+        fetch_all_world_bloom_rankings(&engine, region, event_id, &user_id, character_id, mode)
+            .await?;
     let user_data = get_user_data(&engine, event_id, &user_id, mode)
         .await
         .ok()
@@ -393,14 +394,19 @@ async fn web_user_detail_for_scope(
             (Some(filter), None) => {
                 search_user_trace(&engine, region, event_id, &user_id, &filter, mode).await?
             }
-            (None, Some(character_id)) => {
-                fetch_all_world_bloom_rankings(&engine, event_id, &user_id, character_id, mode)
-                    .await?
-                    .into_iter()
-                    .map(RecordedRankData::WorldBloom)
-                    .collect()
-            }
-            (None, None) => fetch_all_rankings(&engine, event_id, &user_id, mode)
+            (None, Some(character_id)) => fetch_all_world_bloom_rankings(
+                &engine,
+                region,
+                event_id,
+                &user_id,
+                character_id,
+                mode,
+            )
+            .await?
+            .into_iter()
+            .map(RecordedRankData::WorldBloom)
+            .collect(),
+            (None, None) => fetch_all_rankings(&engine, region, event_id, &user_id, mode)
                 .await?
                 .into_iter()
                 .map(RecordedRankData::Normal)

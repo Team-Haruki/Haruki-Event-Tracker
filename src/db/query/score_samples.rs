@@ -16,8 +16,10 @@ use sea_orm::{DbErr, ExprTrait, FromQueryResult};
 use crate::db::engine::DatabaseEngine;
 use crate::db::entity::time_id;
 use crate::db::query::edge::{TimeWindow, and_where_time_id_within};
+use crate::db::query::trace::time_ids_are_timestamps;
 use crate::db::query::user::{PublicUserIdMode, user_key_lookup};
 use crate::db::table_name::{TableKind, intern};
+use crate::model::enums::SekaiServerRegion;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, FromQueryResult)]
 pub struct ScoreSample {
@@ -32,6 +34,7 @@ pub struct ScoreSample {
 #[tracing::instrument(skip(engine, user_id), fields(event_id, character_id, end_time))]
 pub async fn fetch_user_score_samples(
     engine: &DatabaseEngine,
+    region: SekaiServerRegion,
     event_id: i64,
     character_id: Option<i64>,
     user_id: &str,
@@ -44,22 +47,36 @@ pub async fn fetch_user_score_samples(
     });
     let time_tbl = Alias::new(intern(TableKind::TimeId, event_id));
     let time_id_col = Alias::new("time_id");
+    // On events whose time ids are their timestamps the ranking table alone
+    // answers: the key lookup is an InitPlan whose row count the planner
+    // cannot see, so a join to the time table became a hash join over every
+    // time row (17 ms on CN 180 at 72k rows) for a player's dozen samples.
+    let aligned = time_ids_are_timestamps(engine, region, event_id).await?;
     let mut stmt = Query::select();
+    if aligned {
+        stmt.expr_as(
+            Expr::col((tbl.clone(), time_id_col.clone())),
+            Alias::new("timestamp"),
+        );
+    } else {
+        stmt.expr_as(
+            Expr::col((time_tbl.clone(), time_id::Column::Timestamp)),
+            Alias::new("timestamp"),
+        );
+    }
     stmt.expr_as(
-        Expr::col((time_tbl.clone(), time_id::Column::Timestamp)),
-        Alias::new("timestamp"),
-    )
-    .expr_as(
         Expr::col((tbl.clone(), Alias::new("score"))),
         Alias::new("score"),
     )
-    .from(tbl.clone())
-    .inner_join(
-        time_tbl.clone(),
-        Expr::col((tbl.clone(), time_id_col.clone()))
-            .equals((time_tbl.clone(), time_id::Column::TimeId)),
-    )
-    .and_where(
+    .from(tbl.clone());
+    if !aligned {
+        stmt.inner_join(
+            time_tbl.clone(),
+            Expr::col((tbl.clone(), time_id_col.clone()))
+                .equals((time_tbl.clone(), time_id::Column::TimeId)),
+        );
+    }
+    stmt.and_where(
         Expr::col((tbl.clone(), Alias::new("user_id_key")))
             .eq(user_key_lookup(event_id, user_id, mode)),
     );
@@ -67,7 +84,11 @@ pub async fn fetch_user_score_samples(
         stmt.and_where(Expr::col((tbl.clone(), Alias::new("character_id"))).eq(character_id));
     }
     if let Some(end_time) = end_time {
-        stmt.and_where(Expr::col((time_tbl, time_id::Column::Timestamp)).lte(end_time));
+        if aligned {
+            stmt.and_where(Expr::col((tbl.clone(), time_id_col.clone())).lte(end_time));
+        } else {
+            stmt.and_where(Expr::col((time_tbl, time_id::Column::Timestamp)).lte(end_time));
+        }
     }
     and_where_time_id_within(
         &mut stmt,
