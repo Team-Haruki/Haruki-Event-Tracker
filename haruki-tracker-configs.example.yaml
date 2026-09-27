@@ -201,9 +201,13 @@ servers:
       max_open_conns: 20     # 最大打开连接数（建议 10-50；多区服同库时保持保守）
       max_idle_conns: 1      # 最小/空闲连接数（Rust 版本映射为 min_connections）
       conn_max_lifetime: 1h  # 连接最大生命周期（支持：1h, 30m, 3600s）
+      idle_timeout: 60s      # 空闲连接回收时间（默认 60s；reader 突发后的多余 backend 一分钟内释放）
+      statement_cache_capacity: 32  # 每连接预处理语句缓存条数（默认 32；每条都占后端 plan 内存，0 关闭）
+      write_timeout: 5s      # 仅 writer 角色：单次 flush 的墙钟上限，同时作为事务内的
+                             # statement_timeout / idle_in_transaction_session_timeout（0s 关闭）
 
       # 性能优化配置
-      prepare_stmt: true     # 是否使用预处理语句（提高性能，建议启用）
+      prepare_stmt: true     # 兼容旧配置，已忽略：sqlx 始终使用预处理语句（见 statement_cache_capacity）
       disable_fk_migrate: true  # 迁移时是否禁用外键约束（提高性能）
 
       # 数据库日志配置

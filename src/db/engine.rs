@@ -8,7 +8,13 @@ const DEFAULT_MAX_CONN: u32 = 20;
 const DEFAULT_MIN_CONN: u32 = 1;
 const DEFAULT_LIFETIME: Duration = Duration::from_secs(3600);
 const DEFAULT_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(3);
-const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(600);
+/// 60 s (was 600 s): a reader's burst connections — each a backend holding
+/// several MB of cached plans — are reaped a minute after the burst. The
+/// writer flushes every few seconds, so its 1–2 connections never idle out.
+const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+/// Per-connection prepared-statement cache (sqlx default 100). Every cached
+/// statement pins a server-side plan; 32 covers the hot statement set.
+const DEFAULT_STATEMENT_CACHE_CAPACITY: u32 = 32;
 
 #[derive(Debug, thiserror::Error)]
 pub enum EngineError {
@@ -33,25 +39,7 @@ impl DatabaseEngine {
     /// cutover time — see `REWRITE_PLAN.md`.
     pub async fn connect(cfg: &DbConfig) -> Result<Self, EngineError> {
         let backend = parse_backend(&cfg.dialect)?;
-
-        let mut opts = ConnectOptions::new(cfg.dsn.clone());
-        opts.max_connections(if cfg.max_open_conns > 0 {
-            cfg.max_open_conns
-        } else {
-            DEFAULT_MAX_CONN
-        });
-        opts.min_connections(if cfg.max_idle_conns > 0 {
-            cfg.max_idle_conns
-        } else {
-            DEFAULT_MIN_CONN
-        });
-        opts.max_lifetime(
-            parse_simple_duration(&cfg.conn_max_lifetime).unwrap_or(DEFAULT_LIFETIME),
-        );
-        opts.acquire_timeout(DEFAULT_ACQUIRE_TIMEOUT);
-        opts.idle_timeout(DEFAULT_IDLE_TIMEOUT);
-        opts.sqlx_logging(false);
-
+        let opts = connect_options(cfg);
         let conn = Database::connect(opts)
             .await
             .map_err(EngineError::Connect)?;
@@ -95,6 +83,32 @@ impl DatabaseEngine {
     pub async fn close(self) -> Result<(), DbErr> {
         self.conn.close().await
     }
+}
+
+fn connect_options(cfg: &DbConfig) -> ConnectOptions {
+    let mut opts = ConnectOptions::new(cfg.dsn.clone());
+    opts.max_connections(if cfg.max_open_conns > 0 {
+        cfg.max_open_conns
+    } else {
+        DEFAULT_MAX_CONN
+    });
+    opts.min_connections(if cfg.max_idle_conns > 0 {
+        cfg.max_idle_conns
+    } else {
+        DEFAULT_MIN_CONN
+    });
+    opts.max_lifetime(parse_simple_duration(&cfg.conn_max_lifetime).unwrap_or(DEFAULT_LIFETIME));
+    opts.acquire_timeout(DEFAULT_ACQUIRE_TIMEOUT);
+    opts.idle_timeout(parse_simple_duration(&cfg.idle_timeout).unwrap_or(DEFAULT_IDLE_TIMEOUT));
+    opts.sqlx_logging(false);
+
+    let cache = cfg
+        .statement_cache_capacity
+        .unwrap_or(DEFAULT_STATEMENT_CACHE_CAPACITY) as usize;
+    opts.map_sqlx_postgres_opts(move |o| o.statement_cache_capacity(cache));
+    opts.map_sqlx_mysql_opts(move |o| o.statement_cache_capacity(cache));
+    opts.map_sqlx_sqlite_opts(move |o| o.statement_cache_capacity(cache));
+    opts
 }
 
 fn parse_backend(dialect: &str) -> Result<DatabaseBackend, EngineError> {
@@ -151,6 +165,34 @@ mod tests {
         assert_eq!(parse_simple_duration(""), None);
         assert_eq!(parse_simple_duration("h"), None);
         assert_eq!(parse_simple_duration("1d"), None);
+    }
+
+    #[test]
+    fn pool_options_follow_config_with_defaults() {
+        let opts = connect_options(&DbConfig {
+            dsn: "postgres://u:p@localhost/db".into(),
+            ..DbConfig::default()
+        });
+        assert_eq!(opts.get_idle_timeout(), Some(Some(DEFAULT_IDLE_TIMEOUT)));
+        assert_eq!(opts.get_max_lifetime(), Some(Some(DEFAULT_LIFETIME)));
+        assert_eq!(opts.get_max_connections(), Some(DEFAULT_MAX_CONN));
+
+        let opts = connect_options(&DbConfig {
+            dsn: "postgres://u:p@localhost/db".into(),
+            idle_timeout: "2m".into(),
+            conn_max_lifetime: "30m".into(),
+            max_open_conns: 6,
+            ..DbConfig::default()
+        });
+        assert_eq!(
+            opts.get_idle_timeout(),
+            Some(Some(Duration::from_secs(120)))
+        );
+        assert_eq!(
+            opts.get_max_lifetime(),
+            Some(Some(Duration::from_secs(1800)))
+        );
+        assert_eq!(opts.get_max_connections(), Some(6));
     }
 
     #[test]
