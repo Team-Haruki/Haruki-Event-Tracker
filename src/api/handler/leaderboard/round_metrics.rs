@@ -317,6 +317,7 @@ mod tests {
                 let trace = match chapter {
                     Some(chapter) => search_world_bloom_user_trace(
                         &engine,
+                        SekaiServerRegion::Jp,
                         event,
                         chapter,
                         user,
@@ -325,9 +326,16 @@ mod tests {
                     )
                     .await
                     .unwrap(),
-                    None => search_user_trace(&engine, event, user, &filter, PublicUserIdMode::Raw)
-                        .await
-                        .unwrap(),
+                    None => search_user_trace(
+                        &engine,
+                        SekaiServerRegion::Jp,
+                        event,
+                        user,
+                        &filter,
+                        PublicUserIdMode::Raw,
+                    )
+                    .await
+                    .unwrap(),
                 };
                 let trace_samples: Vec<ScoreSample> = trace
                     .iter()

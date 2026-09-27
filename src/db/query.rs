@@ -6,6 +6,7 @@ pub(crate) mod keys;
 pub mod lines;
 pub mod ranking;
 pub mod score_samples;
+pub(crate) mod trace;
 pub mod user;
 pub mod web;
 pub mod world_bloom;

@@ -132,6 +132,7 @@ pub(super) async fn build_subject_trace_json(
                     })?;
                     search_world_bloom_rank_trace(
                         &engine,
+                        region,
                         event_id,
                         character_id,
                         rank,
@@ -143,6 +144,7 @@ pub(super) async fn build_subject_trace_json(
                 SubjectKind::User => {
                     search_world_bloom_user_trace(
                         &engine,
+                        region,
                         event_id,
                         character_id,
                         &user_id,
@@ -157,10 +159,10 @@ pub(super) async fn build_subject_trace_json(
                     let rank = resolved_rank.ok_or_else(|| {
                         ApiError::ServiceUnavailable("rank subject has no resolved rank".into())
                     })?;
-                    search_rank_trace(&engine, event_id, rank, &filter, mode).await?
+                    search_rank_trace(&engine, region, event_id, rank, &filter, mode).await?
                 }
                 SubjectKind::User => {
-                    search_user_trace(&engine, event_id, &user_id, &filter, mode).await?
+                    search_user_trace(&engine, region, event_id, &user_id, &filter, mode).await?
                 }
             },
         };
