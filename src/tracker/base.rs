@@ -18,7 +18,7 @@ use thiserror::Error;
 
 use crate::db::engine::DatabaseEngine;
 use crate::db::privacy::ensure_user_table_extensions;
-use crate::db::query::batch::{batch_insert_flush, batch_upsert_event_users};
+use crate::db::query::batch::{UserMemo, batch_insert_flush, batch_upsert_event_users};
 use crate::db::query::heartbeat::{fetch_latest_heartbeat, write_heartbeat};
 use crate::db::schema::create_event_tables;
 use crate::model::enums::{SekaiEventType, SekaiServerRegion};
@@ -145,10 +145,13 @@ pub struct EventTrackerBase {
     /// dedupe rows that are still pending in memory — this map can.
     wl_sample_state: HashMap<(i64, i64), PlayerState>,
     prev_world_bloom_state: HashMap<WorldBloomKey, PlayerState>,
-    /// `uid -> user_id_key` learned from earlier ticks. Lets the World Bloom
-    /// pre-diff drop unchanged rows before their profiles are deep-cloned
-    /// and serialized; misses just mean the row is treated as changed.
-    wl_user_keys: HashMap<i64, i64>,
+    /// What this writer knows the users table to hold (`uid -> key` and
+    /// dimension values), fed by every committed flush. Lets the World
+    /// Bloom pre-diff drop unchanged rows before their profiles are
+    /// deep-cloned and serialized, and lets a flush skip the users
+    /// read-back and upsert for users whose profile did not change; misses
+    /// just mean the user is treated as changed.
+    user_memo: UserMemo,
 }
 
 impl EventTrackerBase {
@@ -202,7 +205,7 @@ impl EventTrackerBase {
             wl_sample_state: HashMap::new(),
             prev_rank_state: HashMap::new(),
             prev_world_bloom_state: HashMap::new(),
-            wl_user_keys: HashMap::new(),
+            user_memo: UserMemo::default(),
         }
     }
 
@@ -337,6 +340,7 @@ impl EventTrackerBase {
             self.event_id,
             &self.anonymizer,
             &records,
+            &mut self.user_memo,
         )
         .await
         {
@@ -530,7 +534,7 @@ impl EventTrackerBase {
             &records,
             &wl_rows,
             &mut self.prev_world_bloom_state,
-            &mut self.wl_user_keys,
+            &mut self.user_memo,
         )
         .await
         {
@@ -617,7 +621,7 @@ impl EventTrackerBase {
                 {
                     return true;
                 }
-                let Some(&user_id_key) = self.wl_user_keys.get(&uid) else {
+                let Some(user_id_key) = self.user_memo.user_id_key(uid) else {
                     return false;
                 };
                 self.prev_world_bloom_state
@@ -872,6 +876,7 @@ pub(crate) mod tests {
     use std::sync::atomic::{AtomicI64, Ordering};
 
     use crate::db::entity::time_id;
+    use crate::db::query::batch::UserMemoEntry;
     use crate::db::query::lines::fetch_ranking_lines;
     use crate::db::table_name::{TableKind, intern};
 
@@ -985,7 +990,16 @@ pub(crate) mod tests {
 
         let world_bloom = tracker.build_world_bloom_records(&data);
         assert_eq!(world_bloom.len(), 1);
-        tracker.wl_user_keys.insert(200, 7);
+        tracker.user_memo.insert(
+            200,
+            UserMemoEntry {
+                user_id_key: 7,
+                name: "player-200".into(),
+                cheerful_team_id: None,
+                unique_id: None,
+                profile_hash: None,
+            },
+        );
         tracker.prev_world_bloom_state.insert(
             WorldBloomKey {
                 user_id_key: 7,
@@ -1272,7 +1286,7 @@ pub(crate) mod tests {
                 .await
                 .unwrap()
         );
-        assert_eq!(tracker.wl_user_keys.len(), 1);
+        assert_eq!(tracker.user_memo.len(), 1);
         assert_eq!(tracker.prev_world_bloom_state.len(), 1);
         assert_eq!(tracker.wl_sample_state.len(), 1);
 

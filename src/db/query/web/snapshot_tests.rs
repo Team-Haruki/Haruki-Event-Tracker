@@ -11,7 +11,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use sea_orm::{ConnectionTrait, DatabaseBackend};
 
 use crate::db::engine::DatabaseEngine;
-use crate::db::query::batch::batch_insert_flush;
+use crate::db::query::batch::{UserMemo, batch_insert_flush};
 use crate::db::query::edge::tests::{Rng, quiet_connect};
 use crate::db::query::user::PublicUserIdMode;
 use crate::db::query::web::{
@@ -233,7 +233,7 @@ async fn run_generated(engine: &DatabaseEngine, first_event_id: i64, seeds: u64)
                 &records,
                 &[],
                 &mut HashMap::new(),
-                &mut HashMap::new(),
+                &mut UserMemo::default(),
             )
             .await
             .unwrap();
@@ -358,7 +358,7 @@ async fn world_bloom_snapshot_drops_stale_occupant_and_honours_cut() {
     let anonymizer = UidAnonymizer::enabled("snapshot-test");
     let mode = PublicUserIdMode::Raw;
     let mut state = HashMap::new();
-    let mut keys = HashMap::new();
+    let mut keys = UserMemo::default();
     // t0: 1 -> rank 99, 2 -> rank 100. t1: player 1 drops to 100 but rank
     // 99 (now player 3) is only written at t2, in a later flush.
     for flush in [
@@ -452,7 +452,7 @@ async fn flush_writes_main_and_world_bloom_rows_atomically() {
         &main,
         &wl,
         &mut state,
-        &mut HashMap::new(),
+        &mut UserMemo::default(),
     )
     .await;
     assert!(result.is_err(), "the chapter insert must fail");
@@ -507,7 +507,7 @@ async fn a_large_backlog_flushes_in_one_transaction() {
         &main,
         &wl,
         &mut HashMap::new(),
-        &mut HashMap::new(),
+        &mut UserMemo::default(),
     )
     .await
     .unwrap();

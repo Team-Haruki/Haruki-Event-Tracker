@@ -9,6 +9,11 @@
 //! `db::pg_session` (one release ping instead of three, one statement
 //! cache, `write_timeout` enforced with a hard close). Other dialects use
 //! sea-orm's transaction handle; the statements are shared.
+//!
+//! The writer is the only process that writes a event's `users` table, so
+//! it remembers what it wrote ([`UserMemo`]): a user whose incoming
+//! dimension values match the memo needs neither the read-back nor the
+//! upsert, and its `user_id_key` comes from memory.
 
 use std::collections::{HashMap, HashSet};
 
@@ -48,14 +53,99 @@ struct UserKeyRow {
     profile_hash: Option<i64>,
 }
 
+impl UserKeyRow {
+    fn into_memo(self) -> Option<(i64, UserMemoEntry)> {
+        let uid = self.user_id.parse().ok()?;
+        Some((
+            uid,
+            UserMemoEntry {
+                user_id_key: self.user_id_key,
+                name: self.name,
+                cheerful_team_id: self.cheerful_team_id,
+                unique_id: self.unique_id,
+                profile_hash: self.profile_hash,
+            },
+        ))
+    }
+}
+
 #[derive(FromQueryResult)]
 struct UserKeyOnlyRow {
     user_id: String,
     user_id_key: i64,
 }
 
-type DirtyUser<'a> = (&'a str, Option<i64>);
-type ExistingUserState<'a> = (HashMap<String, i64>, Vec<DirtyUser<'a>>);
+/// What the writer knows a user's stored dimension row to hold: the values
+/// it last read back or wrote. `unique_id` is only meaningful while
+/// anonymization is on (it is what the row carries, `None` otherwise).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserMemoEntry {
+    pub user_id_key: i64,
+    pub name: String,
+    pub cheerful_team_id: Option<i64>,
+    pub unique_id: Option<String>,
+    pub profile_hash: Option<i64>,
+}
+
+/// `uid -> stored dimension row` memo, one per tracked event, owned by the
+/// tracker and fed by every committed flush. Correct because this writer is
+/// the only process that writes the event's `users` table: an entry only
+/// ever reflects a row this process read or wrote, and it advances only
+/// after the transaction that wrote it committed. A stale or missing entry
+/// costs one extra read-back/upsert, never a wrong key: a fresh process
+/// starts empty and warms up on its first flushes.
+///
+/// Salt rotation or a rename shows up as a mismatch against the entry
+/// (`unique_id`, `name`) and re-writes the row, exactly like the read-back
+/// did. Recreating an event's tables under a live writer is not supported
+/// (the memo would hand out keys the new table never allocated).
+#[derive(Debug, Default)]
+pub struct UserMemo {
+    entries: HashMap<i64, UserMemoEntry>,
+}
+
+impl UserMemo {
+    pub fn user_id_key(&self, uid: i64) -> Option<i64> {
+        self.entries.get(&uid).map(|e| e.user_id_key)
+    }
+
+    pub fn get(&self, uid: i64) -> Option<&UserMemoEntry> {
+        self.entries.get(&uid)
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    pub fn insert(&mut self, uid: i64, entry: UserMemoEntry) {
+        self.entries.insert(uid, entry);
+    }
+
+    /// The memoized key for `uid` when the stored row already carries
+    /// `info`'s dimension values, so the flush can skip the user entirely.
+    pub(crate) fn current_key(&self, uid: i64, info: &UserDimRow) -> Option<i64> {
+        self.entries
+            .get(&uid)
+            .filter(|entry| !user_row_changed(entry, info))
+            .map(|entry| entry.user_id_key)
+    }
+
+    fn absorb(&mut self, learned: Vec<(i64, UserMemoEntry)>) {
+        self.entries.extend(learned);
+    }
+}
+
+type DirtyUser = (i64, Option<i64>);
+
+/// Keys and learned rows of one users-table resolution.
+struct ResolvedUsers {
+    keys: HashMap<i64, i64>,
+    learned: Vec<(i64, UserMemoEntry)>,
+}
 
 /// Look up `time_id` per timestamp, inserting new rows with `status` for
 /// timestamps not yet present. Returns a `timestamp -> time_id` map.
@@ -205,8 +295,11 @@ async fn resolve_time_ids<C: ConnectionTrait>(
         .collect())
 }
 
-#[derive(Debug, Clone)]
-pub(crate) struct UserDimRow {
+/// One user's dimension values as the writer stores them: profile columns
+/// already serialized, `unique_id` already salted, and the profile digest
+/// computed once.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserDimRow {
     pub name: String,
     pub cheerful_team_id: Option<i64>,
     pub unique_id: Option<String>,
@@ -219,17 +312,18 @@ pub(crate) struct UserDimRow {
     pub profile_honors_json: Option<String>,
     pub honor_missions_json: Option<String>,
     pub player_frames_json: Option<String>,
+    pub profile_hash: i64,
 }
 
 impl UserDimRow {
-    fn from_record(
+    pub fn from_record(
         server: SekaiServerRegion,
         event_id: i64,
         anonymizer: &UidAnonymizer,
         r: &PlayerEventRankingRecordSchema,
     ) -> Self {
         let card = r.profile.card.as_ref();
-        Self {
+        let mut row = Self {
             name: r.name.clone(),
             cheerful_team_id: r.cheerful_team_id,
             unique_id: anonymizer
@@ -244,7 +338,10 @@ impl UserDimRow {
             profile_honors_json: json_array_or_none(&r.profile.profile_honors),
             honor_missions_json: json_array_or_none(&r.profile.honor_missions),
             player_frames_json: json_array_or_none(&r.profile.player_frames),
-        }
+            profile_hash: 0,
+        };
+        row.profile_hash = profile_hash(&row);
+        row
     }
 }
 
@@ -299,95 +396,116 @@ fn profile_hash(u: &UserDimRow) -> i64 {
     i64::from_le_bytes(digest[..8].try_into().expect("digest is 32 bytes"))
 }
 
-/// Look up `user_id_key` per `user_id`, inserting a new row when missing.
+/// Look up `user_id_key` per uid, inserting a new row when missing.
 /// Refreshes stored dimension columns when the upstream payload disagrees
-/// with the stored row — matches Go's `Save` semantics. Changed and missing
-/// rows go through one chunked multi-row upsert instead of per-user
-/// round trips; a stored `cheerful_team_id` is never overwritten with NULL
-/// (resolved in Rust before the upsert, so no dialect-specific COALESCE).
-pub(crate) async fn batch_get_or_create_user_id_keys<C: ConnectionTrait>(
+/// with the stored row — matches Go's `Save` semantics. Users the memo
+/// already holds with these exact values are answered from memory; the
+/// rest are read back in one select, and changed and missing rows go
+/// through one chunked multi-row upsert instead of per-user round trips.
+/// A stored `cheerful_team_id` is never overwritten with NULL (resolved in
+/// Rust before the upsert, so no dialect-specific COALESCE).
+async fn batch_get_or_create_user_id_keys<C: ConnectionTrait>(
     conn: &C,
     backend: DatabaseBackend,
     table_name: &str,
-    users: &HashMap<String, UserDimRow>,
-) -> Result<HashMap<String, i64>, DbErr> {
+    users: &HashMap<i64, UserDimRow>,
+    memo: &UserMemo,
+) -> Result<ResolvedUsers, DbErr> {
     let use_unique_ids = users.values().any(|u| u.unique_id.is_some());
-    let all_ids: Vec<&str> = users.keys().map(String::as_str).collect();
-    let hashes: HashMap<&str, i64> = users
-        .iter()
-        .map(|(id, u)| (id.as_str(), profile_hash(u)))
-        .collect();
-    let rows = select_user_rows(conn, backend, table_name, &all_ids, use_unique_ids).await?;
-    let (mut out, dirty) = collect_existing_user_state(rows, users, &hashes, use_unique_ids);
-
-    let missing: Vec<&str> = users
-        .keys()
-        .filter(|k| !out.contains_key(*k))
-        .map(String::as_str)
-        .collect();
-    let mut upserts = dirty;
-    upserts.extend(missing.iter().map(|id| (*id, users[*id].cheerful_team_id)));
-    if !upserts.is_empty() {
-        upsert_user_rows(conn, table_name, users, &hashes, &upserts, use_unique_ids).await?;
+    let mut keys = HashMap::with_capacity(users.len());
+    let mut probe: Vec<i64> = Vec::new();
+    for (&uid, info) in users {
+        match memo.current_key(uid, info) {
+            Some(key) => {
+                keys.insert(uid, key);
+            }
+            None => probe.push(uid),
+        }
+    }
+    if probe.is_empty() {
+        return Ok(ResolvedUsers {
+            keys,
+            learned: Vec::new(),
+        });
+    }
+    let probe_ids: Vec<String> = probe.iter().map(i64::to_string).collect();
+    let rows = select_user_rows(conn, backend, table_name, &probe_ids, use_unique_ids).await?;
+    let mut learned = Vec::new();
+    let mut dirty: Vec<DirtyUser> = Vec::new();
+    for row in rows {
+        let Some((uid, entry)) = row.into_memo() else {
+            continue;
+        };
+        let Some(info) = users.get(&uid) else {
+            continue;
+        };
+        if user_row_changed(&entry, info) {
+            dirty.push((uid, info.cheerful_team_id.or(entry.cheerful_team_id)));
+        } else {
+            learned.push((uid, entry.clone()));
+        }
+        keys.insert(uid, entry.user_id_key);
     }
 
-    load_missing_user_keys(conn, backend, table_name, &missing, &mut out).await?;
-    if out.len() != users.len() {
+    let missing: Vec<i64> = probe
+        .iter()
+        .copied()
+        .filter(|uid| !keys.contains_key(uid))
+        .collect();
+    let mut upserts = dirty;
+    upserts.extend(
+        missing
+            .iter()
+            .map(|&uid| (uid, users[&uid].cheerful_team_id)),
+    );
+    if !upserts.is_empty() {
+        upsert_user_rows(conn, table_name, users, &upserts, use_unique_ids).await?;
+    }
+
+    load_missing_user_keys(conn, backend, table_name, &missing, &mut keys).await?;
+    if keys.len() != users.len() {
         return Err(DbErr::Custom(format!(
             "inserted user_id_key rows vanished ({} of {} resolved)",
-            out.len(),
+            keys.len(),
             users.len()
         )));
     }
-    Ok(out)
-}
-
-fn collect_existing_user_state<'a>(
-    rows: Vec<UserKeyRow>,
-    users: &'a HashMap<String, UserDimRow>,
-    hashes: &HashMap<&str, i64>,
-    use_unique_ids: bool,
-) -> ExistingUserState<'a> {
-    let mut out = HashMap::with_capacity(users.len());
-    let mut dirty = Vec::new();
-    for row in rows {
-        let Some((user_id, info)) = users.get_key_value(&row.user_id) else {
-            continue;
-        };
-        if user_row_changed(&row, info, hashes[user_id.as_str()], use_unique_ids) {
-            dirty.push((
-                user_id.as_str(),
-                info.cheerful_team_id.or(row.cheerful_team_id),
-            ));
-        }
-        out.insert(row.user_id, row.user_id_key);
+    for (uid, cheerful_team_id) in upserts {
+        let info = &users[&uid];
+        learned.push((
+            uid,
+            UserMemoEntry {
+                user_id_key: keys[&uid],
+                name: info.name.clone(),
+                cheerful_team_id,
+                unique_id: use_unique_ids.then(|| info.unique_id.clone()).flatten(),
+                profile_hash: Some(info.profile_hash),
+            },
+        ));
     }
-    (out, dirty)
+    Ok(ResolvedUsers { keys, learned })
 }
 
-fn user_row_changed(
-    row: &UserKeyRow,
-    info: &UserDimRow,
-    profile_hash: i64,
-    use_unique_ids: bool,
-) -> bool {
-    let cheerful_changed = match (row.cheerful_team_id, info.cheerful_team_id) {
+/// Whether the stored row (as memoized or read back) differs from the
+/// incoming values. An incoming `cheerful_team_id` of NULL never counts
+/// as a change; `unique_id` is compared only while anonymization is on.
+fn user_row_changed(entry: &UserMemoEntry, info: &UserDimRow) -> bool {
+    let cheerful_changed = match (entry.cheerful_team_id, info.cheerful_team_id) {
         (_, None) => false,
         (Some(stored), Some(new)) => stored != new,
         (None, Some(_)) => true,
     };
-    row.name != info.name
+    entry.name != info.name
         || cheerful_changed
-        || use_unique_ids && row.unique_id != info.unique_id
-        || row.profile_hash != Some(profile_hash)
+        || info.unique_id.is_some() && entry.unique_id != info.unique_id
+        || entry.profile_hash != Some(info.profile_hash)
 }
 
 async fn upsert_user_rows<C: ConnectionTrait>(
     conn: &C,
     table_name: &str,
-    users: &HashMap<String, UserDimRow>,
-    hashes: &HashMap<&str, i64>,
-    upserts: &[DirtyUser<'_>],
+    users: &HashMap<i64, UserDimRow>,
+    upserts: &[DirtyUser],
     use_unique_ids: bool,
 ) -> Result<(), DbErr> {
     for chunk in upserts.chunks(INSERT_CHUNK) {
@@ -398,9 +516,9 @@ async fn upsert_user_rows<C: ConnectionTrait>(
             columns.push(event_users::Column::UniqueId);
         }
         ins.columns(columns.clone());
-        for (user_id, cheerful_team_id) in chunk {
-            let info = &users[*user_id];
-            let mut values = user_upsert_values(user_id, *cheerful_team_id, info, hashes[user_id]);
+        for &(uid, cheerful_team_id) in chunk {
+            let info = &users[&uid];
+            let mut values = user_upsert_values(&uid.to_string(), cheerful_team_id, info);
             if use_unique_ids {
                 values.push(info.unique_id.clone().into());
             }
@@ -436,7 +554,6 @@ fn user_upsert_values(
     user_id: &str,
     cheerful_team_id: Option<i64>,
     info: &UserDimRow,
-    profile_hash: i64,
 ) -> Vec<Expr> {
     vec![
         user_id.into(),
@@ -451,7 +568,7 @@ fn user_upsert_values(
         info.profile_honors_json.clone().into(),
         info.honor_missions_json.clone().into(),
         info.player_frames_json.clone().into(),
-        profile_hash.into(),
+        info.profile_hash.into(),
     ]
 }
 
@@ -459,8 +576,8 @@ async fn load_missing_user_keys<C: ConnectionTrait>(
     conn: &C,
     backend: DatabaseBackend,
     table_name: &str,
-    missing: &[&str],
-    out: &mut HashMap<String, i64>,
+    missing: &[i64],
+    out: &mut HashMap<i64, i64>,
 ) -> Result<(), DbErr> {
     for chunk in missing.chunks(INSERT_CHUNK) {
         let sel = Query::select()
@@ -473,13 +590,17 @@ async fn load_missing_user_keys<C: ConnectionTrait>(
                 Alias::new("user_id_key"),
             )
             .from(Alias::new(table_name))
-            .and_where(Expr::col(event_users::Column::UserId).is_in(chunk.iter().copied()))
+            .and_where(
+                Expr::col(event_users::Column::UserId).is_in(chunk.iter().map(i64::to_string)),
+            )
             .to_owned();
         for row in UserKeyOnlyRow::find_by_statement(backend.build(&sel))
             .all(conn)
             .await?
         {
-            out.insert(row.user_id, row.user_id_key);
+            if let Ok(uid) = row.user_id.parse::<i64>() {
+                out.insert(uid, row.user_id_key);
+            }
         }
     }
     Ok(())
@@ -493,7 +614,7 @@ async fn select_user_rows<C: ConnectionTrait>(
     conn: &C,
     backend: DatabaseBackend,
     table_name: &str,
-    user_ids: &[&str],
+    user_ids: &[String],
     use_unique_ids: bool,
 ) -> Result<Vec<UserKeyRow>, DbErr> {
     let mut rows = Vec::with_capacity(user_ids.len());
@@ -525,7 +646,7 @@ async fn select_user_rows<C: ConnectionTrait>(
             Alias::new("profile_hash"),
         )
         .from(Alias::new(table_name))
-        .and_where(Expr::col(event_users::Column::UserId).is_in(chunk.iter().copied()));
+        .and_where(Expr::col(event_users::Column::UserId).is_in(chunk.iter().map(String::as_str)));
         rows.extend(
             UserKeyRow::find_by_statement(backend.build(&sel))
                 .all(conn)
@@ -535,12 +656,18 @@ async fn select_user_rows<C: ConnectionTrait>(
     Ok(rows)
 }
 
+fn parse_uid(user_id: &str) -> Result<i64, DbErr> {
+    user_id
+        .parse()
+        .map_err(|_| DbErr::Custom(format!("user_id {user_id:?} is not a numeric id")))
+}
+
 fn collect_users<'a, I>(
     server: SekaiServerRegion,
     event_id: i64,
     anonymizer: &UidAnonymizer,
     records: I,
-) -> HashMap<String, UserDimRow>
+) -> Result<HashMap<i64, UserDimRow>, DbErr>
 where
     I: Iterator<Item = &'a PlayerEventRankingRecordSchema>,
 {
@@ -549,10 +676,10 @@ where
     // Latest timestamp wins, ties go to the later occurrence — the main and
     // World Bloom buffers are chained, so plain iteration order is not
     // sample order.
-    let mut latest: HashMap<&str, &PlayerEventRankingRecordSchema> = HashMap::new();
+    let mut latest: HashMap<i64, &PlayerEventRankingRecordSchema> = HashMap::new();
     for r in records {
         latest
-            .entry(r.user_id.as_str())
+            .entry(parse_uid(&r.user_id)?)
             .and_modify(|cur| {
                 if r.timestamp >= cur.timestamp {
                     *cur = r;
@@ -560,33 +687,36 @@ where
             })
             .or_insert(r);
     }
-    latest
+    Ok(latest
         .into_iter()
-        .map(|(user_id, r)| {
+        .map(|(uid, r)| {
             (
-                user_id.to_owned(),
+                uid,
                 UserDimRow::from_record(server, event_id, anonymizer, r),
             )
         })
-        .collect()
+        .collect())
 }
 
-#[tracing::instrument(skip(engine, records), fields(event_id, n = records.len()))]
+#[tracing::instrument(skip(engine, records, memo), fields(event_id, n = records.len()))]
 pub async fn batch_upsert_event_users(
     engine: &DatabaseEngine,
     server: SekaiServerRegion,
     event_id: i64,
     anonymizer: &UidAnonymizer,
     records: &[PlayerEventRankingRecordSchema],
+    memo: &mut UserMemo,
 ) -> Result<(), DbErr> {
     if records.is_empty() {
         return Ok(());
     }
     let backend = engine.backend();
     let users_tbl = intern(TableKind::EventUsers, event_id);
-    let users = collect_users(server, event_id, anonymizer, records.iter());
+    let users = collect_users(server, event_id, anonymizer, records.iter())?;
 
-    batch_get_or_create_user_id_keys(engine.conn(), backend, users_tbl, &users).await?;
+    let resolved =
+        batch_get_or_create_user_id_keys(engine.conn(), backend, users_tbl, &users, memo).await?;
+    memo.absorb(resolved.learned);
     Ok(())
 }
 
@@ -621,13 +751,13 @@ pub async fn batch_insert_event_rankings(
         records,
         &[],
         &mut HashMap::new(),
-        &mut HashMap::new(),
+        &mut UserMemo::default(),
     )
     .await
     .map(|_| ())
 }
 
-#[tracing::instrument(skip(engine, records, prev_state), fields(event_id, n = records.len()))]
+#[tracing::instrument(skip(engine, records, prev_state, memo), fields(event_id, n = records.len()))]
 pub async fn batch_insert_world_bloom_rankings(
     engine: &DatabaseEngine,
     server: SekaiServerRegion,
@@ -635,7 +765,7 @@ pub async fn batch_insert_world_bloom_rankings(
     anonymizer: &UidAnonymizer,
     records: &[PlayerWorldBloomRankingRecordSchema],
     prev_state: &mut HashMap<WorldBloomKey, PlayerState>,
-    user_key_cache: &mut HashMap<i64, i64>,
+    memo: &mut UserMemo,
 ) -> Result<usize, DbErr> {
     batch_insert_flush(
         engine,
@@ -645,7 +775,7 @@ pub async fn batch_insert_world_bloom_rankings(
         &[],
         records,
         prev_state,
-        user_key_cache,
+        memo,
     )
     .await
     .map(|outcome| outcome.world_bloom_rows)
@@ -658,13 +788,14 @@ struct FlushInput<'a> {
     main: &'a [PlayerEventRankingRecordSchema],
     world_bloom: &'a [PlayerWorldBloomRankingRecordSchema],
     prev_state: &'a HashMap<WorldBloomKey, PlayerState>,
+    memo: &'a UserMemo,
 }
 
 /// What a committed flush hands back to the caller's in-memory state.
 struct FlushWrite {
     outcome: FlushOutcome,
     running: HashMap<WorldBloomKey, PlayerState>,
-    user_lookup: HashMap<String, i64>,
+    learned: Vec<(i64, UserMemoEntry)>,
 }
 
 /// Writes one tracker flush — main and World Bloom rows of every buffered
@@ -680,13 +811,14 @@ struct FlushWrite {
 /// rows that already landed). `running` advances per record within the
 /// batch: a coalesced flush can carry several samples for one
 /// `(user, chapter)`, and a value that oscillates back to the pre-batch
-/// state is still a real trace point.
+/// state is still a real trace point. `memo` likewise learns the users
+/// rows only once they are committed.
 ///
 /// On PostgreSQL the flush is bounded by the engine's `write_timeout`; a
 /// timed-out flush surfaces as an error and is safe to retry.
 #[allow(clippy::too_many_arguments)]
 #[tracing::instrument(
-    skip(engine, anonymizer, main, world_bloom, prev_state, user_key_cache),
+    skip(engine, anonymizer, main, world_bloom, prev_state, memo),
     fields(event_id, main = main.len(), world_bloom = world_bloom.len())
 )]
 pub async fn batch_insert_flush(
@@ -697,7 +829,7 @@ pub async fn batch_insert_flush(
     main: &[PlayerEventRankingRecordSchema],
     world_bloom: &[PlayerWorldBloomRankingRecordSchema],
     prev_state: &mut HashMap<WorldBloomKey, PlayerState>,
-    user_key_cache: &mut HashMap<i64, i64>,
+    memo: &mut UserMemo,
 ) -> Result<FlushOutcome, DbErr> {
     if main.is_empty() && world_bloom.is_empty() {
         return Ok(FlushOutcome::default());
@@ -709,6 +841,7 @@ pub async fn batch_insert_flush(
         main,
         world_bloom,
         prev_state,
+        memo,
     };
     let written = match engine.backend() {
         DatabaseBackend::Postgres => flush_on_postgres(engine, &input).await?,
@@ -727,15 +860,7 @@ pub async fn batch_insert_flush(
         }
     };
 
-    if !world_bloom.is_empty() {
-        // Feed the tracker's uid -> key memo so future ticks can pre-diff
-        // these users before materializing their rows at all.
-        for (user_id, key) in &written.user_lookup {
-            if let Ok(uid) = user_id.parse::<i64>() {
-                user_key_cache.insert(uid, *key);
-            }
-        }
-    }
+    memo.absorb(written.learned);
     prev_state.extend(written.running);
     Ok(written.outcome)
 }
@@ -828,13 +953,17 @@ async fn write_flush<C: ConnectionTrait>(
             .main
             .iter()
             .chain(input.world_bloom.iter().map(|r| &r.base)),
-    );
-    let user_lookup = batch_get_or_create_user_id_keys(conn, backend, users_tbl, &users).await?;
+    )?;
+    let resolved =
+        batch_get_or_create_user_id_keys(conn, backend, users_tbl, &users, input.memo).await?;
     let user_key = |user_id: &str| {
-        user_lookup
-            .get(user_id)
-            .copied()
-            .ok_or_else(|| DbErr::Custom("missing user_id_key lookup".into()))
+        parse_uid(user_id).and_then(|uid| {
+            resolved
+                .keys
+                .get(&uid)
+                .copied()
+                .ok_or_else(|| DbErr::Custom("missing user_id_key lookup".into()))
+        })
     };
 
     let mut main_rows: Vec<(i64, i64, i64, i64)> = Vec::with_capacity(input.main.len());
@@ -874,7 +1003,7 @@ async fn write_flush<C: ConnectionTrait>(
         return Ok(FlushWrite {
             outcome: FlushOutcome::default(),
             running,
-            user_lookup,
+            learned: resolved.learned,
         });
     }
     let outcome = FlushOutcome {
@@ -958,7 +1087,7 @@ async fn write_flush<C: ConnectionTrait>(
     Ok(FlushWrite {
         outcome,
         running,
-        user_lookup,
+        learned: resolved.learned,
     })
 }
 
@@ -1057,7 +1186,7 @@ mod tests {
             &anonymizer,
             &[wl],
             &mut HashMap::new(),
-            &mut HashMap::new(),
+            &mut UserMemo::default(),
         )
         .await
         .unwrap();
@@ -1278,15 +1407,18 @@ mod tests {
             },
         }];
 
+        let mut memo = UserMemo::default();
         batch_upsert_event_users(
             &engine,
             SekaiServerRegion::Jp,
             event_id,
             &UidAnonymizer::disabled(),
             &records,
+            &mut memo,
         )
         .await
         .unwrap();
+        assert_eq!(memo.len(), 1);
 
         let user = get_user_data(&engine, event_id, "100", PublicUserIdMode::Raw)
             .await
@@ -1335,11 +1467,12 @@ mod tests {
             1,
             &UidAnonymizer::disabled(),
             main.iter().chain(wl.iter()),
-        );
+        )
+        .unwrap();
         assert_eq!(users.len(), 2);
-        assert_eq!(users["100"].name, "renamed");
-        assert_eq!(users["100"].cheerful_team_id, Some(2));
-        assert_eq!(users["200"].name, "player-200");
+        assert_eq!(users[&100].name, "renamed");
+        assert_eq!(users[&100].cheerful_team_id, Some(2));
+        assert_eq!(users[&200].name, "player-200");
 
         // Same timestamp: the later occurrence wins.
         let mut same_ts = record(t + 2, "100", 1, 1_300);
@@ -1350,8 +1483,126 @@ mod tests {
             1,
             &UidAnonymizer::disabled(),
             main.iter(),
+        )
+        .unwrap();
+        assert_eq!(users[&100].name, "later");
+    }
+
+    async fn stored_name(engine: &DatabaseEngine, event_id: i64, user_id: &str) -> String {
+        get_user_data(engine, event_id, user_id, PublicUserIdMode::Raw)
+            .await
+            .unwrap()
+            .unwrap()
+            .name
+    }
+
+    /// A user the memo holds with unchanged values is neither read back
+    /// nor rewritten: an out-of-band edit of the stored row survives the
+    /// next flush of that user. Once the payload changes, the row is
+    /// rewritten and the memo follows; a stored `cheerful_team_id` is kept
+    /// when the payload has none.
+    #[tokio::test]
+    async fn memoized_users_skip_the_read_back_and_upsert() {
+        let conn = Database::connect("sqlite::memory:").await.unwrap();
+        let engine = DatabaseEngine::from_connection(conn, DatabaseBackend::Sqlite);
+        let event_id = 8181;
+        create_event_tables(&engine, SekaiServerRegion::Jp, event_id, false)
+            .await
+            .unwrap();
+        let t = 1_710_000_000;
+        let anonymizer = UidAnonymizer::disabled();
+        let mut memo = UserMemo::default();
+        let mut first = record(t, "100", 1, 1_000);
+        first.cheerful_team_id = Some(2);
+
+        batch_insert_flush(
+            &engine,
+            SekaiServerRegion::Jp,
+            event_id,
+            &anonymizer,
+            std::slice::from_ref(&first),
+            &[],
+            &mut HashMap::new(),
+            &mut memo,
+        )
+        .await
+        .unwrap();
+        let entry = memo.get(100).unwrap().clone();
+        assert_eq!(entry.name, "player-100");
+        assert_eq!(entry.cheerful_team_id, Some(2));
+        assert!(entry.profile_hash.is_some());
+
+        engine
+            .conn()
+            .execute_unprepared(&format!(
+                "UPDATE {} SET name = 'edited' WHERE user_id = '100'",
+                intern(TableKind::EventUsers, event_id)
+            ))
+            .await
+            .unwrap();
+        let mut again = record(t + 1, "100", 1, 1_001);
+        again.cheerful_team_id = None;
+        batch_insert_flush(
+            &engine,
+            SekaiServerRegion::Jp,
+            event_id,
+            &anonymizer,
+            std::slice::from_ref(&again),
+            &[],
+            &mut HashMap::new(),
+            &mut memo,
+        )
+        .await
+        .unwrap();
+        assert_eq!(stored_name(&engine, event_id, "100").await, "edited");
+        assert_eq!(memo.get(100), Some(&entry));
+
+        let mut renamed = record(t + 2, "100", 1, 1_002);
+        renamed.name = "renamed".into();
+        batch_insert_flush(
+            &engine,
+            SekaiServerRegion::Jp,
+            event_id,
+            &anonymizer,
+            std::slice::from_ref(&renamed),
+            &[],
+            &mut HashMap::new(),
+            &mut memo,
+        )
+        .await
+        .unwrap();
+        assert_eq!(stored_name(&engine, event_id, "100").await, "renamed");
+        let entry = memo.get(100).unwrap();
+        assert_eq!(entry.name, "renamed");
+        assert_eq!(
+            entry.cheerful_team_id,
+            Some(2),
+            "stored team survives a NULL payload"
         );
-        assert_eq!(users["100"].name, "later");
+        assert_eq!(entry.user_id_key, memo.user_id_key(100).unwrap());
+
+        // A fresh memo (writer restart) reads the row back and relearns it
+        // without rewriting anything.
+        let mut fresh = UserMemo::default();
+        let mut same = record(t + 3, "100", 1, 1_003);
+        same.name = "renamed".into();
+        batch_insert_flush(
+            &engine,
+            SekaiServerRegion::Jp,
+            event_id,
+            &anonymizer,
+            std::slice::from_ref(&same),
+            &[],
+            &mut HashMap::new(),
+            &mut fresh,
+        )
+        .await
+        .unwrap();
+        assert_eq!(fresh.get(100), memo.get(100));
+        let lines = fetch_ranking_lines(&engine, event_id, &[1], None)
+            .await
+            .unwrap();
+        assert_eq!((lines[0].timestamp, lines[0].score), (t + 3, 1_003));
     }
 
     #[tokio::test]
@@ -1364,7 +1615,7 @@ mod tests {
             .unwrap();
 
         let mut prev_state = HashMap::new();
-        let mut user_keys = HashMap::new();
+        let mut user_keys = UserMemo::default();
         let mut record = PlayerWorldBloomRankingRecordSchema {
             base: PlayerEventRankingRecordSchema {
                 timestamp: 1_710_000_000,
@@ -1465,7 +1716,7 @@ mod tests {
         let t = 1_710_000_000;
         let anonymizer = UidAnonymizer::disabled();
         let mut prev_state = HashMap::new();
-        let mut user_keys = HashMap::new();
+        let mut user_keys = UserMemo::default();
         let wl = PlayerWorldBloomRankingRecordSchema {
             base: record(t + 1, "100", 1, 500),
             character_id: 19,
