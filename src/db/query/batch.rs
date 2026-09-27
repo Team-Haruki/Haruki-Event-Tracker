@@ -2,23 +2,25 @@
 //! (Go: `BatchInsertEventRankings`, `BatchInsertWorldBloomRankings`,
 //! `batchGetOrCreateTimeIDs`, `batchGetOrCreateUserIDKeys`).
 //!
-//! `batch_get_or_create_time_ids` executes inside the caller's transaction
-//! so the time-id row and the ranking rows commit atomically. The user
-//! dimension upsert is idempotent and independently useful, so it runs
-//! *before* the transaction — keeping the write transaction (and its row
-//! locks on `event_<id>_users`) as short as possible.
+//! One flush is one transaction: the user dimension upsert, the time-id
+//! rows and the ranking rows commit together. On PostgreSQL the whole
+//! flush — including the post-commit `pg_current_wal_lsn()` the cluster
+//! invalidation needs — runs on a single pooled connection through
+//! `db::pg_session` (one release ping instead of three, one statement
+//! cache, `write_timeout` enforced with a hard close). Other dialects use
+//! sea-orm's transaction handle; the statements are shared.
 
 use std::collections::{HashMap, HashSet};
 
 use sea_orm::sea_query::{Alias, Expr, OnConflict, Query};
 use sea_orm::{
-    ConnectionTrait, DatabaseBackend, DatabaseTransaction, DbErr, ExprTrait, FromQueryResult,
-    TransactionError, TransactionTrait,
+    ConnectionTrait, DatabaseBackend, DbErr, ExprTrait, FromQueryResult, TransactionTrait,
 };
 
 use crate::db::engine::DatabaseEngine;
 use crate::db::entity::time_id::time_id_for_timestamp;
 use crate::db::entity::{event, event_users, time_id, world_bloom};
+use crate::db::pg_session::{PgSession, with_writer_session};
 use crate::db::table_name::{TableKind, intern};
 use crate::model::enums::SekaiServerRegion;
 use crate::model::tracker::{
@@ -58,20 +60,19 @@ type ExistingUserState<'a> = (HashMap<String, i64>, Vec<DirtyUser<'a>>);
 /// Look up `time_id` per timestamp, inserting new rows with `status` for
 /// timestamps not yet present. Returns a `timestamp -> time_id` map.
 ///
+/// This is the legacy-table path: a table that still carries
+/// sequence-numbered rows has to be read back, because an existing row's
+/// id is reused as-is. Tables where every row already has
+/// `time_id == timestamp` skip the two lookups (see
+/// [`resolve_time_ids`]).
+///
 /// New rows get `time_id_for_timestamp` as their id rather than the
 /// sequence: a coalesced flush carries a whole window of timestamps, the
 /// main and World Bloom batches allocate separately, and a heartbeat can
 /// land while earlier samples are still buffered — with sequence ids each
-/// of those could hand a later sample a smaller id. Existing rows (legacy
-/// sequence ids included) are reused as-is, which is why the map is still
-/// read back rather than derived.
-///
-/// One coalesced flush carries a whole window of per-second timestamps, so
-/// this runs as three set-based statements (select existing, multi-row
-/// conflict-ignoring insert, re-select) instead of up to three statements
-/// *per timestamp* inside the write transaction.
-pub(crate) async fn batch_get_or_create_time_ids(
-    tx: &DatabaseTransaction,
+/// of those could hand a later sample a smaller id.
+pub(crate) async fn batch_get_or_create_time_ids<C: ConnectionTrait>(
+    conn: &C,
     backend: DatabaseBackend,
     table_name: &str,
     timestamps: &HashSet<i64>,
@@ -95,7 +96,7 @@ pub(crate) async fn batch_get_or_create_time_ids(
 
     let sel = select_by_ts(timestamps.iter().copied().collect());
     for row in TimeIdRow::find_by_statement(backend.build(&sel))
-        .all(tx)
+        .all(conn)
         .await?
     {
         out.insert(row.timestamp, row.time_id);
@@ -110,26 +111,11 @@ pub(crate) async fn batch_get_or_create_time_ids(
         return Ok(out);
     }
     missing.sort_unstable();
-
-    let mut ins = Query::insert();
-    ins.into_table(Alias::new(table_name)).columns([
-        time_id::Column::TimeId,
-        time_id::Column::Timestamp,
-        time_id::Column::Status,
-    ]);
-    for &ts in &missing {
-        ins.values_panic([time_id_for_timestamp(ts).into(), ts.into(), status.into()]);
-    }
-    ins.on_conflict(
-        OnConflict::column(time_id::Column::Timestamp)
-            .do_nothing_on([time_id::Column::Timestamp])
-            .to_owned(),
-    );
-    tx.execute(&ins).await?;
+    insert_time_rows(conn, table_name, &missing, status).await?;
 
     let sel = select_by_ts(missing);
     for row in TimeIdRow::find_by_statement(backend.build(&sel))
-        .all(tx)
+        .all(conn)
         .await?
     {
         out.insert(row.timestamp, row.time_id);
@@ -142,6 +128,81 @@ pub(crate) async fn batch_get_or_create_time_ids(
         )));
     }
     Ok(out)
+}
+
+/// One multi-row, conflict-ignoring insert of `time_id = timestamp` rows.
+async fn insert_time_rows<C: ConnectionTrait>(
+    conn: &C,
+    table_name: &str,
+    timestamps: &[i64],
+    status: i16,
+) -> Result<(), DbErr> {
+    let mut ins = Query::insert();
+    ins.into_table(Alias::new(table_name)).columns([
+        time_id::Column::TimeId,
+        time_id::Column::Timestamp,
+        time_id::Column::Status,
+    ]);
+    for &ts in timestamps {
+        ins.values_panic([time_id_for_timestamp(ts).into(), ts.into(), status.into()]);
+    }
+    ins.on_conflict(
+        OnConflict::column(time_id::Column::Timestamp)
+            .do_nothing_on([time_id::Column::Timestamp])
+            .to_owned(),
+    );
+    conn.execute(&ins).await?;
+    Ok(())
+}
+
+/// Whether every row of `event_<id>_time_id` has `time_id == timestamp`.
+/// True for every table this writer created; false while legacy
+/// sequence-numbered rows remain (until `repair-time-ids` renumbers them).
+pub(crate) async fn probe_time_id_alignment<C: ConnectionTrait>(
+    conn: &C,
+    table_name: &str,
+) -> Result<bool, DbErr> {
+    let sel = Query::select()
+        .expr(Expr::val(1))
+        .from(Alias::new(table_name))
+        .and_where(Expr::col(time_id::Column::TimeId).ne(Expr::col(time_id::Column::Timestamp)))
+        .limit(1)
+        .to_owned();
+    Ok(conn.query_one(&sel).await?.is_none())
+}
+
+/// `timestamp -> time_id` for a flush, creating the time rows. On an
+/// aligned table the map is derived — `time_id == timestamp` is what this
+/// writer inserts and what every existing row already satisfies, so the
+/// select/insert/re-select becomes one insert. The alignment answer is
+/// probed once per event and cached on the engine.
+async fn resolve_time_ids<C: ConnectionTrait>(
+    conn: &C,
+    engine: &DatabaseEngine,
+    event_id: i64,
+    table_name: &str,
+    timestamps: &HashSet<i64>,
+) -> Result<HashMap<i64, i64>, DbErr> {
+    let aligned = match engine.time_id_alignment(event_id) {
+        Some(aligned) => aligned,
+        None => {
+            let aligned = probe_time_id_alignment(conn, table_name).await?;
+            tracing::info!(event_id, aligned, "probed time_id alignment");
+            engine.set_time_id_alignment(event_id, aligned);
+            aligned
+        }
+    };
+    if !aligned {
+        return batch_get_or_create_time_ids(conn, engine.backend(), table_name, timestamps, 0)
+            .await;
+    }
+    let mut ordered: Vec<i64> = timestamps.iter().copied().collect();
+    ordered.sort_unstable();
+    insert_time_rows(conn, table_name, &ordered, 0).await?;
+    Ok(ordered
+        .into_iter()
+        .map(|ts| (ts, time_id_for_timestamp(ts)))
+        .collect())
 }
 
 #[derive(Debug, Clone)]
@@ -529,11 +590,13 @@ pub async fn batch_upsert_event_users(
     Ok(())
 }
 
-/// Rows a flush wrote, per table.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+/// Rows a flush wrote, per table, and (PostgreSQL) the WAL position right
+/// after its commit.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FlushOutcome {
     pub main_rows: usize,
     pub world_bloom_rows: usize,
+    pub lsn: Option<String>,
 }
 
 impl FlushOutcome {
@@ -588,6 +651,22 @@ pub async fn batch_insert_world_bloom_rankings(
     .map(|outcome| outcome.world_bloom_rows)
 }
 
+struct FlushInput<'a> {
+    server: SekaiServerRegion,
+    event_id: i64,
+    anonymizer: &'a UidAnonymizer,
+    main: &'a [PlayerEventRankingRecordSchema],
+    world_bloom: &'a [PlayerWorldBloomRankingRecordSchema],
+    prev_state: &'a HashMap<WorldBloomKey, PlayerState>,
+}
+
+/// What a committed flush hands back to the caller's in-memory state.
+struct FlushWrite {
+    outcome: FlushOutcome,
+    running: HashMap<WorldBloomKey, PlayerState>,
+    user_lookup: HashMap<String, i64>,
+}
+
 /// Writes one tracker flush — main and World Bloom rows of every buffered
 /// sample — in a single transaction, so a reader (or a streaming replica)
 /// sees either none of it or all of it: never a sample with only some of
@@ -602,6 +681,9 @@ pub async fn batch_insert_world_bloom_rankings(
 /// batch: a coalesced flush can carry several samples for one
 /// `(user, chapter)`, and a value that oscillates back to the pre-batch
 /// state is still a real trace point.
+///
+/// On PostgreSQL the flush is bounded by the engine's `write_timeout`; a
+/// timed-out flush surfaces as an error and is safe to retry.
 #[allow(clippy::too_many_arguments)]
 #[tracing::instrument(
     skip(engine, anonymizer, main, world_bloom, prev_state, user_key_cache),
@@ -620,43 +702,148 @@ pub async fn batch_insert_flush(
     if main.is_empty() && world_bloom.is_empty() {
         return Ok(FlushOutcome::default());
     }
+    let input = FlushInput {
+        server,
+        event_id,
+        anonymizer,
+        main,
+        world_bloom,
+        prev_state,
+    };
+    let written = match engine.backend() {
+        DatabaseBackend::Postgres => flush_on_postgres(engine, &input).await?,
+        _ => {
+            let tx = engine.conn().begin().await?;
+            match write_flush(&tx, engine, &input).await {
+                Ok(written) => {
+                    tx.commit().await?;
+                    written
+                }
+                Err(err) => {
+                    tx.rollback().await?;
+                    return Err(err);
+                }
+            }
+        }
+    };
+
+    if !world_bloom.is_empty() {
+        // Feed the tracker's uid -> key memo so future ticks can pre-diff
+        // these users before materializing their rows at all.
+        for (user_id, key) in &written.user_lookup {
+            if let Ok(uid) = user_id.parse::<i64>() {
+                user_key_cache.insert(uid, *key);
+            }
+        }
+    }
+    prev_state.extend(written.running);
+    Ok(written.outcome)
+}
+
+/// The PostgreSQL flush: `BEGIN` with the server-side timeouts, every
+/// statement, then `COMMIT` and the WAL position in one round trip — all
+/// on one connection. A failed statement rolls back on the same
+/// connection; if the rollback itself fails the connection is discarded.
+async fn flush_on_postgres(
+    engine: &DatabaseEngine,
+    input: &FlushInput<'_>,
+) -> Result<FlushWrite, DbErr> {
+    let begin = begin_sql(engine.write_timeout());
+    with_writer_session(engine, |session| async move {
+        if let Err(err) = session.execute_simple(begin).await {
+            session.rollback_or_mark_broken().await;
+            return Err(err);
+        }
+        let mut written = match write_flush(&*session, engine, input).await {
+            Ok(written) => written,
+            Err(err) => {
+                session.rollback_or_mark_broken().await;
+                return Err(err);
+            }
+        };
+        match commit_and_read_lsn(&session).await {
+            Ok(lsn) => {
+                written.outcome.lsn = lsn;
+                Ok(written)
+            }
+            Err(err) => {
+                session.rollback_or_mark_broken().await;
+                Err(err)
+            }
+        }
+    })
+    .await
+}
+
+/// `BEGIN` plus, when a write timeout is configured, the matching
+/// server-side caps for this transaction only: a runaway statement is
+/// cancelled, and a session left idle mid-transaction (client stalled or
+/// gone) is terminated so its locks don't outlive the client-side timeout.
+/// Transaction-local so init-time DDL on big legacy tables is unaffected.
+fn begin_sql(write_timeout: Option<std::time::Duration>) -> String {
+    match write_timeout {
+        Some(limit) => {
+            let ms = limit.as_millis().max(1);
+            format!(
+                "BEGIN; SET LOCAL statement_timeout = {ms}; \
+                 SET LOCAL idle_in_transaction_session_timeout = {ms}"
+            )
+        }
+        None => "BEGIN".into(),
+    }
+}
+
+/// Commit and read the flushed WAL position in the same round trip: the
+/// `SELECT` runs after `COMMIT` returned on this backend, so the position
+/// covers the commit record (default `synchronous_commit`).
+async fn commit_and_read_lsn(session: &PgSession) -> Result<Option<String>, DbErr> {
+    let rows = session
+        .query_simple("COMMIT; SELECT pg_current_wal_lsn()::text AS lsn".into())
+        .await?;
+    rows.last()
+        .map(|row| row.try_get::<String>("", "lsn"))
+        .transpose()
+}
+
+/// Every statement of one flush, in order, on `conn` — sea-orm's
+/// transaction handle or the PostgreSQL writer session between its
+/// `BEGIN` and `COMMIT`.
+async fn write_flush<C: ConnectionTrait>(
+    conn: &C,
+    engine: &DatabaseEngine,
+    input: &FlushInput<'_>,
+) -> Result<FlushWrite, DbErr> {
     let backend = engine.backend();
+    let event_id = input.event_id;
     let time_tbl = intern(TableKind::TimeId, event_id);
     let users_tbl = intern(TableKind::EventUsers, event_id);
     let event_tbl = intern(TableKind::Event, event_id);
     let wl_tbl = intern(TableKind::WorldBloom, event_id);
 
     let users = collect_users(
-        server,
+        input.server,
         event_id,
-        anonymizer,
-        main.iter().chain(world_bloom.iter().map(|r| &r.base)),
+        input.anonymizer,
+        input
+            .main
+            .iter()
+            .chain(input.world_bloom.iter().map(|r| &r.base)),
     );
-    let user_lookup =
-        batch_get_or_create_user_id_keys(engine.conn(), backend, users_tbl, &users).await?;
+    let user_lookup = batch_get_or_create_user_id_keys(conn, backend, users_tbl, &users).await?;
     let user_key = |user_id: &str| {
         user_lookup
             .get(user_id)
             .copied()
             .ok_or_else(|| DbErr::Custom("missing user_id_key lookup".into()))
     };
-    if !world_bloom.is_empty() {
-        // Feed the tracker's uid -> key memo so future ticks can pre-diff
-        // these users before materializing their rows at all.
-        for (user_id, key) in &user_lookup {
-            if let Ok(uid) = user_id.parse::<i64>() {
-                user_key_cache.insert(uid, *key);
-            }
-        }
-    }
 
-    let mut main_rows: Vec<(i64, i64, i64, i64)> = Vec::with_capacity(main.len());
-    for r in main {
+    let mut main_rows: Vec<(i64, i64, i64, i64)> = Vec::with_capacity(input.main.len());
+    for r in input.main {
         main_rows.push((r.timestamp, user_key(&r.user_id)?, r.score, r.rank));
     }
     let mut wl_rows: Vec<(i64, i64, i64, i64, i64)> = Vec::new();
     let mut running: HashMap<WorldBloomKey, PlayerState> = HashMap::new();
-    for r in world_bloom {
+    for r in input.world_bloom {
         let user_key = user_key(&r.base.user_id)?;
         let key = WorldBloomKey {
             user_id_key: user_key,
@@ -665,7 +852,7 @@ pub async fn batch_insert_flush(
         let last = running
             .get(&key)
             .copied()
-            .or_else(|| prev_state.get(&key).copied());
+            .or_else(|| input.prev_state.get(&key).copied());
         if last.is_none_or(|p| p.score != r.base.score || p.rank != r.base.rank) {
             wl_rows.push((
                 r.base.timestamp,
@@ -684,11 +871,16 @@ pub async fn batch_insert_flush(
         }
     }
     if main_rows.is_empty() && wl_rows.is_empty() {
-        return Ok(FlushOutcome::default());
+        return Ok(FlushWrite {
+            outcome: FlushOutcome::default(),
+            running,
+            user_lookup,
+        });
     }
     let outcome = FlushOutcome {
         main_rows: main_rows.len(),
         world_bloom_rows: wl_rows.len(),
+        lsn: None,
     };
     let timestamps: HashSet<i64> = main_rows
         .iter()
@@ -696,92 +888,78 @@ pub async fn batch_insert_flush(
         .chain(wl_rows.iter().map(|row| row.0))
         .collect();
 
-    engine
-        .conn()
-        .transaction::<_, (), DbErr>(move |tx| {
-            Box::pin(async move {
-                let time_lookup =
-                    batch_get_or_create_time_ids(tx, backend, time_tbl, &timestamps, 0).await?;
-                let time_id = |ts: &i64| {
-                    time_lookup
-                        .get(ts)
-                        .copied()
-                        .ok_or_else(|| DbErr::Custom("missing time_id lookup".into()))
-                };
+    let time_lookup = resolve_time_ids(conn, engine, event_id, time_tbl, &timestamps).await?;
+    let time_id = |ts: &i64| {
+        time_lookup
+            .get(ts)
+            .copied()
+            .ok_or_else(|| DbErr::Custom("missing time_id lookup".into()))
+    };
 
-                // Chunked inside the one transaction: a backlog after a DB
-                // outage must stay under PostgreSQL's 65,535 bind parameters.
-                for chunk in main_rows.chunks(INSERT_CHUNK) {
-                    let mut ins = Query::insert();
-                    ins.into_table(Alias::new(event_tbl)).columns([
-                        event::Column::TimeId,
-                        event::Column::UserIdKey,
-                        event::Column::Score,
-                        event::Column::Rank,
-                    ]);
-                    for (ts, user_key, score, rank) in chunk {
-                        ins.values_panic([
-                            time_id(ts)?.into(),
-                            (*user_key).into(),
-                            (*score).into(),
-                            (*rank).into(),
-                        ]);
-                    }
-                    ins.on_conflict(
-                        OnConflict::columns([event::Column::TimeId, event::Column::UserIdKey])
-                            .do_nothing_on([event::Column::TimeId, event::Column::UserIdKey])
-                            .to_owned(),
-                    );
-                    tx.execute(&ins).await?;
-                }
-
-                for chunk in wl_rows.chunks(INSERT_CHUNK) {
-                    let mut ins = Query::insert();
-                    ins.into_table(Alias::new(wl_tbl)).columns([
-                        world_bloom::Column::TimeId,
-                        world_bloom::Column::UserIdKey,
-                        world_bloom::Column::CharacterId,
-                        world_bloom::Column::Score,
-                        world_bloom::Column::Rank,
-                    ]);
-                    for (ts, user_key, character_id, score, rank) in chunk {
-                        ins.values_panic([
-                            time_id(ts)?.into(),
-                            (*user_key).into(),
-                            (*character_id).into(),
-                            (*score).into(),
-                            (*rank).into(),
-                        ]);
-                    }
-                    ins.on_conflict(
-                        OnConflict::columns([
-                            world_bloom::Column::TimeId,
-                            world_bloom::Column::UserIdKey,
-                            world_bloom::Column::CharacterId,
-                        ])
-                        .do_nothing_on([
-                            world_bloom::Column::TimeId,
-                            world_bloom::Column::UserIdKey,
-                            world_bloom::Column::CharacterId,
-                        ])
-                        .to_owned(),
-                    );
-                    tx.execute(&ins).await?;
-                }
-                Ok(())
-            })
-        })
-        .await
-        .map_err(unwrap_tx_err)?;
-
-    prev_state.extend(running);
-    Ok(outcome)
-}
-
-fn unwrap_tx_err(e: TransactionError<DbErr>) -> DbErr {
-    match e {
-        TransactionError::Connection(err) | TransactionError::Transaction(err) => err,
+    // Chunked inside the one transaction: a backlog after a DB outage
+    // must stay under PostgreSQL's 65,535 bind parameters.
+    for chunk in main_rows.chunks(INSERT_CHUNK) {
+        let mut ins = Query::insert();
+        ins.into_table(Alias::new(event_tbl)).columns([
+            event::Column::TimeId,
+            event::Column::UserIdKey,
+            event::Column::Score,
+            event::Column::Rank,
+        ]);
+        for (ts, user_key, score, rank) in chunk {
+            ins.values_panic([
+                time_id(ts)?.into(),
+                (*user_key).into(),
+                (*score).into(),
+                (*rank).into(),
+            ]);
+        }
+        ins.on_conflict(
+            OnConflict::columns([event::Column::TimeId, event::Column::UserIdKey])
+                .do_nothing_on([event::Column::TimeId, event::Column::UserIdKey])
+                .to_owned(),
+        );
+        conn.execute(&ins).await?;
     }
+
+    for chunk in wl_rows.chunks(INSERT_CHUNK) {
+        let mut ins = Query::insert();
+        ins.into_table(Alias::new(wl_tbl)).columns([
+            world_bloom::Column::TimeId,
+            world_bloom::Column::UserIdKey,
+            world_bloom::Column::CharacterId,
+            world_bloom::Column::Score,
+            world_bloom::Column::Rank,
+        ]);
+        for (ts, user_key, character_id, score, rank) in chunk {
+            ins.values_panic([
+                time_id(ts)?.into(),
+                (*user_key).into(),
+                (*character_id).into(),
+                (*score).into(),
+                (*rank).into(),
+            ]);
+        }
+        ins.on_conflict(
+            OnConflict::columns([
+                world_bloom::Column::TimeId,
+                world_bloom::Column::UserIdKey,
+                world_bloom::Column::CharacterId,
+            ])
+            .do_nothing_on([
+                world_bloom::Column::TimeId,
+                world_bloom::Column::UserIdKey,
+                world_bloom::Column::CharacterId,
+            ])
+            .to_owned(),
+        );
+        conn.execute(&ins).await?;
+    }
+    Ok(FlushWrite {
+        outcome,
+        running,
+        user_lookup,
+    })
 }
 
 #[cfg(test)]
@@ -908,6 +1086,98 @@ mod tests {
             .await
             .unwrap();
         assert_eq!((lines[0].timestamp, lines[0].score), (t + 4, 1_400));
+    }
+
+    /// A fresh table probes as aligned and the flush skips the time-id
+    /// lookups; a legacy row makes the probe say no and the lookups return.
+    #[tokio::test]
+    async fn time_id_alignment_is_probed_once_and_picks_the_path() {
+        let conn = Database::connect("sqlite::memory:").await.unwrap();
+        let engine = DatabaseEngine::from_connection(conn, DatabaseBackend::Sqlite);
+        let event_id = 7373;
+        create_event_tables(&engine, SekaiServerRegion::Jp, event_id, false)
+            .await
+            .unwrap();
+        let t = 1_710_000_000;
+        assert_eq!(engine.time_id_alignment(event_id), None);
+
+        batch_insert_event_rankings(
+            &engine,
+            SekaiServerRegion::Jp,
+            event_id,
+            &UidAnonymizer::disabled(),
+            &[record(t + 1, "100", 1, 1_001), record(t, "100", 1, 1_000)],
+        )
+        .await
+        .unwrap();
+        assert_eq!(engine.time_id_alignment(event_id), Some(true));
+        assert_eq!(
+            time_rows_by_id(&engine, event_id).await,
+            vec![(t, t), (t + 1, t + 1)]
+        );
+        // Re-flushing an already-present timestamp is a no-op on the time
+        // table and dedups the ranking row.
+        batch_insert_event_rankings(
+            &engine,
+            SekaiServerRegion::Jp,
+            event_id,
+            &UidAnonymizer::disabled(),
+            &[
+                record(t + 1, "100", 1, 1_001),
+                record(t + 2, "100", 1, 1_002),
+            ],
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            time_rows_by_id(&engine, event_id).await,
+            vec![(t, t), (t + 1, t + 1), (t + 2, t + 2)]
+        );
+        let stmt = Query::select()
+            .expr_as(
+                Func::count(Expr::col(event::Column::TimeId)),
+                Alias::new("n"),
+            )
+            .from(Alias::new(intern(TableKind::Event, event_id)))
+            .to_owned();
+        let count = CountRow::find_by_statement(engine.backend().build(&stmt))
+            .one(engine.conn())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(count.n, 3);
+
+        let legacy_event = 7374;
+        create_event_tables(&engine, SekaiServerRegion::Jp, legacy_event, false)
+            .await
+            .unwrap();
+        engine
+            .conn()
+            .execute_raw(Statement::from_string(
+                DatabaseBackend::Sqlite,
+                format!(
+                    "INSERT INTO {} (time_id, timestamp, status) VALUES (5, {t}, 0)",
+                    intern(TableKind::TimeId, legacy_event)
+                ),
+            ))
+            .await
+            .unwrap();
+        assert!(
+            !probe_time_id_alignment(engine.conn(), intern(TableKind::TimeId, legacy_event))
+                .await
+                .unwrap()
+        );
+        batch_insert_event_rankings(
+            &engine,
+            SekaiServerRegion::Jp,
+            legacy_event,
+            &UidAnonymizer::disabled(),
+            &[record(t, "100", 1, 1_000)],
+        )
+        .await
+        .unwrap();
+        assert_eq!(engine.time_id_alignment(legacy_event), Some(false));
+        assert_eq!(time_rows_by_id(&engine, legacy_event).await, vec![(5, t)]);
     }
 
     #[tokio::test]
@@ -1058,8 +1328,8 @@ mod tests {
 
         // Main buffer in sample order, then the World Bloom buffer chained
         // after it carrying an *earlier* sample of the same user.
-        let main = vec![oldest.clone(), newest.clone(), other.clone()];
-        let wl = vec![older.clone()];
+        let main = [oldest.clone(), newest.clone(), other.clone()];
+        let wl = [older.clone()];
         let users = collect_users(
             SekaiServerRegion::Jp,
             1,
@@ -1074,7 +1344,7 @@ mod tests {
         // Same timestamp: the later occurrence wins.
         let mut same_ts = record(t + 2, "100", 1, 1_300);
         same_ts.name = "later".into();
-        let main = vec![newest, same_ts];
+        let main = [newest, same_ts];
         let users = collect_users(
             SekaiServerRegion::Jp,
             1,
@@ -1163,5 +1433,137 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(count.n, 2);
+    }
+    /// `HET_TEST_PG_URL=postgres://... cargo test --lib -- --ignored
+    /// flush_on_postgres`.
+    #[tokio::test]
+    #[ignore = "needs HET_TEST_PG_URL"]
+    async fn flush_on_postgres_commits_on_one_connection_and_reports_the_lsn() {
+        use std::time::Duration;
+
+        use crate::db::pg_session::tests::pg_engine;
+
+        let Some(engine) = pg_engine(Duration::from_secs(5)).await else {
+            return;
+        };
+        let event_id = 900_000 + (chrono::Utc::now().timestamp() % 100_000);
+        for kind in [
+            TableKind::WorldBloom,
+            TableKind::Event,
+            TableKind::EventUsers,
+            TableKind::TimeId,
+        ] {
+            engine
+                .conn()
+                .execute_unprepared(&format!("DROP TABLE IF EXISTS {}", intern(kind, event_id)))
+                .await
+                .unwrap();
+        }
+        create_event_tables(&engine, SekaiServerRegion::Jp, event_id, true)
+            .await
+            .unwrap();
+        let t = 1_710_000_000;
+        let anonymizer = UidAnonymizer::disabled();
+        let mut prev_state = HashMap::new();
+        let mut user_keys = HashMap::new();
+        let wl = PlayerWorldBloomRankingRecordSchema {
+            base: record(t + 1, "100", 1, 500),
+            character_id: 19,
+        };
+
+        let outcome = batch_insert_flush(
+            &engine,
+            SekaiServerRegion::Jp,
+            event_id,
+            &anonymizer,
+            &[record(t, "100", 1, 1_000), record(t + 1, "200", 2, 900)],
+            std::slice::from_ref(&wl),
+            &mut prev_state,
+            &mut user_keys,
+        )
+        .await
+        .unwrap();
+        assert_eq!((outcome.main_rows, outcome.world_bloom_rows), (2, 1));
+        let lsn = outcome.lsn.expect("postgres flush reports the lsn");
+        assert!(lsn.contains('/'), "{lsn}");
+        assert_eq!(engine.time_id_alignment(event_id), Some(true));
+        assert_eq!(
+            time_rows_by_id(&engine, event_id).await,
+            vec![(t, t), (t + 1, t + 1)]
+        );
+        assert_eq!(prev_state.len(), 1);
+        assert_eq!(user_keys.len(), 2);
+
+        // Retry of the same window: nothing duplicated, and every pool
+        // connection is back to idle (none stuck in a release ping).
+        let again = batch_insert_flush(
+            &engine,
+            SekaiServerRegion::Jp,
+            event_id,
+            &anonymizer,
+            &[record(t, "100", 1, 1_000)],
+            &[wl],
+            &mut prev_state,
+            &mut user_keys,
+        )
+        .await
+        .unwrap();
+        assert_eq!((again.main_rows, again.world_bloom_rows), (1, 0));
+        let stmt = Query::select()
+            .expr_as(
+                Func::count(Expr::col(event::Column::TimeId)),
+                Alias::new("n"),
+            )
+            .from(Alias::new(intern(TableKind::Event, event_id)))
+            .to_owned();
+        let count = CountRow::find_by_statement(engine.backend().build(&stmt))
+            .one(engine.conn())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(count.n, 2);
+        let lines = fetch_ranking_lines(&engine, event_id, &[1, 2], None)
+            .await
+            .unwrap();
+        assert_eq!(lines.len(), 2);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let pool = engine.conn().get_postgres_connection_pool();
+        assert_eq!(pool.num_idle(), pool.size() as usize);
+
+        // A statement failure inside the flush rolls back on the same
+        // connection: the users upsert from that attempt is gone too.
+        engine
+            .conn()
+            .execute_unprepared(&format!(
+                "ALTER TABLE {} ADD CONSTRAINT het_block CHECK (score < 5000)",
+                intern(TableKind::Event, event_id)
+            ))
+            .await
+            .unwrap();
+        let err = batch_insert_flush(
+            &engine,
+            SekaiServerRegion::Jp,
+            event_id,
+            &anonymizer,
+            &[record(t + 5, "300", 3, 9_999)],
+            &[],
+            &mut prev_state,
+            &mut user_keys,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("het_block"), "{err}");
+        assert!(
+            get_user_data(&engine, event_id, "300", PublicUserIdMode::Raw)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            time_rows_by_id(&engine, event_id).await,
+            vec![(t, t), (t + 1, t + 1)]
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(pool.num_idle(), pool.size() as usize);
     }
 }

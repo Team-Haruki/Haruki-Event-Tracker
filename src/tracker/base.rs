@@ -345,7 +345,7 @@ impl EventTrackerBase {
             return Err(err.into());
         }
 
-        self.finish_cache_update("failed to bump API cache epoch after user refresh")
+        self.finish_cache_update(None, "failed to bump API cache epoch after user refresh")
             .await;
         self.last_post_end_user_refresh_at = Some(now);
         Ok(changed)
@@ -548,7 +548,7 @@ impl EventTrackerBase {
             self.abort_cache_update("failed to clear API cache dirty after no-op flush")
                 .await;
         }
-        self.complete_cache_update(batch_called, write_idle_heartbeat, now)
+        self.complete_cache_update(batch_called, outcome.lsn, write_idle_heartbeat, now)
             .await?;
 
         let changed_ranks = std::mem::take(&mut self.pending_changed_ranks);
@@ -639,11 +639,12 @@ impl EventTrackerBase {
     async fn complete_cache_update(
         &mut self,
         batch_called: bool,
+        lsn: Option<String>,
         write_idle_heartbeat: bool,
         now: i64,
     ) -> Result<(), TrackerError> {
         if batch_called {
-            self.finish_cache_update("failed to bump API cache epoch")
+            self.finish_cache_update(lsn, "failed to bump API cache epoch")
                 .await;
             // The batch itself created a status-0 `time_id` row, so this
             // tick counts as a heartbeat for throttling purposes.
@@ -660,11 +661,13 @@ impl EventTrackerBase {
             .await;
     }
 
-    async fn finish_cache_update(&mut self, message: &'static str) {
+    /// `lsn`: the WAL position the flush read after its commit, when it
+    /// had one (PostgreSQL); otherwise the cluster path reads it now.
+    async fn finish_cache_update(&mut self, lsn: Option<String>, message: &'static str) {
         let db = self.db.clone();
         self.cache_version = self
             .invalidation
-            .finish(self.server, self.event_id, &db, message)
+            .finish(self.server, self.event_id, &db, lsn, message)
             .await;
     }
 
@@ -1278,7 +1281,7 @@ pub(crate) mod tests {
             .abort_cache_update("coverage abort should succeed")
             .await;
         tracker
-            .finish_cache_update("coverage finish should succeed")
+            .finish_cache_update(None, "coverage finish should succeed")
             .await;
     }
 }

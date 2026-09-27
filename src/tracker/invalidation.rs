@@ -46,14 +46,17 @@ impl CacheInvalidation {
         }
     }
 
-    /// Called after the data is committed. `db` is consulted for the WAL
-    /// position on the cluster path only. Returns the bumped local cache
-    /// epoch — `None` when this process has no API cache to bump.
+    /// Called after the data is committed. On the cluster path the update
+    /// carries the WAL position: `lsn` when the flush already read it on
+    /// its own connection, otherwise one is read from `db` now. Returns
+    /// the bumped local cache epoch — `None` when this process has no API
+    /// cache to bump.
     pub async fn finish(
         &mut self,
         server: SekaiServerRegion,
         event_id: i64,
         db: &DatabaseEngine,
+        lsn: Option<String>,
         message: &str,
     ) -> Option<i64> {
         match self {
@@ -66,12 +69,15 @@ impl CacheInvalidation {
                 }
             },
             Self::Cluster(bus) => {
-                let lsn = match current_wal_lsn(db).await {
-                    Ok(lsn) => lsn,
-                    Err(err) => {
-                        tracing::warn!(%err, "failed to read WAL position; publishing without lsn");
-                        None
-                    }
+                let lsn = match lsn {
+                    Some(lsn) => Some(lsn),
+                    None => match current_wal_lsn(db).await {
+                        Ok(lsn) => lsn,
+                        Err(err) => {
+                            tracing::warn!(%err, "failed to read WAL position; publishing without lsn");
+                            None
+                        }
+                    },
                 };
                 let seq = bus.publish(server, event_id, chrono::Utc::now().timestamp(), lsn);
                 tracing::debug!(%server, event_id, seq, "published cluster update");
@@ -97,7 +103,8 @@ mod tests {
         inv.begin(SekaiServerRegion::Jp, 1).await;
         inv.abort(SekaiServerRegion::Jp, 1, "x").await;
         assert!(rx.try_recv().is_err());
-        inv.finish(SekaiServerRegion::Jp, 1, &engine, "x").await;
+        inv.finish(SekaiServerRegion::Jp, 1, &engine, None, "x")
+            .await;
         let event = rx.try_recv().unwrap();
         assert_eq!(
             (event.server, event.event_id, event.seq),
@@ -105,16 +112,28 @@ mod tests {
         );
         assert!(event.lsn.is_none());
 
+        // A flush that read its own WAL position hands it through as-is.
+        inv.finish(
+            SekaiServerRegion::Jp,
+            1,
+            &engine,
+            Some("0/1A2B3C".into()),
+            "x",
+        )
+        .await;
+        let event = rx.try_recv().unwrap();
+        assert_eq!(event.lsn.as_deref(), Some("0/1A2B3C"));
+
         assert_eq!(
             CacheInvalidation::from_parts(None, Some(UpdateBus::new()))
-                .finish(SekaiServerRegion::Jp, 1, &engine, "x")
+                .finish(SekaiServerRegion::Jp, 1, &engine, None, "x")
                 .await,
             None
         );
         let mut disabled = CacheInvalidation::from_parts(None, None);
         assert_eq!(
             disabled
-                .finish(SekaiServerRegion::Jp, 1, &engine, "x")
+                .finish(SekaiServerRegion::Jp, 1, &engine, None, "x")
                 .await,
             None
         );
@@ -137,11 +156,11 @@ mod tests {
         let mut inv = CacheInvalidation::from_parts(Some(conn), None);
         inv.begin(SekaiServerRegion::Jp, event_id).await;
         let first = inv
-            .finish(SekaiServerRegion::Jp, event_id, &engine, "x")
+            .finish(SekaiServerRegion::Jp, event_id, &engine, None, "x")
             .await;
         assert_eq!(first, Some(1));
         let second = inv
-            .finish(SekaiServerRegion::Jp, event_id, &engine, "x")
+            .finish(SekaiServerRegion::Jp, event_id, &engine, None, "x")
             .await;
         assert_eq!(second, Some(2));
     }
