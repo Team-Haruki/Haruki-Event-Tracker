@@ -12,6 +12,11 @@ static LOGGER_STARTED: AtomicBool = AtomicBool::new(false);
 pub struct CacheStats {
     pub l1_hit: AtomicU64,
     pub l1_control_hit: AtomicU64,
+    pub l1_expired: AtomicU64,
+    pub l1_evicted: AtomicU64,
+    /// Gauges refreshed by the L1 sweeper, not per-interval counters.
+    pub l1_entries: AtomicU64,
+    pub l1_bytes: AtomicU64,
     pub l2_hit: AtomicU64,
     pub l2_miss: AtomicU64,
     pub l2_not_found: AtomicU64,
@@ -31,6 +36,10 @@ impl CacheStats {
         Self {
             l1_hit: AtomicU64::new(0),
             l1_control_hit: AtomicU64::new(0),
+            l1_expired: AtomicU64::new(0),
+            l1_evicted: AtomicU64::new(0),
+            l1_entries: AtomicU64::new(0),
+            l1_bytes: AtomicU64::new(0),
             l2_hit: AtomicU64::new(0),
             l2_miss: AtomicU64::new(0),
             l2_not_found: AtomicU64::new(0),
@@ -97,6 +106,14 @@ pub fn incr(counter: &AtomicU64) {
     counter.fetch_add(1, Ordering::Relaxed);
 }
 
+pub fn add(counter: &AtomicU64, n: u64) {
+    counter.fetch_add(n, Ordering::Relaxed);
+}
+
+pub fn set(gauge: &AtomicU64, value: u64) {
+    gauge.store(value, Ordering::Relaxed);
+}
+
 pub fn spawn_aggregation_logger() {
     if LOGGER_STARTED.swap(true, Ordering::Relaxed) {
         return;
@@ -119,6 +136,10 @@ fn log_snapshot() {
         target: "api_stats",
         l1_hit = take(&CACHE_STATS.l1_hit),
         l1_control_hit = take(&CACHE_STATS.l1_control_hit),
+        l1_expired = take(&CACHE_STATS.l1_expired),
+        l1_evicted = take(&CACHE_STATS.l1_evicted),
+        l1_entries = CACHE_STATS.l1_entries.load(Ordering::Relaxed),
+        l1_bytes = CACHE_STATS.l1_bytes.load(Ordering::Relaxed),
         l2_hit = take(&CACHE_STATS.l2_hit),
         l2_miss = take(&CACHE_STATS.l2_miss),
         l2_not_found = take(&CACHE_STATS.l2_not_found),
@@ -152,10 +173,14 @@ mod tests {
         let access = AccessStats::default();
         let api = ApiStats::default();
         incr(&cache.l1_hit);
+        add(&cache.l1_expired, 3);
+        set(&cache.l1_bytes, 42);
         incr(&access.logged);
         incr(&api.service_unavailable);
 
         assert_eq!(take(&cache.l1_hit), 1);
+        assert_eq!(take(&cache.l1_expired), 3);
+        assert_eq!(cache.l1_bytes.load(Ordering::Relaxed), 42);
         assert_eq!(take(&cache.l1_hit), 0);
         assert_eq!(take(&access.logged), 1);
         assert_eq!(take(&api.service_unavailable), 1);
