@@ -4,8 +4,8 @@ use futures::stream;
 
 use crate::api::extract::{ApiAudience, prepare_audience_user_id_mode, resolve_region_engine};
 use crate::api::state::AppState;
-use crate::db::query::web::{WebTraceFilter, search_user_trace, search_world_bloom_user_trace};
-use crate::model::api::{CloudRankInfoSchema, RecordedRankData};
+use crate::db::query::score_samples::{ScoreSample, fetch_user_score_samples};
+use crate::model::api::CloudRankInfoSchema;
 
 const CLOUD_TRACE_METRICS_LOOKBACK_SECONDS: i64 = 12 * 60 * 60;
 const CLOUD_RECOVERY_IDLE_SECONDS: i64 = 5 * 60;
@@ -46,49 +46,40 @@ pub(super) async fn enrich_cloud_rank_infos_with_trace_metrics(
     // Per-rank fetches are independent; run them concurrently but bounded, so
     // one 100-rank batch can't park 100 waiters on the trace-permit queue
     // ahead of every other request.
-    let traces: Vec<_> = stream::iter(jobs.into_iter().map(|(idx, user_id, timestamp)| {
+    // The whole history up to the rank's own sample: `record_start_at`
+    // looks for the last idle gap anywhere in it, so no lookback window.
+    let samples: Vec<_> = stream::iter(jobs.into_iter().map(|(idx, user_id, timestamp)| {
         let engine = engine.clone();
         async move {
             let Ok(_permit) = state.query_limiter().acquire_trace(region).await else {
                 return (idx, None);
             };
-            let filter = cloud_trace_metrics_filter(timestamp);
-            let trace = match character_id {
-                Some(character_id) => {
-                    search_world_bloom_user_trace(
-                        &engine,
-                        event_id,
-                        character_id,
-                        user_id.as_str(),
-                        &filter,
-                        mode,
-                    )
-                    .await
-                }
-                None => search_user_trace(&engine, event_id, user_id.as_str(), &filter, mode).await,
-            };
-            (idx, trace.ok())
+            let samples = fetch_user_score_samples(
+                &engine,
+                region,
+                event_id,
+                character_id,
+                user_id.as_str(),
+                cloud_trace_metrics_end(timestamp),
+                mode,
+            )
+            .await;
+            (idx, samples.ok())
         }
     }))
     .buffer_unordered(state.query_limiter().batch_trace_fill_concurrency())
     .collect()
     .await;
     let now = Utc::now();
-    for (idx, trace) in traces {
-        if let Some(trace) = trace {
-            apply_cloud_trace_metrics_at(&mut ranks[idx], &trace, now);
+    for (idx, samples) in samples {
+        if let Some(samples) = samples {
+            apply_cloud_trace_metrics_at(&mut ranks[idx], &samples, now);
         }
     }
 }
 
-fn cloud_trace_metrics_filter(rank_timestamp: i64) -> WebTraceFilter {
-    let end_time = positive_timestamp(Some(normalize_tracker_unix_seconds(rank_timestamp)));
-    WebTraceFilter {
-        start_time: None,
-        end_time,
-        cursor: None,
-        limit: None,
-    }
+fn cloud_trace_metrics_end(rank_timestamp: i64) -> Option<i64> {
+    positive_timestamp(Some(normalize_tracker_unix_seconds(rank_timestamp)))
 }
 
 fn has_cloud_round_metrics(info: &CloudRankInfoSchema) -> bool {
@@ -101,20 +92,14 @@ fn has_cloud_round_metrics(info: &CloudRankInfoSchema) -> bool {
         && info.record_start_at.is_some()
 }
 
-#[derive(Debug, Clone, Copy)]
-struct CloudTraceSample {
-    score: i64,
-    timestamp: i64,
-}
-
 fn apply_cloud_trace_metrics_at(
     info: &mut CloudRankInfoSchema,
-    trace: &[RecordedRankData],
+    trace: &[ScoreSample],
     now: DateTime<Utc>,
 ) {
     let mut samples = trace
         .iter()
-        .filter_map(cloud_trace_sample)
+        .copied()
         .filter(|sample| sample.timestamp > 0)
         .collect::<Vec<_>>();
     if samples.is_empty() {
@@ -182,19 +167,6 @@ fn apply_cloud_trace_metrics_at(
     }
 }
 
-fn cloud_trace_sample(rank_data: &RecordedRankData) -> Option<CloudTraceSample> {
-    match rank_data {
-        RecordedRankData::Normal(data) => Some(CloudTraceSample {
-            score: data.score,
-            timestamp: data.timestamp,
-        }),
-        RecordedRankData::WorldBloom(data) => Some(CloudTraceSample {
-            score: data.score,
-            timestamp: data.timestamp,
-        }),
-    }
-}
-
 fn normalize_tracker_unix_seconds(timestamp: i64) -> i64 {
     if timestamp > 1_000_000_000_000 {
         timestamp / 1000
@@ -223,7 +195,7 @@ fn effective_tracker_window_end_unix_seconds(last_timestamp: i64, now: DateTime<
     now_sec
 }
 
-fn find_window_baseline_index(samples: &[CloudTraceSample], window_start: i64) -> Option<usize> {
+fn find_window_baseline_index(samples: &[ScoreSample], window_start: i64) -> Option<usize> {
     if samples.is_empty() {
         return None;
     }
@@ -239,14 +211,14 @@ fn find_window_baseline_index(samples: &[CloudTraceSample], window_start: i64) -
     Some(baseline.unwrap_or(0))
 }
 
-fn count_positive_deltas(samples: &[CloudTraceSample]) -> i64 {
+fn count_positive_deltas(samples: &[ScoreSample]) -> i64 {
     samples
         .windows(2)
         .filter(|window| window[1].score - window[0].score > 0)
         .count() as i64
 }
 
-fn recovery_record_start_at(samples: &[CloudTraceSample]) -> Option<i64> {
+fn recovery_record_start_at(samples: &[ScoreSample]) -> Option<i64> {
     if samples.is_empty() {
         return None;
     }
@@ -281,29 +253,157 @@ fn positive_timestamp(timestamp: Option<i64>) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::limiter::ApiQueryLimiter;
+    use crate::api::realtime::RealtimeHub;
+    use crate::api::ws_ticket::WsTicketStore;
+    use crate::config::ApiQueryConfig;
+    use crate::db::query::user::PublicUserIdMode;
+    use crate::db::query::web::tests::{
+        seed_normal_event_with_history, seed_player_pushed_out,
+        seed_world_bloom_event_with_history, sqlite_engine,
+    };
+    use crate::db::query::web::{WebTraceFilter, search_user_trace, search_world_bloom_user_trace};
+    use crate::db::schema::create_event_tables;
+    use crate::model::api::RecordedRankData;
+    use crate::model::enums::SekaiServerRegion;
+    use crate::privacy::UidAnonymizer;
     use chrono::TimeZone;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    const NORMAL_EVENT: i64 = 821;
+    const WORLD_BLOOM_EVENT: i64 = 822;
+
+    async fn test_state() -> AppState {
+        let engine = sqlite_engine().await;
+        create_event_tables(&engine, SekaiServerRegion::Jp, NORMAL_EVENT, false)
+            .await
+            .unwrap();
+        seed_normal_event_with_history(&engine, NORMAL_EVENT).await;
+        seed_player_pushed_out(&engine, NORMAL_EVENT, None, 3).await;
+        create_event_tables(&engine, SekaiServerRegion::Jp, WORLD_BLOOM_EVENT, true)
+            .await
+            .unwrap();
+        seed_world_bloom_event_with_history(&engine, WORLD_BLOOM_EVENT).await;
+        seed_player_pushed_out(&engine, WORLD_BLOOM_EVENT, Some(17), 3).await;
+        AppState::new(
+            HashMap::from([(SekaiServerRegion::Jp, Arc::new(engine))]),
+            None,
+            ApiQueryLimiter::new(ApiQueryConfig::default(), [SekaiServerRegion::Jp]),
+            UidAnonymizer::disabled(),
+            None,
+            RealtimeHub::new(),
+            WsTicketStore::default(),
+        )
+    }
+
+    /// The lean samples query feeds the metrics exactly what the full user
+    /// trace did. The seeds have sequence `time_id`s (1, 2, …) that differ
+    /// from their timestamps, so the timestamp must come from the time
+    /// table; player 300 was pushed out (history but no current rank),
+    /// 999 was never seen.
+    #[tokio::test]
+    async fn lean_samples_yield_the_metrics_of_the_full_trace() {
+        let state = test_state().await;
+        let (_, engine) = resolve_region_engine(&state, "jp").unwrap();
+        let end = 1_710_000_120;
+        for (event, chapter) in [(NORMAL_EVENT, None), (WORLD_BLOOM_EVENT, Some(17))] {
+            for user in ["100", "300", "400", "999"] {
+                let filter = WebTraceFilter {
+                    start_time: None,
+                    end_time: Some(end),
+                    cursor: None,
+                    limit: None,
+                };
+                let trace = match chapter {
+                    Some(chapter) => search_world_bloom_user_trace(
+                        &engine,
+                        SekaiServerRegion::Jp,
+                        event,
+                        chapter,
+                        user,
+                        &filter,
+                        PublicUserIdMode::Raw,
+                    )
+                    .await
+                    .unwrap(),
+                    None => search_user_trace(
+                        &engine,
+                        SekaiServerRegion::Jp,
+                        event,
+                        user,
+                        &filter,
+                        PublicUserIdMode::Raw,
+                    )
+                    .await
+                    .unwrap(),
+                };
+                let trace_samples: Vec<ScoreSample> = trace
+                    .iter()
+                    .map(|row| match row {
+                        RecordedRankData::Normal(row) => ScoreSample {
+                            score: row.score,
+                            timestamp: row.timestamp,
+                        },
+                        RecordedRankData::WorldBloom(row) => ScoreSample {
+                            score: row.score,
+                            timestamp: row.timestamp,
+                        },
+                    })
+                    .collect();
+                let samples = fetch_user_score_samples(
+                    &engine,
+                    SekaiServerRegion::Jp,
+                    event,
+                    chapter,
+                    user,
+                    cloud_trace_metrics_end(end),
+                    PublicUserIdMode::Raw,
+                )
+                .await
+                .unwrap();
+                assert_eq!(samples, trace_samples, "{event}/{chapter:?} user {user}");
+                assert_eq!(samples.is_empty(), user == "999");
+
+                let now = Utc::now();
+                let mut expected = cloud_info_fixture(3, 0, end);
+                expected.user_id = Some(user.to_owned());
+                apply_cloud_trace_metrics_at(&mut expected, &trace_samples, now);
+                let mut ranks = vec![cloud_info_fixture(3, 0, end)];
+                ranks[0].user_id = Some(user.to_owned());
+                enrich_cloud_rank_infos_with_trace_metrics(
+                    &state, "jp", event, chapter, &mut ranks,
+                )
+                .await;
+                assert_eq!(
+                    sonic_rs::to_string(&ranks[0]).unwrap(),
+                    sonic_rs::to_string(&expected).unwrap(),
+                    "{event}/{chapter:?} user {user}"
+                );
+                // Not vacuous: two rows 60 s apart yield a round of +300.
+                if user == "100" {
+                    assert_eq!(ranks[0].latest_pt, Some(300));
+                    assert_eq!(ranks[0].record_start_at, Some(1_710_000_000_000));
+                }
+            }
+        }
+    }
 
     #[test]
     fn cloud_trace_metrics_match_cloud_fallback_semantics() {
         let trace = vec![
-            RecordedRankData::Normal(crate::model::api::RecordedRankingSchema {
-                rank: 100,
-                user_id: "12345".to_owned(),
+            ScoreSample {
                 score: 1_000_000,
                 timestamp: 1_704_060_000,
-            }),
-            RecordedRankData::Normal(crate::model::api::RecordedRankingSchema {
-                rank: 100,
-                user_id: "12345".to_owned(),
+            },
+            ScoreSample {
                 score: 1_250_000,
                 timestamp: 1_704_063_600,
-            }),
-            RecordedRankData::Normal(crate::model::api::RecordedRankingSchema {
-                rank: 100,
-                user_id: "12345".to_owned(),
+            },
+            ScoreSample {
                 score: 1_550_000,
                 timestamp: 1_704_067_200,
-            }),
+            },
         ];
         let mut info = cloud_info_fixture(100, 1_550_000, 1_704_067_200);
 
@@ -325,18 +425,14 @@ mod tests {
     #[test]
     fn cloud_trace_metrics_use_recovery_start_time() {
         let trace = vec![
-            RecordedRankData::Normal(crate::model::api::RecordedRankingSchema {
-                rank: 100,
-                user_id: "12345".to_owned(),
+            ScoreSample {
                 score: 1_250_000,
                 timestamp: 1_704_063_600,
-            }),
-            RecordedRankData::Normal(crate::model::api::RecordedRankingSchema {
-                rank: 100,
-                user_id: "12345".to_owned(),
+            },
+            ScoreSample {
                 score: 1_550_000,
                 timestamp: 1_704_067_200,
-            }),
+            },
         ];
         let mut info = cloud_info_fixture(100, 1_550_000, 1_704_067_200);
         info.record_start_at = Some(1_704_000_000_000);
@@ -355,30 +451,22 @@ mod tests {
     #[test]
     fn cloud_trace_metrics_keep_rt_after_recent_recovery() {
         let trace = vec![
-            RecordedRankData::Normal(crate::model::api::RecordedRankingSchema {
-                rank: 1,
-                user_id: "12345".to_owned(),
+            ScoreSample {
                 score: 1_000_000,
                 timestamp: 1_704_060_000,
-            }),
-            RecordedRankData::Normal(crate::model::api::RecordedRankingSchema {
-                rank: 1,
-                user_id: "12345".to_owned(),
+            },
+            ScoreSample {
                 score: 1_000_000,
                 timestamp: 1_704_060_360,
-            }),
-            RecordedRankData::Normal(crate::model::api::RecordedRankingSchema {
-                rank: 1,
-                user_id: "12345".to_owned(),
+            },
+            ScoreSample {
                 score: 1_300_000,
                 timestamp: 1_704_060_420,
-            }),
-            RecordedRankData::Normal(crate::model::api::RecordedRankingSchema {
-                rank: 1,
-                user_id: "12345".to_owned(),
+            },
+            ScoreSample {
                 score: 1_600_000,
                 timestamp: 1_704_067_200,
-            }),
+            },
         ];
         let mut info = cloud_info_fixture(1, 1_600_000, 1_704_067_200);
 
@@ -394,36 +482,26 @@ mod tests {
     #[test]
     fn cloud_trace_metrics_keep_rt_before_recent_metric_window() {
         let trace = vec![
-            RecordedRankData::Normal(crate::model::api::RecordedRankingSchema {
-                rank: 1,
-                user_id: "12345".to_owned(),
+            ScoreSample {
                 score: 1_000_000,
                 timestamp: 1_704_000_000,
-            }),
-            RecordedRankData::Normal(crate::model::api::RecordedRankingSchema {
-                rank: 1,
-                user_id: "12345".to_owned(),
+            },
+            ScoreSample {
                 score: 1_000_000,
                 timestamp: 1_704_000_360,
-            }),
-            RecordedRankData::Normal(crate::model::api::RecordedRankingSchema {
-                rank: 1,
-                user_id: "12345".to_owned(),
+            },
+            ScoreSample {
                 score: 1_300_000,
                 timestamp: 1_704_000_420,
-            }),
-            RecordedRankData::Normal(crate::model::api::RecordedRankingSchema {
-                rank: 1,
-                user_id: "12345".to_owned(),
+            },
+            ScoreSample {
                 score: 2_000_000,
                 timestamp: 1_704_063_600,
-            }),
-            RecordedRankData::Normal(crate::model::api::RecordedRankingSchema {
-                rank: 1,
-                user_id: "12345".to_owned(),
+            },
+            ScoreSample {
                 score: 2_300_000,
                 timestamp: 1_704_067_200,
-            }),
+            },
         ];
         let mut info = cloud_info_fixture(1, 2_300_000, 1_704_067_200);
 
@@ -439,12 +517,13 @@ mod tests {
     }
 
     #[test]
-    fn cloud_trace_metrics_filter_looks_back_from_current_rank_time() {
-        let filter = cloud_trace_metrics_filter(1_704_067_200);
-        assert_eq!(filter.end_time, Some(1_704_067_200));
-        assert_eq!(filter.start_time, None);
-        assert_eq!(filter.cursor, None);
-        assert_eq!(filter.limit, None);
+    fn cloud_trace_metrics_end_at_the_current_rank_time() {
+        assert_eq!(cloud_trace_metrics_end(1_704_067_200), Some(1_704_067_200));
+        assert_eq!(
+            cloud_trace_metrics_end(1_704_067_200_000),
+            Some(1_704_067_200)
+        );
+        assert_eq!(cloud_trace_metrics_end(0), None);
     }
 
     #[test]

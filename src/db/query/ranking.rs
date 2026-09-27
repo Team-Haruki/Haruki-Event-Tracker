@@ -10,9 +10,11 @@ use sea_orm::{DbErr, ExprTrait, FromQueryResult};
 
 use crate::db::engine::DatabaseEngine;
 use crate::db::entity::{event, event_users, time_id};
-use crate::db::query::user::PublicUserIdMode;
+use crate::db::query::keys::col_in_keys;
+use crate::db::query::user::{PublicUserIdMode, user_key_lookup};
 use crate::db::table_name::{TableKind, intern};
 use crate::model::api::RecordedRankingSchema;
+use crate::model::enums::SekaiServerRegion;
 
 /// Build the shared `SELECT t.timestamp, u.user_id, e.score, e.rank FROM event_<id> e
 /// INNER JOIN event_<id>_time_id t ... INNER JOIN event_<id>_users u ...` query.
@@ -59,15 +61,19 @@ pub async fn fetch_latest_ranking(
     user_id: &str,
     mode: PublicUserIdMode,
 ) -> Result<Option<RecordedRankingSchema>, DbErr> {
-    let users_tbl = Alias::new(intern(TableKind::EventUsers, event_id));
     let event_tbl = Alias::new(intern(TableKind::Event, event_id));
     // `time_id` order == `timestamp` order is an invariant (the writer
     // assigns `time_id = timestamp`; `db::repair` renumbers legacy rows),
     // so ordering by the event table's own column gives identical results
     // while letting the `(user_id_key, time_id)` / `(rank, time_id)`
-    // indexes provide the order — no join-then-sort.
+    // indexes provide the order — no join-then-sort. The player is
+    // resolved to their key first (`user_key_lookup`) so that index is
+    // probed with a constant.
     let stmt = ranking_select(event_id, mode)
-        .and_where(Expr::col((users_tbl, mode.output_column())).eq(user_id))
+        .and_where(
+            Expr::col((event_tbl.clone(), event::Column::UserIdKey))
+                .eq(user_key_lookup(event_id, user_id, mode)),
+        )
         .order_by((event_tbl, event::Column::TimeId), Order::Desc)
         .limit(1)
         .to_owned();
@@ -78,24 +84,35 @@ pub async fn fetch_latest_ranking(
         .await
 }
 
+/// A player's whole history, oldest first. Served by the trace query
+/// (`web::search_user_trace` without filters): on events whose time table
+/// has `time_id == timestamp` it reads the ranking table alone, instead of
+/// hash-joining every time and users row — the key-lookup subquery hides the
+/// row count from the planner, which then assumed a large result.
 #[tracing::instrument(skip(engine), fields(event_id, user_id = %user_id))]
 pub async fn fetch_all_rankings(
     engine: &DatabaseEngine,
+    region: SekaiServerRegion,
     event_id: i64,
     user_id: &str,
     mode: PublicUserIdMode,
 ) -> Result<Vec<RecordedRankingSchema>, DbErr> {
-    let users_tbl = Alias::new(intern(TableKind::EventUsers, event_id));
-    let event_tbl = Alias::new(intern(TableKind::Event, event_id));
-    let stmt = ranking_select(event_id, mode)
-        .and_where(Expr::col((users_tbl, mode.output_column())).eq(user_id))
-        .order_by((event_tbl, event::Column::TimeId), Order::Asc)
-        .to_owned();
-
-    let backend = engine.backend();
-    RecordedRankingSchema::find_by_statement(backend.build(&stmt))
-        .all(engine.conn())
-        .await
+    let rows = crate::db::query::web::search_user_trace(
+        engine,
+        region,
+        event_id,
+        user_id,
+        &crate::db::query::web::WebTraceFilter::unbounded(),
+        mode,
+    )
+    .await?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|row| match row {
+            crate::model::api::RecordedRankData::Normal(row) => Some(row),
+            crate::model::api::RecordedRankData::WorldBloom(_) => None,
+        })
+        .collect())
 }
 
 #[tracing::instrument(skip(engine), fields(event_id, rank))]
@@ -150,7 +167,11 @@ pub async fn fetch_all_rankings_by_ranks(
 
     let event_tbl = Alias::new(intern(TableKind::Event, event_id));
     let stmt = ranking_select(event_id, mode)
-        .and_where(Expr::col((event_tbl.clone(), event::Column::Rank)).is_in(ranks.to_vec()))
+        .and_where(col_in_keys(
+            engine.backend(),
+            Expr::col((event_tbl.clone(), event::Column::Rank)),
+            ranks,
+        ))
         .order_by((event_tbl.clone(), event::Column::Rank), Order::Asc)
         .order_by((event_tbl, event::Column::TimeId), Order::Asc)
         .to_owned();

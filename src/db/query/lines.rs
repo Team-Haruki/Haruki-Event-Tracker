@@ -14,15 +14,17 @@
 use std::collections::HashMap;
 
 use sea_orm::sea_query::{Alias, Expr, JoinType, Order, Query, SelectStatement};
-use sea_orm::{DbErr, ExprTrait, FromQueryResult};
+use sea_orm::{DatabaseBackend, DbErr, ExprTrait, FromQueryResult};
 
 use crate::db::engine::DatabaseEngine;
 use crate::db::entity::time_id;
 use crate::db::query::edge::{Edge, EdgeSpec, TimeWindow, edge_keys_select};
+use crate::db::query::web::RankSnapshotCut;
 use crate::db::table_name::{TableKind, intern};
 use crate::model::api::RankingLineScoreSchema;
 
 pub(crate) struct RankEdgeSpec {
+    pub backend: DatabaseBackend,
     pub tbl: &'static str,
     pub time_tbl: &'static str,
     /// World Bloom chapter filter; `None` on the main event table.
@@ -44,7 +46,22 @@ pub(crate) fn rank_edge_select(
     start_time: Option<i64>,
     end_time: Option<i64>,
 ) -> SelectStatement {
+    rank_edge_select_until(spec, ranks, edge, start_time, end_time, None)
+}
+
+/// [`rank_edge_select`] under a commit cut: rows with `time_id` past
+/// `max_time_id` do not exist for the probes (see
+/// `db::query::web::latest_rank_cut`).
+pub(crate) fn rank_edge_select_until(
+    spec: &RankEdgeSpec,
+    ranks: &[i64],
+    edge: RankEdge,
+    start_time: Option<i64>,
+    end_time: Option<i64>,
+    max_time_id: Option<i64>,
+) -> SelectStatement {
     let edge_sub = edge_keys_select(&EdgeSpec {
+        backend: spec.backend,
         tbl: spec.tbl,
         time_tbl: spec.time_tbl,
         key_col: "rank",
@@ -57,7 +74,7 @@ pub(crate) fn rank_edge_select(
         window: TimeWindow::new(start_time, end_time),
         score_min: None,
         score_max: None,
-        max_time_id: None,
+        max_time_id,
     });
     join_rank_edge(spec, edge_sub)
 }
@@ -204,13 +221,22 @@ async fn fetch_lines(
     engine: &DatabaseEngine,
     spec: RankEdgeSpec,
     ranks: &[i64],
-    timestamp: Option<i64>,
+    cut: RankSnapshotCut,
 ) -> Result<Vec<RankingLineScoreSchema>, DbErr> {
-    let stmt = rank_edge_select(&spec, ranks, RankEdge::Latest, None, timestamp);
+    let stmt = rank_edge_select_until(
+        &spec,
+        ranks,
+        RankEdge::Latest,
+        None,
+        cut.at,
+        cut.as_of_time_id,
+    );
     let mut rows = fetch_rank_edge_rows(engine, &stmt).await;
     Ok(ranks.iter().filter_map(|rank| rows.remove(rank)).collect())
 }
 
+/// Each rank's latest `(timestamp, score)` at or before `timestamp`
+/// (`None`: its newest row).
 #[tracing::instrument(skip(engine, ranks), fields(event_id, ranks_len = ranks.len()))]
 pub async fn fetch_ranking_lines(
     engine: &DatabaseEngine,
@@ -218,12 +244,35 @@ pub async fn fetch_ranking_lines(
     ranks: &[i64],
     timestamp: Option<i64>,
 ) -> Result<Vec<RankingLineScoreSchema>, DbErr> {
+    fetch_ranking_lines_at(
+        engine,
+        event_id,
+        ranks,
+        RankSnapshotCut {
+            at: timestamp,
+            as_of_time_id: None,
+        },
+    )
+    .await
+}
+
+/// [`fetch_ranking_lines`] reading the state of `cut`, so the lines agree
+/// with rank rows read at the same cut (`web::rank_snapshot_rows`) even
+/// while the next flush is landing.
+#[tracing::instrument(skip(engine, ranks), fields(event_id, ranks_len = ranks.len()))]
+pub async fn fetch_ranking_lines_at(
+    engine: &DatabaseEngine,
+    event_id: i64,
+    ranks: &[i64],
+    cut: RankSnapshotCut,
+) -> Result<Vec<RankingLineScoreSchema>, DbErr> {
     let spec = RankEdgeSpec {
+        backend: engine.backend(),
         tbl: intern(TableKind::Event, event_id),
         time_tbl: intern(TableKind::TimeId, event_id),
         character_id: None,
     };
-    fetch_lines(engine, spec, ranks, timestamp).await
+    fetch_lines(engine, spec, ranks, cut).await
 }
 
 #[tracing::instrument(skip(engine, ranks), fields(event_id, character_id, ranks_len = ranks.len()))]
@@ -234,10 +283,123 @@ pub async fn fetch_world_bloom_ranking_lines(
     ranks: &[i64],
     timestamp: Option<i64>,
 ) -> Result<Vec<RankingLineScoreSchema>, DbErr> {
+    fetch_world_bloom_ranking_lines_at(
+        engine,
+        event_id,
+        character_id,
+        ranks,
+        RankSnapshotCut {
+            at: timestamp,
+            as_of_time_id: None,
+        },
+    )
+    .await
+}
+
+#[tracing::instrument(skip(engine, ranks), fields(event_id, character_id, ranks_len = ranks.len()))]
+pub async fn fetch_world_bloom_ranking_lines_at(
+    engine: &DatabaseEngine,
+    event_id: i64,
+    character_id: i64,
+    ranks: &[i64],
+    cut: RankSnapshotCut,
+) -> Result<Vec<RankingLineScoreSchema>, DbErr> {
     let spec = RankEdgeSpec {
+        backend: engine.backend(),
         tbl: intern(TableKind::WorldBloom, event_id),
         time_tbl: intern(TableKind::TimeId, event_id),
         character_id: Some(character_id),
     };
-    fetch_lines(engine, spec, ranks, timestamp).await
+    fetch_lines(engine, spec, ranks, cut).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::query::web::tests::{
+        seed_normal_event_with_history, seed_world_bloom_event_with_history, sqlite_engine,
+    };
+    use crate::db::schema::create_event_tables;
+    use crate::model::enums::SekaiServerRegion;
+
+    fn tuples(lines: &[RankingLineScoreSchema]) -> Vec<(i64, i64, i64)> {
+        lines
+            .iter()
+            .map(|line| (line.rank, line.score, line.timestamp))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn lines_at_a_cut_ignore_rows_past_it() {
+        let engine = sqlite_engine().await;
+        let (normal, world_bloom) = (571, 572);
+        create_event_tables(&engine, SekaiServerRegion::Jp, normal, false)
+            .await
+            .unwrap();
+        seed_normal_event_with_history(&engine, normal).await;
+        create_event_tables(&engine, SekaiServerRegion::Jp, world_bloom, true)
+            .await
+            .unwrap();
+        seed_world_bloom_event_with_history(&engine, world_bloom).await;
+        // Sequence `time_id`s: the first sample is 1, the second 2.
+        let first = RankSnapshotCut {
+            at: None,
+            as_of_time_id: Some(1),
+        };
+        let replay = RankSnapshotCut {
+            at: Some(1_710_000_030),
+            as_of_time_id: None,
+        };
+
+        let lines = fetch_ranking_lines_at(&engine, normal, &[1, 3], first)
+            .await
+            .unwrap();
+        assert_eq!(
+            tuples(&lines),
+            vec![(1, 1000, 1_710_000_000), (3, 800, 1_710_000_000)]
+        );
+        let lines = fetch_ranking_lines_at(&engine, normal, &[1, 3], replay)
+            .await
+            .unwrap();
+        assert_eq!(
+            tuples(&lines),
+            vec![(1, 1000, 1_710_000_000), (3, 800, 1_710_000_000)]
+        );
+        let lines = fetch_ranking_lines_at(&engine, normal, &[1, 3], RankSnapshotCut::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            tuples(&lines),
+            vec![(1, 1300, 1_710_000_060), (3, 1100, 1_710_000_060)]
+        );
+        assert_eq!(
+            tuples(
+                &fetch_ranking_lines(&engine, normal, &[1, 3], None)
+                    .await
+                    .unwrap()
+            ),
+            tuples(&lines)
+        );
+
+        let lines = fetch_world_bloom_ranking_lines_at(&engine, world_bloom, 17, &[2, 3], first)
+            .await
+            .unwrap();
+        assert_eq!(
+            tuples(&lines),
+            vec![(2, 1900, 1_710_000_000), (3, 1800, 1_710_000_000)]
+        );
+        let lines = fetch_world_bloom_ranking_lines_at(
+            &engine,
+            world_bloom,
+            17,
+            &[2, 3],
+            RankSnapshotCut::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            tuples(&lines),
+            vec![(2, 2200, 1_710_000_060), (3, 2100, 1_710_000_060)]
+        );
+    }
 }

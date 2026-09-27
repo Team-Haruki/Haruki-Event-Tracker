@@ -12,18 +12,29 @@ use sea_orm::{ConnectOptions, ConnectionTrait, Database, DatabaseBackend, FromQu
 
 use crate::db::engine::DatabaseEngine;
 use crate::db::query::lines::{RankEdge, RankEdgeSpec, grouped_rank_edge_select, rank_edge_select};
+use crate::db::query::ranking::{fetch_all_rankings, fetch_latest_ranking};
+use crate::db::query::score_samples::{ScoreSample, fetch_user_score_samples};
+use crate::db::query::trace::{
+    TraceSubject, forget_time_id_shape, legacy, time_ids_are_timestamps,
+};
 use crate::db::query::user::PublicUserIdMode;
 use crate::db::query::web::{
-    PlayerGrowthRow, RankingPageRow, WebRankingCursor, WebRankingFilter, WebTraceFilter,
-    WorldBloomRankingPageRow, earliest_player_rows_select, grouped_latest_rank,
-    grouped_latest_world_bloom_rank, latest_rank_window_join, latest_world_bloom_rank_window_join,
-    legacy_player_rows_select, search_rank_trace, search_ranking_rows, search_user_trace,
-    search_world_bloom_rank_trace, search_world_bloom_ranking_rows, search_world_bloom_user_trace,
+    PlayerGrowthRow, RankSnapshotCut, RankingPageRow, UserProjection, WebRankingCursor,
+    WebRankingFilter, WebTraceFilter, WorldBloomRankingPageRow, earliest_player_rows_select,
+    grouped_latest_rank, grouped_latest_world_bloom_rank, latest_rank_window_join,
+    latest_world_bloom_rank_window_join, legacy_player_rows_select, search_rank_trace,
+    search_ranking_rows, search_user_trace, search_world_bloom_rank_trace,
+    search_world_bloom_ranking_rows, search_world_bloom_user_trace, user_rank_as_of,
+};
+use crate::db::query::world_bloom::{
+    fetch_all_world_bloom_rankings, fetch_latest_world_bloom_ranking,
 };
 use crate::db::schema::create_event_tables;
 use crate::db::table_name::{TableKind, intern};
 use crate::model::api::{RankingLineScoreSchema, RecordedRankData};
 use crate::model::enums::SekaiServerRegion;
+
+const REGION: SekaiServerRegion = SekaiServerRegion::Jp;
 
 const T0: i64 = 1_700_000_000;
 const TOP_RANKS: i64 = 10;
@@ -81,6 +92,7 @@ struct Row {
 
 struct Fixture {
     event_id: i64,
+    mode: IdMode,
     /// `time_id -> timestamp`.
     times: BTreeMap<i64, i64>,
     rows: Vec<Row>,
@@ -181,6 +193,7 @@ fn generate(event_id: i64, rng: &mut Rng, mode: IdMode) -> Fixture {
     }
     Fixture {
         event_id,
+        mode,
         times,
         rows,
         wl_rows,
@@ -338,36 +351,63 @@ fn earliest(rows: Vec<PlayerGrowthRow>) -> HashMap<i64, (i64, i64)> {
     out
 }
 
-fn trace_tuples(rows: Vec<RecordedRankData>) -> Vec<(i64, String, i64, i64)> {
-    let mut out: Vec<_> = rows
-        .into_iter()
-        .map(|row| match row {
-            RecordedRankData::Normal(r) => (r.timestamp, r.user_id, r.score, r.rank),
-            RecordedRankData::WorldBloom(r) => (r.timestamp, r.user_id, r.score, r.rank),
-        })
-        .collect();
+type TraceTuple = (i64, String, i64, i64, Option<i64>);
+
+fn trace_tuple(row: &RecordedRankData) -> TraceTuple {
+    match row {
+        RecordedRankData::Normal(r) => (r.timestamp, r.user_id.clone(), r.score, r.rank, None),
+        RecordedRankData::WorldBloom(r) => (
+            r.timestamp,
+            r.user_id.clone(),
+            r.score,
+            r.rank,
+            r.character_id,
+        ),
+    }
+}
+
+fn sorted_trace(rows: &[RecordedRankData]) -> Vec<TraceTuple> {
+    let mut out: Vec<_> = rows.iter().map(trace_tuple).collect();
     out.sort_unstable();
     out
 }
 
-/// Brute-force trace: rows matching `keep`, joined to their time row, in
-/// the `[start, end]` window and after `cursor`.
+fn public_id(user: i64, mode: PublicUserIdMode) -> String {
+    match mode {
+        PublicUserIdMode::Raw => format!("{user}"),
+        PublicUserIdMode::Unique => format!("u-{user}"),
+    }
+}
+
+/// Brute-force trace without the limit: rows matching `keep` in the
+/// `[start, end]` window and after `cursor`, sorted. On a table whose
+/// `time_id`s are timestamps the trace reads the ranking table alone, so
+/// a row without a time row counts with `time_id` as its timestamp; on a
+/// legacy table the time join drops it.
 fn expected_trace(
     fx: &Fixture,
     rows: &[Row],
     filter: &WebTraceFilter,
+    mode: PublicUserIdMode,
     keep: impl Fn(&Row) -> bool,
-) -> Vec<(i64, String, i64, i64)> {
+) -> Vec<TraceTuple> {
     let mut out: Vec<_> = rows
         .iter()
         .filter(|r| keep(r))
-        .filter_map(|r| fx.times.get(&r.time_id).map(|ts| (*ts, r)))
+        .filter_map(|r| match (fx.times.get(&r.time_id), fx.mode) {
+            (Some(ts), _) => Some((*ts, r)),
+            (None, IdMode::Timestamp) => Some((r.time_id, r)),
+            (None, IdMode::Sequence) => None,
+        })
         .filter(|(ts, _)| {
             filter.start_time.is_none_or(|s| *ts >= s)
                 && filter.end_time.is_none_or(|e| *ts <= e)
                 && filter.cursor.is_none_or(|c| *ts > c)
         })
-        .map(|(ts, r)| (ts, format!("{}", r.user), r.score, r.rank))
+        .map(|(ts, r)| {
+            let character = (r.character != 0).then_some(r.character);
+            (ts, public_id(r.user, mode), r.score, r.rank, character)
+        })
         .collect();
     out.sort_unstable();
     out
@@ -451,6 +491,7 @@ fn expected_search(fx: &Fixture, rows: &[Row], f: &WebRankingFilter) -> Vec<(i64
 async fn check_rank_edges(engine: &DatabaseEngine, fx: &Fixture, rng: &mut Rng) {
     let character_id = rng.chance(50).then(|| CHARACTERS[rng.below(2) as usize]);
     let spec = RankEdgeSpec {
+        backend: engine.backend(),
         tbl: match character_id {
             Some(_) => intern(TableKind::WorldBloom, fx.event_id),
             None => intern(TableKind::Event, fx.event_id),
@@ -482,17 +523,20 @@ async fn check_rank_window(engine: &DatabaseEngine, fx: &Fixture, rng: &mut Rng)
     let (new, _) = search_ranking_rows(engine, fx.event_id, &filter, mode)
         .await
         .unwrap();
+    let backend = engine.backend();
     let old_stmt = latest_rank_window_join(
         fx.event_id,
         &filter,
         mode,
-        grouped_latest_rank(fx.event_id, &filter, false),
+        UserProjection::Profile,
+        grouped_latest_rank(backend, fx.event_id, &filter, false),
     );
     let bounded_stmt = latest_rank_window_join(
         fx.event_id,
         &filter,
         mode,
-        grouped_latest_rank(fx.event_id, &filter, true),
+        UserProjection::Profile,
+        grouped_latest_rank(backend, fx.event_id, &filter, true),
     );
     let mut old: Vec<RankingPageRow> = fetch(engine, &old_stmt).await;
     let mut bounded: Vec<RankingPageRow> = fetch(engine, &bounded_stmt).await;
@@ -515,7 +559,8 @@ async fn check_rank_window(engine: &DatabaseEngine, fx: &Fixture, rng: &mut Rng)
         character_id,
         &filter,
         mode,
-        grouped_latest_world_bloom_rank(fx.event_id, character_id, &filter, false),
+        UserProjection::Profile,
+        grouped_latest_world_bloom_rank(backend, fx.event_id, character_id, &filter, false),
     );
     let mut old: Vec<WorldBloomRankingPageRow> = fetch(engine, &old_stmt).await;
     old.truncate(limit);
@@ -559,13 +604,113 @@ async fn check_player_growths(engine: &DatabaseEngine, fx: &Fixture, rng: &mut R
     keys.push(keys[0]);
     let start = bound(rng, fx).unwrap_or(fx.first_ts());
     let end = bound(rng, fx);
-    let new = earliest_player_rows_select(tbl, time_tbl, character_id, &keys, start, end);
+    let new = earliest_player_rows_select(
+        engine.backend(),
+        tbl,
+        time_tbl,
+        character_id,
+        &keys,
+        start,
+        end,
+    );
     let old = legacy_player_rows_select(tbl, time_tbl, character_id, &keys, start, end);
     assert_eq!(
         earliest(fetch(engine, &new).await),
         earliest(fetch(engine, &old).await),
         "player growth keys={keys:?} {start}..{end:?} wb={character_id:?}"
     );
+}
+
+/// One trace against brute force and against the legacy query (time and
+/// users joins, `ORDER BY t.timestamp`): the serialised rows must be
+/// byte-identical. Rows tied on `time_id` (two users written at one rank
+/// in one sample) are ordered arbitrarily by both, so those subjects are
+/// compared as sets and, under a limit, by their timestamps only. A
+/// subject with rows lacking a time row is compared to the legacy form
+/// only on legacy tables (see `expected_trace`).
+#[allow(clippy::too_many_arguments)]
+async fn check_trace(
+    engine: &DatabaseEngine,
+    fx: &Fixture,
+    rows: &[Row],
+    character_id: Option<i64>,
+    subject: TraceSubject<'_>,
+    filter: &WebTraceFilter,
+    mode: PublicUserIdMode,
+    keep: impl Fn(&Row) -> bool,
+) {
+    let label = format!("trace {subject:?} wb={character_id:?} {mode:?} {filter:?}");
+    let got = match (character_id, subject) {
+        (None, TraceSubject::Rank(rank)) => {
+            search_rank_trace(engine, REGION, fx.event_id, rank, filter, mode).await
+        }
+        (None, TraceSubject::User(user)) => {
+            search_user_trace(engine, REGION, fx.event_id, user, filter, mode).await
+        }
+        (Some(c), TraceSubject::Rank(rank)) => {
+            search_world_bloom_rank_trace(engine, REGION, fx.event_id, c, rank, filter, mode).await
+        }
+        (Some(c), TraceSubject::User(user)) => {
+            search_world_bloom_user_trace(engine, REGION, fx.event_id, c, user, filter, mode).await
+        }
+    }
+    .unwrap();
+    let old = legacy::fetch_trace(engine, fx.event_id, character_id, subject, filter, mode)
+        .await
+        .unwrap();
+
+    let expected_all = expected_trace(
+        fx,
+        rows,
+        &WebTraceFilter {
+            limit: None,
+            ..filter.clone()
+        },
+        mode,
+        &keep,
+    );
+    let ts: Vec<i64> = got.iter().map(|r| trace_tuple(r).0).collect();
+    assert!(
+        ts.windows(2).all(|w| w[0] <= w[1]),
+        "{label}: not in time order"
+    );
+    let tied = {
+        let mut ids: Vec<i64> = rows.iter().filter(|r| keep(r)).map(|r| r.time_id).collect();
+        ids.sort_unstable();
+        ids.windows(2).any(|w| w[0] == w[1])
+    };
+    match filter.limit {
+        None => assert_eq!(sorted_trace(&got), expected_all, "{label}"),
+        Some(limit) => {
+            let n = (limit as usize).min(expected_all.len());
+            assert_eq!(got.len(), n, "{label}: limit");
+            let expected_ts: Vec<i64> = expected_all.iter().take(n).map(|t| t.0).collect();
+            assert_eq!(ts, expected_ts, "{label}: limited timestamps");
+            for row in &got {
+                assert!(expected_all.contains(&trace_tuple(row)), "{label}: {row:?}");
+            }
+        }
+    }
+
+    let orphan_free = rows
+        .iter()
+        .filter(|r| keep(r))
+        .all(|r| fx.times.contains_key(&r.time_id));
+    if fx.mode == IdMode::Sequence || orphan_free {
+        if !tied {
+            assert_eq!(
+                sonic_rs::to_vec(&got).unwrap(),
+                sonic_rs::to_vec(&old).unwrap(),
+                "{label}: differs from the legacy query"
+            );
+        } else if filter.limit.is_none() {
+            assert_eq!(
+                sorted_trace(&got),
+                sorted_trace(&old),
+                "{label}: legacy (tied)"
+            );
+        }
+    }
 }
 
 async fn check_traces(engine: &DatabaseEngine, fx: &Fixture, rng: &mut Rng) {
@@ -576,56 +721,208 @@ async fn check_traces(engine: &DatabaseEngine, fx: &Fixture, rng: &mut Rng) {
         cursor: rng
             .chance(30)
             .then(|| rng.range(fx.first_ts(), fx.last_ts())),
-        limit: None,
+        limit: rng.chance(40).then(|| rng.range(1, 30) as u64),
     };
-    let mode = PublicUserIdMode::Raw;
+    let mode = if rng.chance(50) {
+        PublicUserIdMode::Raw
+    } else {
+        PublicUserIdMode::Unique
+    };
     let rank = all_ranks()[rng.below(all_ranks().len() as u64) as usize];
-    let user = rng.range(1, USERS);
+    let user = rng.range(1, USERS + 1);
+    let subject = public_id(user, mode);
     let character_id = CHARACTERS[rng.below(2) as usize];
 
-    let got = search_rank_trace(engine, fx.event_id, rank, &filter, mode)
-        .await
-        .unwrap();
-    assert_eq!(
-        trace_tuples(got),
-        expected_trace(fx, &fx.rows, &filter, |r| r.rank == rank),
-        "rank trace {rank} {filter:?}"
-    );
-    let got = search_user_trace(engine, fx.event_id, &format!("{user}"), &filter, mode)
-        .await
-        .unwrap();
-    assert_eq!(
-        trace_tuples(got),
-        expected_trace(fx, &fx.rows, &filter, |r| r.user == user),
-        "user trace {user} {filter:?}"
-    );
-    let got = search_world_bloom_rank_trace(engine, fx.event_id, character_id, rank, &filter, mode)
-        .await
-        .unwrap();
-    assert_eq!(
-        trace_tuples(got),
-        expected_trace(fx, &fx.wl_rows, &filter, |r| {
-            r.rank == rank && r.character == character_id
-        }),
-        "wb rank trace {character_id}/{rank} {filter:?}"
-    );
-    let got = search_world_bloom_user_trace(
+    check_trace(
         engine,
-        fx.event_id,
-        character_id,
-        &format!("{user}"),
+        fx,
+        &fx.rows,
+        None,
+        TraceSubject::Rank(rank),
         &filter,
         mode,
+        |r| r.rank == rank,
     )
-    .await
-    .unwrap();
+    .await;
+    check_trace(
+        engine,
+        fx,
+        &fx.rows,
+        None,
+        TraceSubject::User(&subject),
+        &filter,
+        mode,
+        |r| r.user == user,
+    )
+    .await;
+    check_trace(
+        engine,
+        fx,
+        &fx.wl_rows,
+        Some(character_id),
+        TraceSubject::Rank(rank),
+        &filter,
+        mode,
+        |r| r.rank == rank && r.character == character_id,
+    )
+    .await;
+    check_trace(
+        engine,
+        fx,
+        &fx.wl_rows,
+        Some(character_id),
+        TraceSubject::User(&subject),
+        &filter,
+        mode,
+        |r| r.user == user && r.character == character_id,
+    )
+    .await;
+}
+
+/// The per-player lookups that resolve the player's key first
+/// (`user::user_key_lookup`) against brute force: latest row, full
+/// history, rank at a cut, and the metrics samples — by raw id and by
+/// `unique_id`, for known players and ids nobody has.
+async fn check_user_lookups(engine: &DatabaseEngine, fx: &Fixture, rng: &mut Rng) {
+    let user = rng.range(1, USERS + 2);
+    let (subject, mode) = if rng.chance(50) {
+        (format!("{user}"), PublicUserIdMode::Raw)
+    } else {
+        (format!("u-{user}"), PublicUserIdMode::Unique)
+    };
+    let character_id = CHARACTERS[rng.below(2) as usize];
+    let label = format!("user {subject} ({mode:?}) wb={character_id}");
+
+    // Joined selects only see rows that have a time row.
+    let history = |rows: &[Row], keep: &dyn Fn(&Row) -> bool| -> Vec<(i64, String, i64, i64)> {
+        let mut out: Vec<_> = rows
+            .iter()
+            .filter(|r| r.user == user && keep(r))
+            .filter_map(|r| fx.times.get(&r.time_id).map(|ts| (r.time_id, *ts, r)))
+            .collect();
+        out.sort_by_key(|(time_id, _, _)| *time_id);
+        out.into_iter()
+            .map(|(_, ts, r)| (ts, subject.clone(), r.score, r.rank))
+            .collect()
+    };
+    // Full histories and metric samples go through the trace query, which on
+    // timestamp-id tables reads the ranking table alone: an orphan row (no
+    // time row) then counts, with its `time_id` as the timestamp — the same
+    // rule `check_trace` models. Sequence-id tables keep the join.
+    let aligned_history =
+        |rows: &[Row], keep: &dyn Fn(&Row) -> bool| -> Vec<(i64, String, i64, i64)> {
+            if fx.mode != IdMode::Timestamp {
+                return history(rows, keep);
+            }
+            let mut out: Vec<_> = rows
+                .iter()
+                .filter(|r| r.user == user && keep(r))
+                .map(|r| (r.time_id, subject.clone(), r.score, r.rank))
+                .collect();
+            out.sort_by_key(|t| t.0);
+            out
+        };
+    let expected = history(&fx.rows, &|_| true);
+    let expected_all = aligned_history(&fx.rows, &|_| true);
+    let got = fetch_all_rankings(engine, REGION, fx.event_id, &subject, mode)
+        .await
+        .unwrap();
     assert_eq!(
-        trace_tuples(got),
-        expected_trace(fx, &fx.wl_rows, &filter, |r| {
-            r.user == user && r.character == character_id
-        }),
-        "wb user trace {character_id}/{user} {filter:?}"
+        got.iter()
+            .map(|r| (r.timestamp, r.user_id.clone(), r.score, r.rank))
+            .collect::<Vec<_>>(),
+        expected_all,
+        "all rankings {label}"
     );
+    let got = fetch_latest_ranking(engine, fx.event_id, &subject, mode)
+        .await
+        .unwrap();
+    assert_eq!(
+        got.map(|r| (r.timestamp, r.user_id, r.score, r.rank)),
+        expected.last().cloned(),
+        "latest ranking {label}"
+    );
+
+    let expected = history(&fx.wl_rows, &|r| r.character == character_id);
+    let expected_all = aligned_history(&fx.wl_rows, &|r| r.character == character_id);
+    let got =
+        fetch_all_world_bloom_rankings(engine, REGION, fx.event_id, &subject, character_id, mode)
+            .await
+            .unwrap();
+    assert!(got.iter().all(|r| r.character_id == Some(character_id)));
+    assert_eq!(
+        got.iter()
+            .map(|r| (r.timestamp, r.user_id.clone(), r.score, r.rank))
+            .collect::<Vec<_>>(),
+        expected_all,
+        "all wb rankings {label}"
+    );
+    let got = fetch_latest_world_bloom_ranking(engine, fx.event_id, &subject, character_id, mode)
+        .await
+        .unwrap();
+    assert_eq!(
+        got.map(|r| (r.timestamp, r.user_id, r.score, r.rank)),
+        expected.last().cloned(),
+        "latest wb ranking {label}"
+    );
+
+    // The metrics samples: `(timestamp, score)` up to an end, oldest first.
+    let end = bound(rng, fx);
+    for (chapter, rows) in [(None, &fx.rows), (Some(character_id), &fx.wl_rows)] {
+        let expected: Vec<ScoreSample> =
+            aligned_history(rows, &|r| chapter.is_none_or(|c| r.character == c))
+                .into_iter()
+                .filter(|(ts, ..)| end.is_none_or(|end| *ts <= end))
+                .map(|(timestamp, _, score, _)| ScoreSample { timestamp, score })
+                .collect();
+        let got =
+            fetch_user_score_samples(engine, REGION, fx.event_id, chapter, &subject, end, mode)
+                .await
+                .unwrap();
+        assert_eq!(
+            got, expected,
+            "score samples {label} chapter={chapter:?} end={end:?}"
+        );
+    }
+
+    // The rank at a cut reads the ranking table alone (orphan rows count)
+    // and bounds `time_id` by the cut and by the replay point's time row.
+    let (lo, hi) = (
+        *fx.times.keys().next().unwrap(),
+        *fx.times.keys().next_back().unwrap(),
+    );
+    let cut = RankSnapshotCut {
+        at: bound(rng, fx),
+        as_of_time_id: rng.chance(50).then(|| rng.range(lo - 1, hi + 1)),
+    };
+    let at_bound = cut.at.map(|at| {
+        fx.times
+            .iter()
+            .filter(|(_, ts)| **ts <= at)
+            .map(|(time_id, _)| *time_id)
+            .max()
+    });
+    for (chapter, rows) in [(None, &fx.rows), (Some(character_id), &fx.wl_rows)] {
+        let expected = rows
+            .iter()
+            .filter(|r| r.user == user && chapter.is_none_or(|c| r.character == c))
+            .filter(|r| cut.as_of_time_id.is_none_or(|as_of| r.time_id <= as_of))
+            .filter(|r| match at_bound {
+                None => true,
+                Some(Some(bound)) => r.time_id <= bound,
+                // `at` before the first sample: the bound is NULL, no row passes.
+                Some(None) => false,
+            })
+            .max_by_key(|r| r.time_id)
+            .map(|r| r.rank);
+        let got = user_rank_as_of(engine, fx.event_id, chapter, &subject, cut, mode)
+            .await
+            .unwrap();
+        assert_eq!(
+            got, expected,
+            "rank as of {cut:?} {label} chapter={chapter:?}"
+        );
+    }
 }
 
 async fn drop_event(engine: &DatabaseEngine, event_id: i64) {
@@ -649,14 +946,23 @@ async fn run_equivalence(engine: &DatabaseEngine, first_event_id: i64, seeds: u6
             let fx = generate(event_id, &mut rng, mode);
             drop_event(engine, event_id).await;
             load(engine, &fx).await;
+            forget_time_id_shape(REGION, event_id);
+            assert_eq!(
+                time_ids_are_timestamps(engine, REGION, event_id)
+                    .await
+                    .unwrap(),
+                mode == IdMode::Timestamp
+            );
             for _ in 0..iters {
                 check_rank_edges(engine, &fx, &mut rng).await;
                 check_rank_window(engine, &fx, &mut rng).await;
                 check_plain_search(engine, &fx, &mut rng).await;
                 check_player_growths(engine, &fx, &mut rng).await;
                 check_traces(engine, &fx, &mut rng).await;
+                check_user_lookups(engine, &fx, &mut rng).await;
             }
             drop_event(engine, event_id).await;
+            forget_time_id_shape(REGION, event_id);
             event_id += 1;
         }
     }

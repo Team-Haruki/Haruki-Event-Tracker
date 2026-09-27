@@ -13,7 +13,7 @@ use crate::db::engine::DatabaseEngine;
 use crate::db::query::lines::{RankEdge, RankEdgeSpec, grouped_rank_edge_select, rank_edge_select};
 use crate::db::query::user::PublicUserIdMode;
 use crate::db::query::web::{
-    PlayerGrowthRow, RankingPageRow, WebRankingFilter, earliest_player_rows_select,
+    PlayerGrowthRow, RankingPageRow, UserProjection, WebRankingFilter, earliest_player_rows_select,
     grouped_latest_rank, latest_rank_window_join, legacy_player_rows_select,
 };
 use crate::db::schema::{create_event_tables, create_query_indexes};
@@ -209,6 +209,7 @@ async fn bench_overview_queries_on_postgres() {
     let end = T0 + SECONDS - 1;
     let start = end - INTERVAL;
     let spec = RankEdgeSpec {
+        backend: engine.backend(),
         tbl: intern(TableKind::Event, EVENT_ID),
         time_tbl: intern(TableKind::TimeId, EVENT_ID),
         character_id: None,
@@ -273,13 +274,21 @@ async fn bench_overview_queries_on_postgres() {
         cursor: None,
         limit: 100,
     };
+    let backend = engine.backend();
     let old = latest_rank_window_join(
         EVENT_ID,
         &top,
         mode,
-        grouped_latest_rank(EVENT_ID, &top, false),
+        UserProjection::Profile,
+        grouped_latest_rank(backend, EVENT_ID, &top, false),
     );
-    let new = crate::db::query::web::latest_rank_window_select(EVENT_ID, &top, mode);
+    let new = crate::db::query::web::latest_rank_window_select(
+        backend,
+        EVENT_ID,
+        &top,
+        mode,
+        UserProjection::Profile,
+    );
     let (t_old, r_old) = time::<RankingPageRow>(&engine, &old).await;
     let (t_new, r_new) = time::<RankingPageRow>(&engine, &new).await;
     let key = |rows: &[RankingPageRow]| {
@@ -300,7 +309,13 @@ async fn bench_overview_queries_on_postgres() {
         as_of_time_id: cut,
         ..top.clone()
     };
-    let at_cut = crate::db::query::web::latest_rank_window_select(EVENT_ID, &pinned, mode);
+    let at_cut = crate::db::query::web::latest_rank_window_select(
+        backend,
+        EVENT_ID,
+        &pinned,
+        mode,
+        UserProjection::Profile,
+    );
     let (t_cut, r_cut) = time::<RankingPageRow>(&engine, &at_cut).await;
     assert_eq!(key(&r_new), key(&r_cut));
     report.add("   top-100 window vs pinned cut", t_new, t_cut);
@@ -310,7 +325,8 @@ async fn bench_overview_queries_on_postgres() {
     let tbl = intern(TableKind::Event, EVENT_ID);
     let time_tbl = intern(TableKind::TimeId, EVENT_ID);
     let old = legacy_player_rows_select(tbl, time_tbl, None, &user_keys, start, Some(end));
-    let new = earliest_player_rows_select(tbl, time_tbl, None, &user_keys, start, Some(end));
+    let new =
+        earliest_player_rows_select(backend, tbl, time_tbl, None, &user_keys, start, Some(end));
     let (t_old, r_old) = time::<PlayerGrowthRow>(&engine, &old).await;
     let (t_new, r_new) = time::<PlayerGrowthRow>(&engine, &new).await;
     let earliest = |rows: Vec<PlayerGrowthRow>| {

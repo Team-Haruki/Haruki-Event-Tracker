@@ -35,8 +35,11 @@ api_cache:
   pool_size: 2               # API cache Redis 连接池大小；生产热点可从 4 起观察
   command_timeout_ms: 100    # Redis cache 命令超时；超时后降级查库/回填
   local_control_ttl_ms: 100  # event epoch/dirty 本地短缓存
-  local_value_ttl_ms: 250    # API value 本地短缓存；0 表示禁用 L1 value
-  local_max_entries: 4096
+  local_value_ttl_ms: 250    # epoch key 的 L1 寿命（不超过其 L2 TTL）；0 表示禁用 L1 value
+  local_static_value_ttl_secs: 60 # static/时间桶 key 的 L1 寿命上限（同样不超过 L2 剩余 TTL）；0 表示沿用 local_value_ttl_ms
+  local_max_entries: 4096    # L1 control 条目上限，同时作为 value 条目数的估算；0 表示禁用 L1
+  local_max_bytes: 201326592 # L1 value 字节预算（192 MiB），超出按 S3-FIFO 淘汰
+  local_sweep_interval_ms: 1000 # 定期清扫过期 L1 条目的间隔；0 表示只在读到时清理
   precompress_gzip_enabled: true # 热点 trace JSON 是否缓存 gzip 预压缩响应
   precompress_min_bytes: 4096    # 原始 JSON 小于该值时不预压缩
   gzip_level: 1                  # 预压缩 gzip 等级；1 优先降低 CPU
@@ -71,6 +74,8 @@ toolbox:
   auth_proxy_secret: ""      # Toolbox 后端 AUTH_PROXY_TRUSTED_VALUE / Oathkeeper shared secret
   authorization: ""          # 如需兼容旧内部鉴权可填写 Authorization 完整值，通常留空
   user_agent: "Haruki-Event-Tracker/private-lookup"
+  verify_cache_ttl_secs: 45      # 「该登录身份绑定了该区服 UID」的肯定结果在进程内复用的秒数；0 表示每次请求都问 Toolbox。否定结果从不缓存；解绑最多延迟一个 TTL 生效
+  verify_cache_max_entries: 4096 # 进程内肯定结果缓存的条数上限
 
 # ============================================================================
 # 后端 API 服务器配置
@@ -109,6 +114,9 @@ backend:
 # ============================================================================
 realtime:
   push_min_interval_secs: 0 # 每个 (server, event) topic 的 updated 事件最小推送间隔（秒）；窗口内的多次更新合并为一条尾随推送（携带最新时间戳，不会漏掉最后一次变更）。0 表示每次落库都推（旧行为）。CN 每秒落库，建议 2–5：客户端的 overview 刷新次数按同样倍数下降
+  online_broadcast_interval_secs: 2 # 每个 topic 的 online 人数至多每 N 秒推一次（推当时的人数）；0 表示每次订阅/退订都推
+  ws_ping_interval_secs: 30  # 服务端 WebSocket ping 间隔；0 关闭 keepalive 与下面的空闲断开
+  ws_idle_timeout_secs: 75   # 超过这么久没收到任何帧（含 pong）的连接会被服务端关闭，半开连接不再计入 online
 
 # ============================================================================
 # 集群角色配置
@@ -201,9 +209,13 @@ servers:
       max_open_conns: 20     # 最大打开连接数（建议 10-50；多区服同库时保持保守）
       max_idle_conns: 1      # 最小/空闲连接数（Rust 版本映射为 min_connections）
       conn_max_lifetime: 1h  # 连接最大生命周期（支持：1h, 30m, 3600s）
+      idle_timeout: 60s      # 空闲连接回收时间（默认 60s；reader 突发后的多余 backend 一分钟内释放）
+      statement_cache_capacity: 32  # 每连接预处理语句缓存条数（默认 32；每条都占后端 plan 内存，0 关闭）
+      write_timeout: 5s      # 仅 writer 角色：单次 flush 的墙钟上限，同时作为事务内的
+                             # statement_timeout / idle_in_transaction_session_timeout（0s 关闭）
 
       # 性能优化配置
-      prepare_stmt: true     # 是否使用预处理语句（提高性能，建议启用）
+      prepare_stmt: true     # 兼容旧配置，已忽略：sqlx 始终使用预处理语句（见 statement_cache_capacity）
       disable_fk_migrate: true  # 迁移时是否禁用外键约束（提高性能）
 
       # 数据库日志配置

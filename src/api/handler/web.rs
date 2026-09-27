@@ -4,7 +4,7 @@ use bytes::Bytes;
 use chrono::Utc;
 use serde::Deserialize;
 
-use crate::api::cache::{CacheTtl, CachedJsonEncoding};
+use crate::api::cache::{ByteSpan, CacheTtl, CachedJson, CachedJsonEncoding};
 use crate::api::error::ApiError;
 use crate::api::extract::resolve_region_engine;
 use crate::api::json::{EncodedJson, RawJson, accepts_gzip};
@@ -14,16 +14,16 @@ use crate::db::query::growth::{
     fetch_ranking_score_growths, fetch_world_bloom_ranking_score_growths,
 };
 use crate::db::query::heartbeat::fetch_latest_heartbeat_before;
-use crate::db::query::lines::{fetch_ranking_lines, fetch_world_bloom_ranking_lines};
+use crate::db::query::lines::{fetch_ranking_lines_at, fetch_world_bloom_ranking_lines_at};
 use crate::db::query::user::PublicUserIdMode;
 use crate::db::query::web::{
-    RankSnapshotCut, WebRankingCursor, WebRankingFilter, WebTraceFilter, WebUserSearchFilter,
-    fetch_top_player_growths, fetch_world_bloom_top_player_growths, rank_snapshot_rows,
-    search_rankings, search_user_trace, search_users, search_world_bloom_rankings,
-    search_world_bloom_user_trace, world_bloom_rank_snapshot_rows,
+    RankSnapshotCut, UserProjection, WebRankingCursor, WebRankingFilter, WebTraceFilter,
+    WebUserSearchFilter, fetch_top_player_growths, fetch_world_bloom_top_player_growths,
+    rank_snapshot_rows, search_rankings, search_user_trace, search_users,
+    search_world_bloom_rankings, search_world_bloom_user_trace, world_bloom_rank_snapshot_rows,
 };
 use crate::model::api::{
-    EventStatusResponseSchema, RecordedRankData, UserAllRankingDataQueryResponseSchema,
+    EventStatusResponseSchema, RecordedRankData, TraceRows, UserAllRankingDataQueryResponseSchema,
     WebOverviewSchema, WebRankingPageSchema, WebUserSearchPageSchema,
 };
 use crate::model::enums::{
@@ -227,7 +227,8 @@ pub async fn user_trace(
     let fetch = async move {
         let mode = prepare_web_user_id_mode(&state_for_fetch, &engine, region, event_id).await?;
         let _permit = limiter.acquire_trace(region).await?;
-        let rank_data = search_user_trace(&engine, event_id, &user_id, &filter, mode).await?;
+        let rank_data =
+            search_user_trace(&engine, region, event_id, &user_id, &filter, mode).await?;
         not_found_if_empty(&rank_data)?;
         Ok(UserAllRankingDataQueryResponseSchema {
             rank_data,
@@ -255,9 +256,16 @@ pub async fn world_bloom_user_trace(
     let fetch = async move {
         let mode = prepare_web_user_id_mode(&state_for_fetch, &engine, region, event_id).await?;
         let _permit = limiter.acquire_trace(region).await?;
-        let rank_data =
-            search_world_bloom_user_trace(&engine, event_id, character_id, &user_id, &filter, mode)
-                .await?;
+        let rank_data = search_world_bloom_user_trace(
+            &engine,
+            region,
+            event_id,
+            character_id,
+            &user_id,
+            &filter,
+            mode,
+        )
+        .await?;
         not_found_if_empty(&rank_data)?;
         Ok(UserAllRankingDataQueryResponseSchema {
             rank_data,
@@ -311,7 +319,15 @@ pub async fn build_overview_until(
     end_time: i64,
 ) -> Result<WebOverviewSchema, ApiError> {
     let at = cut.at;
-    let top_rows = rank_snapshot_rows(engine, event_id, &top_ranks(), cut, mode).await?;
+    let top_rows = rank_snapshot_rows(
+        engine,
+        event_id,
+        &top_ranks(),
+        cut,
+        mode,
+        UserProjection::Profile,
+    )
+    .await?;
     let start_time = end_time - interval;
     let growth_ranks = overview_growth_ranks(SEKAI_EVENT_RANKING_LINES_NORMAL);
     let (top_player_growths, border_lines, rank_growths, status) = tokio::try_join!(
@@ -321,11 +337,11 @@ pub async fn build_overview_until(
                 .map_err(ApiError::from)
         },
         async {
-            fetch_ranking_lines(
+            fetch_ranking_lines_at(
                 engine,
                 event_id,
                 border_ranks(SEKAI_EVENT_RANKING_LINES_NORMAL),
-                at,
+                cut,
             )
             .await
             .map_err(ApiError::from)
@@ -385,9 +401,16 @@ pub async fn build_world_bloom_overview_until(
     end_time: i64,
 ) -> Result<WebOverviewSchema, ApiError> {
     let at = cut.at;
-    let top_rows =
-        world_bloom_rank_snapshot_rows(engine, event_id, character_id, &top_ranks(), cut, mode)
-            .await?;
+    let top_rows = world_bloom_rank_snapshot_rows(
+        engine,
+        event_id,
+        character_id,
+        &top_ranks(),
+        cut,
+        mode,
+        UserProjection::Profile,
+    )
+    .await?;
     let start_time = end_time - interval;
     let growth_ranks = overview_growth_ranks(SEKAI_EVENT_RANKING_LINES_WORLD_BLOOM);
     let (top_player_growths, border_lines, rank_growths, status) = tokio::try_join!(
@@ -404,12 +427,12 @@ pub async fn build_world_bloom_overview_until(
             .map_err(ApiError::from)
         },
         async {
-            fetch_world_bloom_ranking_lines(
+            fetch_world_bloom_ranking_lines_at(
                 engine,
                 event_id,
                 character_id,
                 border_ranks(SEKAI_EVENT_RANKING_LINES_WORLD_BLOOM),
-                at,
+                cut,
             )
             .await
             .map_err(ApiError::from)
@@ -680,9 +703,21 @@ where
 /// the suffix instead: one computation is reused for up to the trace TTL,
 /// and the bucket boundary provides the roll-over. Traces are append-only
 /// history, so a result at most one TTL old is semantically fine.
+///
+/// The boundary is offset per suffix (a deterministic hash, so every
+/// process agrees on the key) so the hot traces don't all expire on the
+/// same second and rebuild in one burst.
 fn trace_bucketed_suffix(suffix: &str, ttl_secs: u64, now_secs: i64) -> String {
-    let bucket = now_secs / i64::try_from(ttl_secs.max(1)).unwrap_or(60);
+    let ttl = i64::try_from(ttl_secs.max(1)).unwrap_or(60);
+    let jitter = i64::try_from(fnv1a_64(suffix.as_bytes()) % ttl.unsigned_abs()).unwrap_or(0);
+    let bucket = now_secs.saturating_add(jitter) / ttl;
     format!("{suffix}:b{bucket}")
+}
+
+fn fnv1a_64(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
+    })
 }
 
 async fn cached_trace_bytes<T, Fut>(
@@ -765,7 +800,8 @@ where
                 CachedJsonEncoding::Gzip => EncodedJson::gzip(encoded.bytes),
                 CachedJsonEncoding::Identity => EncodedJson::identity(encoded.bytes),
             }
-            .at_epoch(encoded.epoch))
+            .at_epoch(encoded.epoch)
+            .with_etag(encoded.etag))
         }
     } else {
         encode_fetched(fetch).await.map(EncodedJson::identity)
@@ -774,10 +810,44 @@ where
 
 /// A subject trace as the cached JSON bytes of a `SubjectTraceResponseSchema`.
 /// Callers decode it (cloud, profile lookups) or splice its `rankData` array
-/// into a web detail without decoding the rows (`TraceRows::from_trace_json`).
+/// into a web detail without decoding the rows ([`cached_trace_rows`]).
 /// Cached L2 values are checked for shape (every field but the rows, plus the
-/// first row), not by decoding every row.
+/// first row), not by decoding every row; the same check locates the rows'
+/// byte range, which travels with the value in L1 so hot details slice
+/// instead of rescanning the payload.
 pub async fn cached_subject_trace_json<T, Fut>(
+    state: &AppState,
+    server: &str,
+    event_id: i64,
+    suffix: String,
+    fetch: Fut,
+) -> Result<CachedJson, ApiError>
+where
+    T: serde::Serialize,
+    Fut: std::future::Future<Output = Result<T, ApiError>>,
+{
+    if let Some(cache) = state.cache() {
+        let ttl_secs = cache.ttl(CacheTtl::TraceRank);
+        let suffix = trace_bucketed_suffix(&suffix, ttl_secs, chrono::Utc::now().timestamp());
+        cache
+            .get_or_fetch_static_json_located(
+                server,
+                event_id,
+                suffix,
+                ttl_secs,
+                locate_subject_trace_rows,
+                fetch,
+            )
+            .await
+    } else {
+        encode_fetched(fetch).await.map(CachedJson::identity)
+    }
+}
+
+/// A subject trace's columns (`TraceColumns`) as cached JSON bytes, keyed
+/// and bucketed like the row trace they are derived from; a detail splices
+/// them in verbatim (`TracePayload::columns_from_json`).
+pub async fn cached_trace_columns_json<T, Fut>(
     state: &AppState,
     server: &str,
     event_id: i64,
@@ -797,7 +867,7 @@ where
                 event_id,
                 suffix,
                 ttl_secs,
-                Some(subject_trace_json_is_valid),
+                Some(trace_columns_json_is_valid),
                 fetch,
             )
             .await
@@ -806,12 +876,38 @@ where
     }
 }
 
-fn subject_trace_json_is_valid(json: &Bytes) -> bool {
-    match crate::model::api::SubjectTraceResponseSchema::json_is_well_formed(json) {
+fn trace_columns_json_is_valid(json: &Bytes) -> bool {
+    match crate::model::trace_columns::TraceColumns::json_is_well_formed(json) {
         Ok(_) => true,
         Err(err) => {
-            tracing::warn!(%err, "api cache cached subject trace is malformed");
+            tracing::warn!(%err, "api cache cached trace columns are malformed");
             false
+        }
+    }
+}
+
+/// The `rankData` rows of a cached subject trace, sliced out by the range
+/// the cache located; a value without a range is scanned.
+pub fn cached_trace_rows(json: &CachedJson) -> sonic_rs::Result<TraceRows> {
+    match json.span {
+        ByteSpan::Unknown => TraceRows::from_trace_json(&json.bytes),
+        ByteSpan::Absent => TraceRows::from_trace_json_range(&json.bytes, None),
+        ByteSpan::Range { start, end } => {
+            TraceRows::from_trace_json_range(&json.bytes, Some(start..end))
+        }
+    }
+}
+
+fn locate_subject_trace_rows(json: &Bytes) -> Option<ByteSpan> {
+    match crate::model::api::SubjectTraceResponseSchema::rank_data_range(json) {
+        Ok(Some(range)) => Some(ByteSpan::Range {
+            start: range.start,
+            end: range.end,
+        }),
+        Ok(None) => Some(ByteSpan::Absent),
+        Err(err) => {
+            tracing::warn!(%err, "api cache cached subject trace is malformed");
+            None
         }
     }
 }
@@ -1179,10 +1275,41 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn trace_bucket_rolls_over_at_ttl_boundaries() {
-        assert_eq!(trace_bucketed_suffix("t", 60, 0), "t:b0");
-        assert_eq!(trace_bucketed_suffix("t", 60, 59), "t:b0");
-        assert_eq!(trace_bucketed_suffix("t", 60, 60), "t:b1");
+    fn trace_bucket_rolls_over_at_ttl_boundaries_offset_per_suffix() {
+        let jitter = |suffix: &str, ttl: u64| (fnv1a_64(suffix.as_bytes()) % ttl) as i64;
+        let boundary = 60 - jitter("t", 60);
+        assert!((1..=60).contains(&boundary));
+        assert_eq!(
+            trace_bucketed_suffix("t", 60, 0),
+            format!("t:b{}", jitter("t", 60) / 60)
+        );
+        assert_eq!(
+            trace_bucketed_suffix("t", 60, boundary - 1),
+            trace_bucketed_suffix("t", 60, 0)
+        );
+        assert_ne!(
+            trace_bucketed_suffix("t", 60, boundary),
+            trace_bucketed_suffix("t", 60, boundary - 1)
+        );
+        assert_eq!(
+            trace_bucketed_suffix("t", 60, boundary + 59),
+            format!("t:b{}", 1 + jitter("t", 60) / 60)
+        );
+        // Every bucket spans exactly one TTL.
+        let mut changes = 0;
+        for now in 1..=600 {
+            if trace_bucketed_suffix("x", 60, now) != trace_bucketed_suffix("x", 60, now - 1) {
+                changes += 1;
+            }
+        }
+        assert_eq!(changes, 10);
+        // The offset is a pure function of the suffix and spreads suffixes
+        // across the window.
+        let offsets: std::collections::HashSet<i64> = (0..64)
+            .map(|i| jitter(&format!("web:v2:total:subject:user:{i}:limit=None"), 60))
+            .collect();
+        assert!(offsets.len() > 16, "{offsets:?}");
+        assert_eq!(fnv1a_64(b"abc"), 0xe71f_a219_0541_574b);
         // A zero TTL must not divide by zero.
         assert_eq!(trace_bucketed_suffix("t", 0, 5), "t:b5");
     }

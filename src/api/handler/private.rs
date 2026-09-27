@@ -24,6 +24,7 @@ use crate::db::query::ranking::{
     fetch_all_rankings, fetch_latest_ranking, fetch_latest_ranking_by_rank,
 };
 use crate::db::query::user::get_user_data;
+use crate::db::query::web::{WebTraceFilter, search_user_trace, search_world_bloom_user_trace};
 use crate::db::query::world_bloom::{
     fetch_all_world_bloom_rankings, fetch_latest_world_bloom_ranking,
     fetch_latest_world_bloom_ranking_by_rank,
@@ -33,6 +34,10 @@ use crate::model::api::{
     UserLatestRankingQueryResponseSchema, WebRankingItemSchema, WebUserDetailResponseSchema,
 };
 use crate::model::enums::SekaiServerRegion;
+use crate::model::trace_columns::{TraceFormat, TracePayload};
+
+/// Same bound as the public web detail's trace page.
+const MAX_TRACE_LIMIT: u64 = 10_000;
 
 #[derive(Debug, Clone)]
 pub struct PrivateSubject(pub String);
@@ -55,6 +60,28 @@ pub struct PrivateWebDetailQuery {
     owner_id: Option<String>,
     include_trace: Option<bool>,
     include_profile: Option<bool>,
+    /// `rows` (default) or `columns`, as for the public details.
+    trace_format: Option<String>,
+    /// Same semantics as the public web detail: `cursor` is the last seen
+    /// trace timestamp and only strictly newer rows come back; `limit`
+    /// caps the page (oldest first, clamped to `MAX_TRACE_LIMIT`). Without
+    /// either the whole history is returned as before.
+    cursor: Option<i64>,
+    limit: Option<u64>,
+}
+
+impl PrivateWebDetailQuery {
+    fn trace_filter(&self) -> Option<WebTraceFilter> {
+        if self.cursor.is_none() && self.limit.is_none() {
+            return None;
+        }
+        Some(WebTraceFilter {
+            start_time: None,
+            end_time: None,
+            cursor: self.cursor,
+            limit: self.limit.map(|limit| limit.clamp(1, MAX_TRACE_LIMIT)),
+        })
+    }
 }
 
 pub async fn require_subject(
@@ -193,7 +220,7 @@ pub async fn trace_by_user(
     .await?;
     let mode = prepare_private_user_id_mode(&state, &engine, region, event_id).await?;
     let _permit = state.query_limiter().acquire_trace(region).await?;
-    let rankings = fetch_all_rankings(&engine, event_id, &user_id, mode).await?;
+    let rankings = fetch_all_rankings(&engine, region, event_id, &user_id, mode).await?;
     let user_data = get_user_data(&engine, event_id, &user_id, mode)
         .await
         .ok()
@@ -227,7 +254,8 @@ pub async fn trace_world_bloom_by_user(
     let mode = prepare_private_user_id_mode(&state, &engine, region, event_id).await?;
     let _permit = state.query_limiter().acquire_trace(region).await?;
     let rankings =
-        fetch_all_world_bloom_rankings(&engine, event_id, &user_id, character_id, mode).await?;
+        fetch_all_world_bloom_rankings(&engine, region, event_id, &user_id, character_id, mode)
+            .await?;
     let user_data = get_user_data(&engine, event_id, &user_id, mode)
         .await
         .ok()
@@ -292,8 +320,10 @@ async fn web_user_detail_for_scope(
         &user_id,
     )
     .await?;
+    let trace_format =
+        TraceFormat::parse(query.trace_format.as_deref()).map_err(ApiError::BadRequest)?;
     let mode = prepare_private_user_id_mode(&state, &engine, region, event_id).await?;
-    let current = match character_id {
+    let latest = match character_id {
         Some(character_id) => {
             fetch_latest_world_bloom_ranking(&engine, event_id, &user_id, character_id, mode)
                 .await?
@@ -303,9 +333,10 @@ async fn web_user_detail_for_scope(
             .await?
             .map(RecordedRankData::Normal),
     };
+    let tracked = latest.is_some();
     // The player's last row keeps its rank after they leave the tracked
     // ranks; unless they still hold that rank they are not ranked.
-    let occupant = match current.as_ref() {
+    let occupant = match latest.as_ref() {
         Some(rank_data) => {
             fetch_rank_item(
                 &engine,
@@ -321,7 +352,7 @@ async fn web_user_detail_for_scope(
     let ranked = occupant
         .as_ref()
         .is_some_and(|item| user_id_of(&item.rank_data) == user_id);
-    let current = current.filter(|_| ranked);
+    let current = latest.filter(|_| ranked);
     let rank = current.as_ref().map(rank_of_rank_data);
     let (previous, next) = tokio::try_join!(
         async {
@@ -347,15 +378,35 @@ async fn web_user_detail_for_scope(
     });
     let player_trace = if query.include_trace.unwrap_or(false) {
         let _permit = state.query_limiter().acquire_trace(region).await?;
-        match character_id {
-            Some(character_id) => {
-                fetch_all_world_bloom_rankings(&engine, event_id, &user_id, character_id, mode)
-                    .await?
-                    .into_iter()
-                    .map(RecordedRankData::WorldBloom)
-                    .collect()
+        match (query.trace_filter(), character_id) {
+            (Some(filter), Some(character_id)) => {
+                search_world_bloom_user_trace(
+                    &engine,
+                    region,
+                    event_id,
+                    character_id,
+                    &user_id,
+                    &filter,
+                    mode,
+                )
+                .await?
             }
-            None => fetch_all_rankings(&engine, event_id, &user_id, mode)
+            (Some(filter), None) => {
+                search_user_trace(&engine, region, event_id, &user_id, &filter, mode).await?
+            }
+            (None, Some(character_id)) => fetch_all_world_bloom_rankings(
+                &engine,
+                region,
+                event_id,
+                &user_id,
+                character_id,
+                mode,
+            )
+            .await?
+            .into_iter()
+            .map(RecordedRankData::WorldBloom)
+            .collect(),
+            (None, None) => fetch_all_rankings(&engine, region, event_id, &user_id, mode)
                 .await?
                 .into_iter()
                 .map(RecordedRankData::Normal)
@@ -369,9 +420,16 @@ async fn web_user_detail_for_scope(
     } else {
         None
     };
-    if current.is_none() && player_trace.is_empty() && profile.is_none() {
+    // A cursor poll with nothing newer is an empty increment for a player
+    // the event has tracked; only a player it never saw is a 404.
+    let empty = current.is_none() && player_trace.is_empty() && profile.is_none();
+    if empty && !(query.cursor.is_some() && tracked) {
         return Err(ApiError::NotFound);
     }
+    let player_trace = TracePayload::encode(player_trace, trace_format).map_err(|err| {
+        tracing::error!(%err, "trace columns encode error");
+        ApiError::ServiceUnavailable("json encode error".into())
+    })?;
     Ok(Json(WebUserDetailResponseSchema {
         meta: LeaderboardMetaSchema {
             server,
@@ -388,7 +446,7 @@ async fn web_user_detail_for_scope(
         current,
         previous,
         next,
-        player_trace: player_trace.into(),
+        player_trace,
         profile,
     }))
 }
@@ -457,7 +515,13 @@ mod tests {
     const NORMAL_EVENT: i64 = 831;
     const WORLD_BLOOM_EVENT: i64 = 832;
 
+    const BINDINGS: &str = r#"{"updatedData":{"kratosIdentityId":"identity-1","gameAccountBindings":[{"server":"jp","userId":100}]}}"#;
+
     async fn test_state(with_verifier: bool) -> AppState {
+        test_state_bound(with_verifier.then_some(BINDINGS)).await
+    }
+
+    async fn test_state_bound(bindings: Option<&'static str>) -> AppState {
         let engine = sqlite_engine().await;
         create_event_tables(&engine, SekaiServerRegion::Jp, NORMAL_EVENT, false)
             .await
@@ -467,18 +531,15 @@ mod tests {
             .await
             .unwrap();
         seed_world_bloom_event_with_history(&engine, WORLD_BLOOM_EVENT).await;
-        let verifier = if with_verifier {
-            let base_url = spawn_toolbox(
-                r#"{"updatedData":{"kratosIdentityId":"identity-1","gameAccountBindings":[{"server":"jp","userId":100}]}}"#,
-                Arc::new(Mutex::new(Vec::new())),
-            )
-            .await;
-            PrivateLookupVerifier::from_config(&ToolboxConfig {
-                base_url,
-                ..ToolboxConfig::default()
-            })
-        } else {
-            None
+        let verifier = match bindings {
+            Some(bindings) => {
+                let base_url = spawn_toolbox(bindings, Arc::new(Mutex::new(Vec::new()))).await;
+                PrivateLookupVerifier::from_config(&ToolboxConfig {
+                    base_url,
+                    ..ToolboxConfig::default()
+                })
+            }
+            None => None,
         };
         AppState::new(
             HashMap::from([(SekaiServerRegion::Jp, Arc::new(engine))]),
@@ -504,7 +565,19 @@ mod tests {
             owner_id: Some("identity-1".into()),
             include_trace: Some(true),
             include_profile: Some(true),
+            trace_format: None,
+            cursor: None,
+            limit: None,
         }
+    }
+
+    fn timestamps(rows: &[RecordedRankData]) -> Vec<i64> {
+        rows.iter()
+            .map(|row| match row {
+                RecordedRankData::Normal(data) => data.timestamp,
+                RecordedRankData::WorldBloom(data) => data.timestamp,
+            })
+            .collect()
     }
 
     fn subject() -> axum::Extension<PrivateSubject> {
@@ -596,6 +669,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn private_web_details_offer_the_columns_trace_format() {
+        let state = test_state(true).await;
+        let rows = web_total_user_detail(
+            State(state.clone()),
+            Path(("jp".into(), NORMAL_EVENT, "100".into())),
+            Query(detail_query()),
+            subject(),
+        )
+        .await
+        .unwrap()
+        .0;
+        let columns = web_total_user_detail(
+            State(state.clone()),
+            Path(("jp".into(), NORMAL_EVENT, "100".into())),
+            Query(PrivateWebDetailQuery {
+                trace_format: Some("columns".into()),
+                ..detail_query()
+            }),
+            subject(),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(columns.player_trace.format(), TraceFormat::Columns);
+        assert_eq!(
+            sonic_rs::to_string(&columns.player_trace.rows()).unwrap(),
+            sonic_rs::to_string(&rows.player_trace.rows()).unwrap()
+        );
+        let json = sonic_rs::to_string(&columns).unwrap();
+        assert!(
+            json.contains(r#""playerTrace":{"format":"columns""#),
+            "{json}"
+        );
+        assert!(json.contains(r#""users":["100"]"#), "{json}");
+        assert!(matches!(
+            web_total_user_detail(
+                State(state),
+                Path(("jp".into(), NORMAL_EVENT, "100".into())),
+                Query(PrivateWebDetailQuery {
+                    trace_format: Some("csv".into()),
+                    ..detail_query()
+                }),
+                subject(),
+            )
+            .await,
+            Err(ApiError::BadRequest(_))
+        ));
+    }
+
+    #[tokio::test]
     async fn private_web_details_of_players_who_left_the_ranks_are_not_ranked() {
         let state = test_state(true).await;
         let (_, engine) = resolve_region_engine(&state, "jp").unwrap();
@@ -634,6 +757,143 @@ mod tests {
             );
             assert_eq!(detail.profile.unwrap().user_id, "100");
         }
+    }
+
+    #[tokio::test]
+    async fn private_web_details_page_the_trace_with_cursor_and_limit() {
+        let state = test_state(true).await;
+        let total_path = || Path(("jp".into(), NORMAL_EVENT, "100".into()));
+        let world_path = || Path(("jp".into(), WORLD_BLOOM_EVENT, 17, "100".into()));
+        let full = web_total_user_detail(
+            State(state.clone()),
+            total_path(),
+            Query(detail_query()),
+            subject(),
+        )
+        .await
+        .unwrap()
+        .0;
+        let all = full.player_trace.rows();
+        let stamps = timestamps(&all);
+        assert_eq!(stamps.len(), 2);
+        assert!(stamps[0] < stamps[1]);
+
+        // An explicit (unreached) limit takes the filtered path and yields
+        // the same bytes as the unfiltered history.
+        let mut query = detail_query();
+        query.limit = Some(u64::MAX);
+        let limited =
+            web_total_user_detail(State(state.clone()), total_path(), Query(query), subject())
+                .await
+                .unwrap()
+                .0;
+        assert_eq!(
+            sonic_rs::to_vec(&limited.player_trace).unwrap(),
+            sonic_rs::to_vec(&full.player_trace).unwrap()
+        );
+
+        // `limit` pages from the oldest row; `cursor` continues after it.
+        let mut query = detail_query();
+        query.limit = Some(1);
+        query.include_profile = None;
+        let first =
+            web_total_user_detail(State(state.clone()), total_path(), Query(query), subject())
+                .await
+                .unwrap()
+                .0;
+        assert_eq!(timestamps(&first.player_trace.rows()), vec![stamps[0]]);
+        let mut query = detail_query();
+        query.cursor = Some(stamps[0]);
+        query.include_profile = None;
+        let rest =
+            web_total_user_detail(State(state.clone()), total_path(), Query(query), subject())
+                .await
+                .unwrap()
+                .0;
+        assert_eq!(timestamps(&rest.player_trace.rows()), vec![stamps[1]]);
+        assert!(rest.current.is_some());
+        assert!(rest.profile.is_none());
+
+        // Nothing newer than the cursor is an empty increment, not a 404,
+        // for a tracked player -- ranked or pushed out of the ranks.
+        let mut query = detail_query();
+        query.cursor = Some(stamps[1]);
+        query.include_profile = None;
+        let none =
+            web_total_user_detail(State(state.clone()), total_path(), Query(query), subject())
+                .await
+                .unwrap()
+                .0;
+        assert!(none.player_trace.is_empty());
+        assert!(none.current.is_some());
+        let (_, engine) = resolve_region_engine(&state, "jp").unwrap();
+        seed_player_pushed_out(&engine, NORMAL_EVENT, None, 1).await;
+        seed_player_pushed_out(&engine, WORLD_BLOOM_EVENT, Some(17), 1).await;
+        let mut query = detail_query();
+        query.cursor = Some(i64::MAX - 1);
+        query.include_profile = None;
+        let pushed_out =
+            web_total_user_detail(State(state.clone()), total_path(), Query(query), subject())
+                .await
+                .unwrap()
+                .0;
+        assert!(!pushed_out.ranked);
+        assert!(pushed_out.current.is_none());
+        assert!(pushed_out.player_trace.is_empty());
+        let mut query = detail_query();
+        query.cursor = Some(i64::MAX - 1);
+        query.include_profile = None;
+        let world = web_world_bloom_user_detail(
+            State(state.clone()),
+            world_path(),
+            Query(query),
+            subject(),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert!(!world.ranked && world.player_trace.is_empty());
+        let mut query = detail_query();
+        query.cursor = Some(stamps[0]);
+        query.limit = Some(1);
+        let world = web_world_bloom_user_detail(
+            State(state.clone()),
+            world_path(),
+            Query(query),
+            subject(),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(world.player_trace.rows().len(), 1);
+        assert!(timestamps(&world.player_trace.rows())[0] > stamps[0]);
+
+        // Without a cursor the old 404 rule stands, and a player the event
+        // never saw is a 404 even on a cursor poll.
+        let mut query = detail_query();
+        query.include_trace = None;
+        query.include_profile = None;
+        assert!(matches!(
+            web_total_user_detail(State(state.clone()), total_path(), Query(query), subject())
+                .await,
+            Err(ApiError::NotFound)
+        ));
+        let stranger = test_state_bound(Some(
+            r#"{"updatedData":{"kratosIdentityId":"identity-1","gameAccountBindings":[{"server":"jp","userId":999}]}}"#,
+        ))
+        .await;
+        let mut query = detail_query();
+        query.cursor = Some(0);
+        assert!(matches!(
+            web_total_user_detail(
+                State(stranger),
+                Path(("jp".into(), NORMAL_EVENT, "999".into())),
+                Query(query),
+                subject()
+            )
+            .await,
+            Err(ApiError::NotFound)
+        ));
     }
 
     #[tokio::test]

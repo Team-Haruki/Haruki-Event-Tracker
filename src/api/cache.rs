@@ -5,18 +5,22 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
+use axum::http::HeaderValue;
 use bytes::Bytes;
 use flate2::Compression;
 use flate2::write::GzEncoder;
+use quick_cache::sync::{Cache as QuickCache, DefaultLifecycle};
+use quick_cache::{DefaultHashBuilder, Lifecycle, OptionsBuilder, UnitWeighter, Weighter};
 use redis::AsyncCommands;
 use redis::aio::ConnectionManager;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tokio::sync::Notify;
-use tokio::time;
+use tokio::time::{self, MissedTickBehavior};
 
 use crate::api::error::ApiError;
-use crate::api::stats::{CACHE_STATS, incr};
+use crate::api::http_cache::strong_etag;
+use crate::api::stats::{CACHE_STATS, add, incr, set};
 use crate::config::ApiCacheConfig;
 
 const DIRTY_TTL_SECS: u64 = 300;
@@ -89,6 +93,13 @@ pub struct CachedJson {
     /// from, or accepted into, the epoch-keyed cache while the event was
     /// clean. `None` for dirty bypasses, cache errors and uncacheable sizes.
     pub epoch: Option<i64>,
+    /// Where the value's sub-value of interest lies, for callers that
+    /// asked the cache to locate it (see [`ApiCache::get_or_fetch_static_json_located`]).
+    pub span: ByteSpan,
+    /// The strong ETag of `bytes`, digested once when a precompressed
+    /// (gzip) value was produced or admitted to L1, so the web cache-header
+    /// layer needn't hash the body per request.
+    pub etag: Option<HeaderValue>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -97,12 +108,27 @@ pub enum CachedJsonEncoding {
     Gzip,
 }
 
+/// A byte range inside a cached JSON value, located once when the value
+/// entered L1 so hot hits slice instead of scanning the payload.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ByteSpan {
+    /// Not located: the value came through a path without a locator.
+    #[default]
+    Unknown,
+    /// The value is well-formed but has no such sub-value.
+    Absent,
+    /// `bytes[start..end]`.
+    Range { start: usize, end: usize },
+}
+
 impl CachedJson {
-    fn identity(bytes: Bytes) -> Self {
+    pub fn identity(bytes: Bytes) -> Self {
         Self {
             bytes,
             encoding: CachedJsonEncoding::Identity,
             epoch: None,
+            span: ByteSpan::Unknown,
+            etag: None,
         }
     }
 
@@ -111,6 +137,8 @@ impl CachedJson {
             bytes,
             encoding: CachedJsonEncoding::Gzip,
             epoch: None,
+            span: ByteSpan::Unknown,
+            etag: None,
         }
     }
 
@@ -118,13 +146,25 @@ impl CachedJson {
         self.epoch = epoch;
         self
     }
+
+    fn with_span(mut self, span: ByteSpan) -> Self {
+        self.span = span;
+        self
+    }
+
+    fn with_etag(mut self, etag: Option<HeaderValue>) -> Self {
+        self.etag = etag;
+        self
+    }
 }
 
 impl ApiCache {
     pub fn new(conns: Vec<ConnectionManager>, cfg: ApiCacheConfig) -> Self {
+        let l1 = L1Cache::new(cfg.local_max_entries, cfg.local_max_bytes);
+        l1.spawn_sweeper(Duration::from_millis(cfg.local_sweep_interval_ms));
         Self {
             conns: Arc::new(CacheConnections::new(conns)),
-            l1: L1Cache::new(cfg.local_max_entries),
+            l1,
             cfg,
             singleflight: SingleFlight::default(),
         }
@@ -172,7 +212,7 @@ impl ApiCache {
                 CacheOptions {
                     max_value_bytes: self.cfg.max_value_bytes,
                     is_batch: false,
-                    validate_cached_bytes: Some(validate_json_bytes::<T>),
+                    check: CachedCheck::Validate(validate_json_bytes::<T>),
                 },
             )
             .await?;
@@ -209,10 +249,11 @@ impl ApiCache {
                 CacheOptions {
                     max_value_bytes: self.cfg.batch_max_value_bytes,
                     is_batch: false,
-                    validate_cached_bytes: Some(validate_json_bytes::<T>),
+                    check: CachedCheck::Validate(validate_json_bytes::<T>),
                 },
             )
-            .await?;
+            .await?
+            .bytes;
         sonic_rs::from_slice::<T>(&bytes).map_err(|err| {
             tracing::warn!(%err, "api cache decoded invalid static JSON bytes");
             ApiError::ServiceUnavailable("api cache decode failed".into())
@@ -287,7 +328,46 @@ impl ApiCache {
             CacheOptions {
                 max_value_bytes: self.cfg.batch_max_value_bytes,
                 is_batch: false,
-                validate_cached_bytes: validate,
+                check: validate.map_or(CachedCheck::None, CachedCheck::Validate),
+            },
+        )
+        .await
+        .map(|cached| cached.bytes)
+    }
+
+    /// Like [`Self::get_or_fetch_static_json_bytes_checked`], with a
+    /// `locate` that both validates a value and finds the byte range its
+    /// consumer slices out. It runs once when a value enters L1 (fresh
+    /// encode or L2 hit); L1 hits carry the range along, so the hot path
+    /// never rescans the payload. `None` from `locate` rejects an L2 value
+    /// as a miss; on a fresh encode it degrades to [`ByteSpan::Unknown`].
+    pub async fn get_or_fetch_static_json_located<T, Fut>(
+        &self,
+        server: &str,
+        event_id: i64,
+        suffix: String,
+        ttl_secs: u64,
+        locate: fn(&Bytes) -> Option<ByteSpan>,
+        fetch: Fut,
+    ) -> Result<CachedJson, ApiError>
+    where
+        T: Serialize,
+        Fut: Future<Output = Result<T, ApiError>>,
+    {
+        let fetch_bytes = async move {
+            let value = fetch.await?;
+            encode_json_bytes(&value)
+        };
+        self.get_or_fetch_static_bytes(
+            server,
+            event_id,
+            suffix,
+            ttl_secs,
+            fetch_bytes,
+            CacheOptions {
+                max_value_bytes: self.cfg.batch_max_value_bytes,
+                is_batch: false,
+                check: CachedCheck::Locate(locate),
             },
         )
         .await
@@ -337,7 +417,7 @@ impl ApiCache {
         let options = CacheOptions {
             max_value_bytes: self.cfg.batch_max_value_bytes,
             is_batch: true,
-            validate_cached_bytes: None,
+            check: CachedCheck::None,
         };
         if !prefer_gzip || !self.cfg.precompress_gzip_enabled {
             return self
@@ -371,7 +451,7 @@ impl ApiCache {
             CacheOptions {
                 max_value_bytes: self.cfg.max_value_bytes,
                 is_batch: false,
-                validate_cached_bytes: None,
+                check: CachedCheck::None,
             },
         )
         .await
@@ -385,36 +465,49 @@ impl ApiCache {
         ttl_secs: u64,
         fetch: Fut,
         options: CacheOptions,
-    ) -> Result<Bytes, ApiError>
+    ) -> Result<CachedJson, ApiError>
     where
         Fut: Future<Output = Result<Bytes, ApiError>>,
     {
         if ttl_secs == 0 {
-            return fetch.await;
+            let bytes = fetch.await?;
+            let span = locate_fresh_bytes(options, &bytes);
+            return Ok(CachedJson::identity(bytes).with_span(span));
         }
         let key = static_value_key(server, event_id, &suffix);
-        // L1 entries are validated on the way in (fresh encode or checked L2
-        // read), so hits skip re-validation — it would re-parse the payload.
-        if let Some(bytes) = self.l1.get_value(&key) {
+        // L1 entries are validated (and located) on the way in, so hits
+        // skip re-validation — it would re-parse the payload.
+        if let Some(value) = self.l1.get_value(&key) {
             incr(&CACHE_STATS.l1_hit);
             tracing::debug!(cache_status = "static_l1_hit", "api static cache L1 hit");
-            return Ok(bytes);
+            return Ok(CachedJson::identity(value.bytes).with_span(value.span));
         }
 
-        self.lookup_with_singleflight(
+        self.lookup_encoded_with_singleflight(
             static_lookup_flight_key(server, event_id, &suffix),
             options,
             async {
                 match self.read_l2_value(&key).await {
-                    Ok(L2ValueRead::Hit(bytes)) => {
-                        if cached_bytes_are_valid(options, &bytes) {
+                    Ok(L2ValueRead::Hit {
+                        bytes,
+                        remaining_ms,
+                    }) => {
+                        if let Some(span) = check_cached_bytes(options, &bytes) {
                             incr(&CACHE_STATS.l2_hit);
                             tracing::debug!(
                                 cache_status = "static_l2_hit",
                                 "api static cache L2 hit"
                             );
-                            self.store_l1_value(key, bytes.clone());
-                            Ok(bytes)
+                            self.store_l1_located(
+                                key,
+                                bytes.clone(),
+                                L1Life::Static {
+                                    ttl_secs,
+                                    remaining_ms,
+                                },
+                                span,
+                            );
+                            Ok(CachedJson::identity(bytes).with_span(span))
                         } else {
                             tracing::warn!(
                                 cache_status = "static_l2_invalid",
@@ -433,7 +526,9 @@ impl ApiCache {
                     Err(err) => {
                         incr(&CACHE_STATS.l2_timeout);
                         tracing::warn!(%err, "api static cache read failed");
-                        fetch.await
+                        let bytes = fetch.await?;
+                        let span = locate_fresh_bytes(options, &bytes);
+                        Ok(CachedJson::identity(bytes).with_span(span))
                     }
                 }
             },
@@ -493,7 +588,7 @@ impl ApiCache {
             CacheOptions {
                 max_value_bytes: self.cfg.max_value_bytes,
                 is_batch: false,
-                validate_cached_bytes: None,
+                check: CachedCheck::None,
             },
         )
         .await
@@ -559,13 +654,13 @@ impl ApiCache {
         }
 
         let key = request.value_key(control.epoch);
-        if let Some(bytes) = self.l1.get_value(&key) {
+        if let Some(value) = self.l1.get_value(&key) {
             record_l1_hit(request.options);
             tracing::debug!(
                 cache_status = cache_status(request.options, "l1_hit"),
                 "api cache L1 hit"
             );
-            return Ok(bytes);
+            return Ok(value.bytes);
         }
         self.lookup_with_singleflight(
             lookup_flight_key(
@@ -596,16 +691,18 @@ impl ApiCache {
         Fut: Future<Output = Result<Bytes, ApiError>>,
     {
         match read {
-            Ok(L2ValueRead::Hit(bytes)) if cached_bytes_are_valid(request.options, &bytes) => {
+            Ok(L2ValueRead::Hit { bytes, .. })
+                if check_cached_bytes(request.options, &bytes).is_some() =>
+            {
                 record_l2_hit(request.options);
                 tracing::debug!(
                     cache_status = cache_status(request.options, "l2_hit"),
                     "api cache L2 hit"
                 );
-                self.store_l1_value(key, bytes.clone());
+                self.store_l1_value(key, bytes.clone(), request.epoch_life());
                 Ok(bytes)
             }
-            Ok(L2ValueRead::Hit(_)) => {
+            Ok(L2ValueRead::Hit { .. }) => {
                 tracing::warn!(
                     cache_status = "l2_invalid",
                     "api cache L2 invalid, refetching"
@@ -684,10 +781,10 @@ impl ApiCache {
                 .await
             }
             Ok(L2CombinedRead::Hit { epoch, key, bytes })
-                if cached_bytes_are_valid(request.options, &bytes) =>
+                if check_cached_bytes(request.options, &bytes).is_some() =>
             {
                 self.store_l1_control(control_key, epoch, false);
-                self.store_l1_value(key, bytes.clone());
+                self.store_l1_value(key, bytes.clone(), request.epoch_life());
                 record_l2_hit(request.options);
                 tracing::debug!(
                     cache_status = cache_status(request.options, "l2_hit"),
@@ -760,15 +857,17 @@ impl ApiCache {
 
         let key = request.value_key(control.epoch);
         let gzip = gzip_key(&key);
-        if let Some(bytes) = self.l1.get_value(&gzip) {
+        if let Some(value) = self.l1.get_value(&gzip) {
             record_l1_hit(request.options);
             tracing::debug!(
                 cache_status = cache_status(request.options, "l1_gzip_hit"),
                 "api cache L1 gzip hit"
             );
-            return Ok(CachedJson::gzip(bytes).at_epoch(Some(control.epoch)));
+            return Ok(CachedJson::gzip(value.bytes)
+                .at_epoch(Some(control.epoch))
+                .with_etag(value.etag));
         }
-        if let Some(bytes) = self.l1.get_value(&key) {
+        if let Some(value) = self.l1.get_value(&key) {
             record_l1_hit(request.options);
             tracing::debug!(
                 cache_status = cache_status(request.options, "l1_hit"),
@@ -776,7 +875,7 @@ impl ApiCache {
             );
             return self
                 .encode_response(
-                    bytes,
+                    value.bytes,
                     Some(request.write_context(control.epoch, key)),
                     request.options,
                 )
@@ -818,8 +917,11 @@ impl ApiCache {
                     cache_status = cache_status(request.options, "l2_gzip_hit"),
                     "api cache L2 gzip hit"
                 );
-                self.store_l1_value(gzip, bytes.clone());
-                Ok(CachedJson::gzip(bytes).at_epoch(Some(epoch)))
+                let etag = etag_for(request.options, &bytes);
+                self.store_l1_tagged(gzip, bytes.clone(), request.epoch_life(), etag.clone());
+                Ok(CachedJson::gzip(bytes)
+                    .at_epoch(Some(epoch))
+                    .with_etag(etag))
             }
             Ok(L2EncodedRead::Identity(bytes)) => {
                 record_l2_hit(request.options);
@@ -827,7 +929,7 @@ impl ApiCache {
                     cache_status = cache_status(request.options, "l2_hit"),
                     "api cache L2 hit, building gzip"
                 );
-                self.store_l1_value(key.clone(), bytes.clone());
+                self.store_l1_value(key.clone(), bytes.clone(), request.epoch_life());
                 self.encode_response(
                     bytes,
                     Some(request.write_context(epoch, key)),
@@ -904,7 +1006,7 @@ impl ApiCache {
             }
             Ok(L2CombinedRead::Hit { epoch, key, bytes }) => {
                 self.store_l1_control(control_key, epoch, false);
-                self.store_l1_value(key.clone(), bytes.clone());
+                self.store_l1_value(key.clone(), bytes.clone(), request.epoch_life());
                 record_l2_hit(request.options);
                 tracing::debug!(
                     cache_status = cache_status(request.options, "l2_hit"),
@@ -1151,7 +1253,7 @@ impl ApiCache {
             .write_l2_if_clean(&ctx, &ctx.value_key, bytes.clone(), ctx.ttl_secs)
             .await
         {
-            Ok(true) => self.store_l1_value(ctx.value_key.clone(), bytes.clone()),
+            Ok(true) => self.store_l1_value(ctx.value_key.clone(), bytes.clone(), ctx.life()),
             Ok(false) => {}
             Err(err) => tracing::warn!(%err, "api cache write failed"),
         }
@@ -1164,11 +1266,12 @@ impl ApiCache {
         key: String,
         ttl_secs: u64,
         options: CacheOptions,
-    ) -> Result<Bytes, ApiError>
+    ) -> Result<CachedJson, ApiError>
     where
         Fut: Future<Output = Result<Bytes, ApiError>>,
     {
         let bytes = fetch.await?;
+        let span = locate_fresh_bytes(options, &bytes);
         if bytes.len() > options.max_value_bytes {
             tracing::debug!(
                 cache_status = "static_too_large",
@@ -1176,13 +1279,21 @@ impl ApiCache {
                 max = options.max_value_bytes,
                 "api static cache value too large"
             );
-            return Ok(bytes);
+            return Ok(CachedJson::identity(bytes).with_span(span));
         }
         match self.write_l2_static(&key, bytes.clone(), ttl_secs).await {
-            Ok(()) => self.store_l1_value(key, bytes.clone()),
+            Ok(()) => self.store_l1_located(
+                key,
+                bytes.clone(),
+                L1Life::Static {
+                    ttl_secs,
+                    remaining_ms: None,
+                },
+                span,
+            ),
             Err(err) => tracing::warn!(%err, "api static cache write failed"),
         }
-        Ok(bytes)
+        Ok(CachedJson::identity(bytes).with_span(span))
     }
 
     async fn fetch_and_maybe_cache_encoded<Fut>(
@@ -1245,9 +1356,14 @@ impl ApiCache {
             .await
         {
             Ok(true) => {
-                self.store_l1_value(ctx.value_key.clone(), bytes);
+                self.store_l1_value(ctx.value_key.clone(), bytes, ctx.life());
                 if encoded.encoding == CachedJsonEncoding::Gzip {
-                    self.store_l1_value(gzip_key(&ctx.value_key), encoded.bytes.clone());
+                    self.store_l1_tagged(
+                        gzip_key(&ctx.value_key),
+                        encoded.bytes.clone(),
+                        ctx.life(),
+                        encoded.etag.clone(),
+                    );
                 }
             }
             // A rejected write means the event went dirty or moved on while
@@ -1265,37 +1381,53 @@ impl ApiCache {
         &self,
         bytes: Bytes,
         write_context: Option<CacheWriteContext>,
-        _options: CacheOptions,
+        options: CacheOptions,
     ) -> Result<CachedJson, ApiError> {
         let epoch = write_context.as_ref().map(|ctx| ctx.epoch);
         if bytes.len() < self.cfg.precompress_min_bytes {
             return Ok(CachedJson::identity(bytes).at_epoch(epoch));
         }
-        let gzip = self.gzip_response_bytes(bytes).await?;
+        let (gzip, etag) = self.gzip_response_bytes(bytes, options).await?;
         if let Some(ctx) = write_context {
             match self
                 .write_l2_if_clean(&ctx, &gzip_key(&ctx.value_key), gzip.clone(), ctx.ttl_secs)
                 .await
             {
-                Ok(true) => self.store_l1_value(gzip_key(&ctx.value_key), gzip.clone()),
+                Ok(true) => self.store_l1_tagged(
+                    gzip_key(&ctx.value_key),
+                    gzip.clone(),
+                    ctx.life(),
+                    etag.clone(),
+                ),
                 Ok(false) => {}
                 Err(err) => tracing::warn!(%err, "api cache gzip write failed"),
             }
         }
-        Ok(CachedJson::gzip(gzip).at_epoch(epoch))
+        Ok(CachedJson::gzip(gzip).at_epoch(epoch).with_etag(etag))
     }
 
-    async fn gzip_response_bytes(&self, bytes: Bytes) -> Result<Bytes, ApiError> {
+    /// Gzips a response body and, for web values, digests its ETag in the
+    /// same (blocking, for large bodies) step: both happen once per cache
+    /// generation instead of once per request.
+    async fn gzip_response_bytes(
+        &self,
+        bytes: Bytes,
+        options: CacheOptions,
+    ) -> Result<(Bytes, Option<HeaderValue>), ApiError> {
         let level = self.cfg.gzip_level;
-        if bytes.len() < GZIP_SPAWN_BLOCKING_THRESHOLD {
-            return gzip_bytes(&bytes, level);
+        let inline = bytes.len() < GZIP_SPAWN_BLOCKING_THRESHOLD;
+        let encode = move || {
+            let gzip = gzip_bytes(&bytes, level)?;
+            let etag = etag_for(options, &gzip);
+            Ok((gzip, etag))
+        };
+        if inline {
+            return encode();
         }
-        tokio::task::spawn_blocking(move || gzip_bytes(&bytes, level))
-            .await
-            .map_err(|err| {
-                tracing::warn!(%err, "gzip blocking task failed");
-                ApiError::ServiceUnavailable("gzip encode error".into())
-            })?
+        tokio::task::spawn_blocking(encode).await.map_err(|err| {
+            tracing::warn!(%err, "gzip blocking task failed");
+            ApiError::ServiceUnavailable("gzip encode error".into())
+        })?
     }
 
     async fn read_l2_combined(
@@ -1331,14 +1463,20 @@ impl ApiCache {
         Ok(L2CombinedRead::Miss { epoch, key })
     }
 
+    /// Reads a value with its remaining L2 life (`PTTL`, same round trip),
+    /// which bounds how long a static value may then serve from L1.
     async fn read_l2_value(&self, key: &str) -> Result<L2ValueRead, redis::RedisError> {
         let mut conn = self.conns.connection();
         let mut pipe = redis::pipe();
-        pipe.get(key).exists(format!("{key}:not_found"));
-        let fut = pipe.query_async::<(Option<Vec<u8>>, bool)>(&mut conn);
-        let (value, negative) = self.with_timeout(fut).await?;
+        pipe.get(key).pttl(key).exists(format!("{key}:not_found"));
+        let fut = pipe.query_async::<(Option<Vec<u8>>, i64, bool)>(&mut conn);
+        let (value, pttl_ms, negative) = self.with_timeout(fut).await?;
         if let Some(bytes) = value {
-            Ok(L2ValueRead::Hit(Bytes::from(bytes)))
+            Ok(L2ValueRead::Hit {
+                bytes: Bytes::from(bytes),
+                // -1 (no expiry) and -2 (gone) mean "unknown" here.
+                remaining_ms: u64::try_from(pttl_ms).ok(),
+            })
         } else if negative {
             Ok(L2ValueRead::NotFound)
         } else {
@@ -1426,18 +1564,89 @@ impl ApiCache {
         );
     }
 
-    fn store_l1_value(&self, key: String, bytes: Bytes) {
-        if self.cfg.local_value_ttl_ms == 0 {
+    fn store_l1_value(&self, key: String, bytes: Bytes, life: L1Life) {
+        self.store_l1_entry(key, bytes, life, ByteSpan::Unknown, None);
+    }
+
+    fn store_l1_located(&self, key: String, bytes: Bytes, life: L1Life, span: ByteSpan) {
+        self.store_l1_entry(key, bytes, life, span, None);
+    }
+
+    fn store_l1_tagged(&self, key: String, bytes: Bytes, life: L1Life, etag: Option<HeaderValue>) {
+        self.store_l1_entry(key, bytes, life, ByteSpan::Unknown, etag);
+    }
+
+    fn store_l1_entry(
+        &self,
+        key: String,
+        bytes: Bytes,
+        life: L1Life,
+        span: ByteSpan,
+        etag: Option<HeaderValue>,
+    ) {
+        let Some(ttl) = l1_value_ttl(&self.cfg, life) else {
             return;
-        }
+        };
         self.l1.insert_value(
             key,
             L1Value {
                 bytes,
-                expires_at: Instant::now() + Duration::from_millis(self.cfg.local_value_ttl_ms),
+                expires_at: Instant::now() + ttl,
+                span,
+                etag,
             },
         );
     }
+}
+
+/// The ETag the web cache-header layer would compute for these wire bytes.
+/// Batch (cloud) values never pass that layer, so they aren't digested.
+fn etag_for(options: CacheOptions, wire_bytes: &Bytes) -> Option<HeaderValue> {
+    (!options.is_batch).then(|| strong_etag(wire_bytes))
+}
+
+/// How long a value may serve from L1, or `None` to keep it out.
+///
+/// Epoch keys keep the short local TTL: the control entry decides when an
+/// epoch is stale, but the window queries behind those keys (snapshots,
+/// overview, growth) end at the wall clock, so a value must never sit in
+/// L1 past its L2 TTL or the window freezes. Static and time-bucketed keys
+/// are immutable for their whole L2 life, so they may stay until L2 would
+/// drop them, capped by `local_static_value_ttl_secs` (0 falls back to the
+/// epoch rule).
+fn l1_value_ttl(cfg: &ApiCacheConfig, life: L1Life) -> Option<Duration> {
+    let local_ms = cfg.local_value_ttl_ms;
+    if local_ms == 0 {
+        return None;
+    }
+    let ms = match life {
+        L1Life::Epoch { ttl_secs } => local_ms.min(ttl_secs.saturating_mul(1000)),
+        L1Life::Static {
+            ttl_secs,
+            remaining_ms,
+        } => {
+            let l2_ms = remaining_ms.unwrap_or_else(|| ttl_secs.saturating_mul(1000));
+            match cfg.local_static_value_ttl_secs.saturating_mul(1000) {
+                0 => local_ms.min(l2_ms),
+                cap_ms => cap_ms.min(l2_ms),
+            }
+        }
+    };
+    (ms > 0).then(|| Duration::from_millis(ms))
+}
+
+/// Which L1 lifetime rule a value falls under (see [`l1_value_ttl`]).
+#[derive(Clone, Copy, Debug)]
+enum L1Life {
+    /// An epoch-keyed value whose L2 TTL is `ttl_secs`.
+    Epoch { ttl_secs: u64 },
+    /// A static-keyed value: `ttl_secs` is the L2 TTL it was written with,
+    /// `remaining_ms` the L2 life left when it was read back (`None` when
+    /// it was just written or Redis reported no expiry).
+    Static {
+        ttl_secs: u64,
+        remaining_ms: Option<u64>,
+    },
 }
 
 struct CacheConnections {
@@ -1463,26 +1672,35 @@ impl CacheConnections {
     }
 }
 
-/// Number of independently-locked L1 shards. Spreading keys across shards keeps
-/// the hot lookup path from serialising on a single mutex under load.
-const L1_SHARDS: usize = 16;
+/// Independently locked L1 shards. quick_cache splits the byte budget
+/// evenly across them, so more shards means a lower ceiling on the largest
+/// (multi-MB batch) values; eight keeps that ceiling at budget / 8.
+const L1_SHARDS: usize = 8;
+/// Bookkeeping charged per value entry on top of key and payload bytes: the
+/// key and `Bytes` handles, the deadline and the cache's own slot.
+const L1_ENTRY_OVERHEAD: usize = 128;
 
+/// In-process tier in front of Redis: control entries (epoch + dirty per
+/// event) and value entries (response bytes), each with its own deadline.
+///
+/// Values are bounded by bytes, not count. Counting entries let a burst of
+/// distinct minute-bucketed traces pin up to `max_entries` × 4 MB: those
+/// keys are never read again after their minute, and expired entries used
+/// to go only on a read or when a shard filled. Now the weighter charges
+/// every entry its payload, the cache evicts to stay under the budget, and
+/// a periodic sweep drops expired entries the reads never revisit.
 #[derive(Clone)]
 struct L1Cache {
-    max_entries: usize,
-    inner: Arc<L1Shards>,
+    inner: Option<Arc<L1Inner>>,
 }
 
-/// Shards use `std` mutexes: the critical sections never await, so the brief
-/// blocking lock is cheaper than an async mutex on the hot lookup path.
-/// Keys are 150-250 byte strings, so the maps use `ahash` instead of SipHash
-/// and the shard index derives from the same seeds (`RandomState` clones
-/// share them), off bits the map's bucket/control lookups don't use.
-struct L1Shards {
-    hasher: ahash::RandomState,
-    max_per_shard: usize,
-    controls: Box<[StdMutex<HashMap<String, L1Control, ahash::RandomState>>]>,
-    values: Box<[StdMutex<HashMap<String, L1Value, ahash::RandomState>>]>,
+type L1Controls = QuickCache<String, L1Control>;
+type L1Values = QuickCache<String, L1Value, L1Weighter, DefaultHashBuilder, L1Lifecycle>;
+
+struct L1Inner {
+    controls: L1Controls,
+    values: L1Values,
+    max_bytes: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -1492,97 +1710,162 @@ struct L1Control {
     expires_at: Instant,
 }
 
-impl Expiring for L1Control {
-    fn expires_at(&self) -> Instant {
-        self.expires_at
-    }
-}
-
 #[derive(Clone)]
 struct L1Value {
     bytes: Bytes,
     expires_at: Instant,
+    span: ByteSpan,
+    etag: Option<HeaderValue>,
 }
 
-impl Expiring for L1Value {
-    fn expires_at(&self) -> Instant {
-        self.expires_at
+#[derive(Clone, Copy, Default)]
+struct L1Weighter;
+
+impl Weighter<String, L1Value> for L1Weighter {
+    fn weight(&self, key: &String, value: &L1Value) -> u64 {
+        (key.len() + value.bytes.len() + L1_ENTRY_OVERHEAD) as u64
     }
 }
 
-trait Expiring {
-    fn expires_at(&self) -> Instant;
+/// Counts budget evictions (and rejected oversized inserts, which the cache
+/// reports the same way) so the stats log shows whether the budget binds.
+#[derive(Clone, Copy, Default)]
+struct L1Lifecycle;
+
+impl Lifecycle<String, L1Value> for L1Lifecycle {
+    type RequestState = ();
+
+    fn begin_request(&self) {}
+
+    fn on_evict(&self, _state: &mut (), _key: String, _value: L1Value) {
+        incr(&CACHE_STATS.l1_evicted);
+    }
 }
 
 impl L1Cache {
-    fn new(max_entries: usize) -> Self {
-        let max_per_shard = max_entries.div_ceil(L1_SHARDS).max(1);
-        let hasher = ahash::RandomState::new();
-        let controls = (0..L1_SHARDS)
-            .map(|_| StdMutex::new(HashMap::with_hasher(hasher.clone())))
-            .collect();
-        let values = (0..L1_SHARDS)
-            .map(|_| StdMutex::new(HashMap::with_hasher(hasher.clone())))
-            .collect();
+    /// `max_entries == 0` disables L1 entirely; `max_bytes == 0` keeps the
+    /// (tiny) control entries but stores no values.
+    fn new(max_entries: usize, max_bytes: usize) -> Self {
+        if max_entries == 0 {
+            return Self { inner: None };
+        }
+        let options = |weight_capacity: u64| {
+            OptionsBuilder::new()
+                .shards(L1_SHARDS)
+                .estimated_items_capacity(max_entries)
+                .weight_capacity(weight_capacity)
+                .build()
+                .expect("L1 cache options are complete")
+        };
+        let controls = QuickCache::with_options(
+            options(max_entries as u64),
+            UnitWeighter,
+            DefaultHashBuilder::default(),
+            DefaultLifecycle::default(),
+        );
+        let values = QuickCache::with_options(
+            options(max_bytes as u64),
+            L1Weighter,
+            DefaultHashBuilder::default(),
+            L1Lifecycle,
+        );
         Self {
-            max_entries,
-            inner: Arc::new(L1Shards {
-                hasher,
-                max_per_shard,
+            inner: Some(Arc::new(L1Inner {
                 controls,
                 values,
-            }),
+                max_bytes,
+            })),
         }
-    }
-
-    fn shard(&self, key: &str) -> usize {
-        // Bits 32..36: hashbrown's control bytes use the top 7 bits and the
-        // bucket index the low ones, so the shard constraint costs neither.
-        (self.inner.hasher.hash_one(key) >> 32) as usize % L1_SHARDS
     }
 
     fn get_control(&self, key: &str) -> Option<L1Control> {
-        let now = Instant::now();
-        let mut shard = lock_ignore_poison(&self.inner.controls[self.shard(key)]);
-        match shard.get(key).copied() {
-            Some(control) if control.expires_at > now => Some(control),
-            Some(_) => {
-                shard.remove(key);
-                None
-            }
-            None => None,
+        let inner = self.inner.as_ref()?;
+        let control = inner.controls.get(key)?;
+        if control.expires_at > Instant::now() {
+            return Some(control);
+        }
+        inner.controls.remove(key);
+        None
+    }
+
+    fn insert_control(&self, key: String, control: L1Control) {
+        if let Some(inner) = &self.inner {
+            inner.controls.insert(key, control);
         }
     }
 
-    fn insert_control(&self, key: String, value: L1Control) {
-        if self.max_entries == 0 {
-            return;
+    fn get_value(&self, key: &str) -> Option<L1Value> {
+        let inner = self.inner.as_ref()?;
+        let value = inner.values.get(key)?;
+        if value.expires_at > Instant::now() {
+            return Some(value);
         }
-        let mut shard = lock_ignore_poison(&self.inner.controls[self.shard(&key)]);
-        evict_if_full(self.inner.max_per_shard, &mut shard);
-        shard.insert(key, value);
-    }
-
-    fn get_value(&self, key: &str) -> Option<Bytes> {
-        let now = Instant::now();
-        let mut shard = lock_ignore_poison(&self.inner.values[self.shard(key)]);
-        match shard.get(key) {
-            Some(value) if value.expires_at > now => Some(value.bytes.clone()),
-            Some(_) => {
-                shard.remove(key);
-                None
-            }
-            None => None,
-        }
+        inner.values.remove(key);
+        None
     }
 
     fn insert_value(&self, key: String, value: L1Value) {
-        if self.max_entries == 0 {
+        if let Some(inner) = &self.inner
+            && inner.max_bytes > 0
+        {
+            inner.values.insert(key, value);
+        }
+    }
+
+    /// Drops every expired entry and refreshes the size gauges; returns how
+    /// many entries went. The sweeper task calls the inner method directly.
+    #[cfg(test)]
+    fn sweep_expired(&self) -> usize {
+        self.inner.as_ref().map_or(0, |inner| inner.sweep_expired())
+    }
+
+    /// Runs [`Self::sweep_expired`] every `interval` for as long as the
+    /// cache is alive. Without a runtime (or with a zero interval) expired
+    /// entries still go on read and under eviction pressure.
+    fn spawn_sweeper(&self, interval: Duration) {
+        let Some(inner) = &self.inner else {
+            return;
+        };
+        if interval.is_zero() {
             return;
         }
-        let mut shard = lock_ignore_poison(&self.inner.values[self.shard(&key)]);
-        evict_if_full(self.inner.max_per_shard, &mut shard);
-        shard.insert(key, value);
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            tracing::warn!("api cache L1 sweeper not started: no tokio runtime");
+            return;
+        };
+        let weak = Arc::downgrade(inner);
+        handle.spawn(async move {
+            let mut ticker = time::interval(interval);
+            ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+            loop {
+                ticker.tick().await;
+                let Some(inner) = weak.upgrade() else {
+                    break;
+                };
+                inner.sweep_expired();
+            }
+        });
+    }
+}
+
+impl L1Inner {
+    fn sweep_expired(&self) -> usize {
+        let now = Instant::now();
+        let expired = std::cell::Cell::new(0usize);
+        let keep = |expires_at: Instant| {
+            let live = expires_at > now;
+            if !live {
+                expired.set(expired.get() + 1);
+            }
+            live
+        };
+        self.controls.retain(|_, control| keep(control.expires_at));
+        self.values.retain(|_, value| keep(value.expires_at));
+        let expired = expired.get();
+        add(&CACHE_STATS.l1_expired, expired as u64);
+        set(&CACHE_STATS.l1_entries, self.values.len() as u64);
+        set(&CACHE_STATS.l1_bytes, self.values.weight());
+        expired
     }
 }
 
@@ -1590,28 +1873,6 @@ fn lock_ignore_poison<T>(mutex: &StdMutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-}
-
-/// Make room in a full shard without the thundering-herd of clearing it whole:
-/// drop expired entries first, and if still full evict roughly the oldest
-/// quarter by expiry (≈ insertion order, since each entry type has a fixed TTL).
-fn evict_if_full<T: Expiring, S: std::hash::BuildHasher>(
-    max_per_shard: usize,
-    map: &mut HashMap<String, T, S>,
-) {
-    if map.len() < max_per_shard {
-        return;
-    }
-    let now = Instant::now();
-    map.retain(|_, v| v.expires_at() > now);
-    if map.len() < max_per_shard || map.len() <= 1 {
-        return;
-    }
-    let drop = (map.len() / 4).max(1).min(map.len() - 1);
-    let mut deadlines: Vec<Instant> = map.values().map(Expiring::expires_at).collect();
-    deadlines.select_nth_unstable(drop);
-    let cutoff = deadlines[drop];
-    map.retain(|_, v| v.expires_at() >= cutoff);
 }
 
 enum L2CombinedRead {
@@ -1633,7 +1894,11 @@ enum L2CombinedRead {
 }
 
 enum L2ValueRead {
-    Hit(Bytes),
+    Hit {
+        bytes: Bytes,
+        /// Remaining L2 life, when Redis reported one.
+        remaining_ms: Option<u64>,
+    },
     NotFound,
     Miss,
 }
@@ -1664,9 +1929,23 @@ struct CacheRequest<'a> {
     options: CacheOptions,
 }
 
+impl CacheWriteContext {
+    fn life(&self) -> L1Life {
+        L1Life::Epoch {
+            ttl_secs: self.ttl_secs,
+        }
+    }
+}
+
 impl CacheRequest<'_> {
     fn value_key(self, epoch: i64) -> String {
         value_key(self.server, self.event_id, epoch, self.suffix)
+    }
+
+    fn epoch_life(self) -> L1Life {
+        L1Life::Epoch {
+            ttl_secs: self.ttl_secs,
+        }
     }
 
     fn write_context(self, epoch: i64, value_key: String) -> CacheWriteContext {
@@ -1685,7 +1964,16 @@ impl CacheRequest<'_> {
 struct CacheOptions {
     max_value_bytes: usize,
     is_batch: bool,
-    validate_cached_bytes: Option<fn(&Bytes) -> bool>,
+    check: CachedCheck,
+}
+
+/// What an L2 value must pass before it is served and admitted to L1.
+#[derive(Clone, Copy)]
+enum CachedCheck {
+    None,
+    Validate(fn(&Bytes) -> bool),
+    /// Validates and locates the consumer's byte range; `None` rejects.
+    Locate(fn(&Bytes) -> Option<ByteSpan>),
 }
 
 fn record_control_hit() {
@@ -1740,11 +2028,27 @@ fn cache_status(options: CacheOptions, status: &'static str) -> &'static str {
     }
 }
 
-fn cached_bytes_are_valid(options: CacheOptions, bytes: &Bytes) -> bool {
-    options
-        .validate_cached_bytes
-        .map(|validate| validate(bytes))
-        .unwrap_or(true)
+/// `None` when the cached bytes fail the caller's check; otherwise the
+/// located span (`Unknown` unless the check is a locator).
+fn check_cached_bytes(options: CacheOptions, bytes: &Bytes) -> Option<ByteSpan> {
+    match options.check {
+        CachedCheck::None => Some(ByteSpan::Unknown),
+        CachedCheck::Validate(validate) => validate(bytes).then_some(ByteSpan::Unknown),
+        CachedCheck::Locate(locate) => locate(bytes),
+    }
+}
+
+/// Locates freshly encoded bytes. They came from this process's own
+/// encoder, so a locator that rejects them is a bug worth a warning, not a
+/// reason to fail the request: the consumer falls back to scanning.
+fn locate_fresh_bytes(options: CacheOptions, bytes: &Bytes) -> ByteSpan {
+    let CachedCheck::Locate(locate) = options.check else {
+        return ByteSpan::Unknown;
+    };
+    locate(bytes).unwrap_or_else(|| {
+        tracing::warn!("api cache locator rejected freshly encoded bytes");
+        ByteSpan::Unknown
+    })
 }
 
 fn validate_json_bytes<T: DeserializeOwned>(bytes: &Bytes) -> bool {
@@ -2180,7 +2484,7 @@ mod tests {
         let options = CacheOptions {
             max_value_bytes: 1024,
             is_batch: false,
-            validate_cached_bytes: None,
+            check: CachedCheck::None,
         };
         let request = CacheRequest {
             server: "jp",
@@ -2195,7 +2499,10 @@ mod tests {
                 request,
                 0,
                 key.clone(),
-                Ok(L2ValueRead::Hit(Bytes::from_static(b"hit"))),
+                Ok(L2ValueRead::Hit {
+                    bytes: Bytes::from_static(b"hit"),
+                    remaining_ms: Some(1_000),
+                }),
                 async { Ok(Bytes::from_static(b"unused")) },
             )
             .await
@@ -2204,7 +2511,7 @@ mod tests {
 
         let invalid_request = CacheRequest {
             options: CacheOptions {
-                validate_cached_bytes: Some(|_| false),
+                check: CachedCheck::Validate(|_| false),
                 ..options
             },
             ..request
@@ -2214,7 +2521,10 @@ mod tests {
                 invalid_request,
                 0,
                 key.clone(),
-                Ok(L2ValueRead::Hit(Bytes::from_static(b"invalid"))),
+                Ok(L2ValueRead::Hit {
+                    bytes: Bytes::from_static(b"invalid"),
+                    remaining_ms: None,
+                }),
                 async { Ok(Bytes::from_static(b"refetched")) },
             )
             .await
@@ -2344,117 +2654,426 @@ mod tests {
         );
     }
 
+    fn l1_value(bytes: &'static [u8], ttl: Duration) -> L1Value {
+        L1Value {
+            bytes: Bytes::from_static(bytes),
+            expires_at: Instant::now() + ttl,
+            span: ByteSpan::Unknown,
+            etag: None,
+        }
+    }
+
+    fn expired_l1_value(bytes: &'static [u8]) -> L1Value {
+        L1Value {
+            bytes: Bytes::from_static(bytes),
+            expires_at: Instant::now() - Duration::from_secs(1),
+            span: ByteSpan::Unknown,
+            etag: None,
+        }
+    }
+
+    fn l1_bytes(l1: &L1Cache, key: &str) -> Option<Bytes> {
+        l1.get_value(key).map(|value| value.bytes)
+    }
+
+    fn l1_control(epoch: i64, dirty: bool, ttl: Duration) -> L1Control {
+        L1Control {
+            epoch,
+            dirty,
+            expires_at: Instant::now() + ttl,
+        }
+    }
+
+    fn l1_resident(l1: &L1Cache) -> (usize, u64) {
+        let inner = l1.inner.as_ref().expect("L1 enabled");
+        (inner.values.len(), inner.values.weight())
+    }
+
     #[test]
     fn l1_value_hit_returns_cached_bytes() {
-        let l1 = L1Cache::new(16);
+        let l1 = L1Cache::new(16, 1 << 20);
         l1.insert_value(
             "value".to_owned(),
-            L1Value {
-                bytes: Bytes::from_static(b"cached"),
-                expires_at: Instant::now() + Duration::from_secs(1),
-            },
+            l1_value(b"cached", Duration::from_secs(1)),
         );
 
-        assert_eq!(l1.get_value("value"), Some(Bytes::from_static(b"cached")));
+        assert_eq!(l1_bytes(&l1, "value"), Some(Bytes::from_static(b"cached")));
     }
 
     #[test]
     fn l1_value_expiry_removes_cached_bytes() {
-        let l1 = L1Cache::new(16);
-        l1.insert_value(
-            "value".to_owned(),
-            L1Value {
-                bytes: Bytes::from_static(b"stale"),
-                expires_at: Instant::now() - Duration::from_secs(1),
-            },
-        );
+        let l1 = L1Cache::new(16, 1 << 20);
+        l1.insert_value("value".to_owned(), expired_l1_value(b"stale"));
 
-        assert_eq!(l1.get_value("value"), None);
-        assert_eq!(l1.get_value("value"), None);
+        assert_eq!(l1_bytes(&l1, "value"), None);
+        assert_eq!(l1_bytes(&l1, "value"), None);
+        assert_eq!(l1_resident(&l1).0, 0);
     }
 
     #[test]
     fn l1_control_tracks_epoch_and_dirty_state() {
-        let l1 = L1Cache::new(16);
+        let l1 = L1Cache::new(16, 1 << 20);
         l1.insert_control(
             "control".to_owned(),
-            L1Control {
-                epoch: 7,
-                dirty: true,
-                expires_at: Instant::now() + Duration::from_secs(1),
-            },
+            l1_control(7, true, Duration::from_secs(1)),
         );
 
         let control = l1.get_control("control").unwrap();
         assert_eq!(control.epoch, 7);
         assert!(control.dirty);
-    }
 
-    #[test]
-    fn evict_if_full_drops_oldest_quarter_not_everything() {
-        let base = Instant::now();
-        let mut map: HashMap<String, L1Value> = (0..100)
-            .map(|i| {
-                (
-                    i.to_string(),
-                    L1Value {
-                        bytes: Bytes::from_static(b"x"),
-                        // Distinct, all-in-the-future deadlines; higher i == newer.
-                        expires_at: base + Duration::from_secs(100 + i),
-                    },
-                )
-            })
-            .collect();
-
-        evict_if_full(100, &mut map);
-
-        // ~25% evicted, not a full clear.
-        assert_eq!(map.len(), 75);
-        // The oldest entries (smallest deadlines) are the ones removed.
-        assert!(!map.contains_key("0"));
-        assert!(map.contains_key("99"));
-    }
-
-    #[test]
-    fn evict_if_full_drops_expired_before_live_entries() {
-        let now = Instant::now();
-        let mut map: HashMap<String, L1Value> = HashMap::new();
-        map.insert(
-            "expired".to_owned(),
-            L1Value {
-                bytes: Bytes::from_static(b"x"),
-                expires_at: now - Duration::from_secs(1),
+        l1.insert_control(
+            "control".to_owned(),
+            L1Control {
+                epoch: 8,
+                dirty: false,
+                expires_at: Instant::now() - Duration::from_millis(1),
             },
         );
-        map.insert(
-            "live".to_owned(),
-            L1Value {
-                bytes: Bytes::from_static(b"x"),
-                expires_at: now + Duration::from_secs(60),
-            },
-        );
-
-        evict_if_full(2, &mut map);
-
-        assert!(!map.contains_key("expired"));
-        assert!(map.contains_key("live"));
+        assert!(l1.get_control("control").is_none());
     }
 
     #[test]
     fn l1_zero_max_entries_disables_storage() {
-        let l1 = L1Cache::new(0);
+        let l1 = L1Cache::new(0, 1 << 20);
         l1.insert_value(
             "value".to_owned(),
-            L1Value {
-                bytes: Bytes::from_static(b"cached"),
-                expires_at: Instant::now() + Duration::from_secs(1),
-            },
+            l1_value(b"cached", Duration::from_secs(1)),
+        );
+        l1.insert_control(
+            "control".to_owned(),
+            l1_control(1, false, Duration::from_secs(1)),
         );
 
-        assert_eq!(l1.get_value("value"), None);
+        assert_eq!(l1_bytes(&l1, "value"), None);
+        assert!(l1.get_control("control").is_none());
+        assert_eq!(l1.sweep_expired(), 0);
     }
 
-    #[derive(Deserialize, Serialize, PartialEq, Debug)]
+    #[test]
+    fn l1_zero_max_bytes_keeps_controls_but_no_values() {
+        let l1 = L1Cache::new(16, 0);
+        l1.insert_value(
+            "value".to_owned(),
+            l1_value(b"cached", Duration::from_secs(1)),
+        );
+        l1.insert_control(
+            "control".to_owned(),
+            l1_control(3, false, Duration::from_secs(1)),
+        );
+
+        assert_eq!(l1_bytes(&l1, "value"), None);
+        assert_eq!(l1.get_control("control").unwrap().epoch, 3);
+    }
+
+    #[test]
+    fn l1_byte_budget_bounds_resident_bytes() {
+        const BUDGET: usize = 64 * 1024;
+        let l1 = L1Cache::new(4096, BUDGET);
+        let evicted_before = CACHE_STATS.l1_evicted.load(Ordering::Relaxed);
+        for i in 0..256 {
+            l1.insert_value(
+                format!("trace:rank:{i}:b1"),
+                L1Value {
+                    bytes: Bytes::from(vec![b'x'; 4096]),
+                    expires_at: Instant::now() + Duration::from_secs(60),
+                    span: ByteSpan::Unknown,
+                    etag: None,
+                },
+            );
+        }
+
+        let (entries, bytes) = l1_resident(&l1);
+        assert!(bytes <= BUDGET as u64, "{bytes} resident of {BUDGET}");
+        assert!((1..256).contains(&entries), "{entries} entries");
+        assert!(CACHE_STATS.l1_evicted.load(Ordering::Relaxed) > evicted_before);
+        // The survivors are still served.
+        let served = (0..256)
+            .filter(|i| l1_bytes(&l1, &format!("trace:rank:{i}:b1")).is_some())
+            .count();
+        assert_eq!(served, entries);
+    }
+
+    #[test]
+    fn l1_value_larger_than_a_shard_is_not_admitted() {
+        let l1 = L1Cache::new(4096, 64 * 1024);
+        l1.insert_value(
+            "huge".to_owned(),
+            L1Value {
+                bytes: Bytes::from(vec![b'x'; 65 * 1024]),
+                expires_at: Instant::now() + Duration::from_secs(60),
+                span: ByteSpan::Unknown,
+                etag: None,
+            },
+        );
+        assert_eq!(l1_bytes(&l1, "huge"), None);
+        assert_eq!(l1_resident(&l1), (0, 0));
+    }
+
+    #[test]
+    fn l1_sweep_drops_expired_entries_and_refreshes_gauges() {
+        let l1 = L1Cache::new(64, 1 << 20);
+        l1.insert_value("expired".to_owned(), expired_l1_value(b"stale"));
+        l1.insert_value(
+            "live".to_owned(),
+            l1_value(b"fresh", Duration::from_secs(60)),
+        );
+        l1.insert_control(
+            "expired-control".to_owned(),
+            L1Control {
+                epoch: 1,
+                dirty: false,
+                expires_at: Instant::now() - Duration::from_millis(1),
+            },
+        );
+        l1.insert_control(
+            "live-control".to_owned(),
+            l1_control(2, false, Duration::from_secs(60)),
+        );
+        let expired_before = CACHE_STATS.l1_expired.load(Ordering::Relaxed);
+
+        assert_eq!(l1.sweep_expired(), 2);
+
+        assert_eq!(l1_bytes(&l1, "expired"), None);
+        assert_eq!(l1_bytes(&l1, "live"), Some(Bytes::from_static(b"fresh")));
+        assert!(l1.get_control("expired-control").is_none());
+        assert_eq!(l1.get_control("live-control").unwrap().epoch, 2);
+        let (entries, bytes) = l1_resident(&l1);
+        assert_eq!(entries, 1);
+        assert_eq!(
+            bytes,
+            ("live".len() + "fresh".len() + L1_ENTRY_OVERHEAD) as u64
+        );
+        assert!(CACHE_STATS.l1_expired.load(Ordering::Relaxed) >= expired_before + 2);
+        // Gauges are global, so another test may have refreshed them since;
+        // an empty cache still reports its own state after a sweep.
+        assert_eq!(l1.sweep_expired(), 0);
+    }
+
+    #[tokio::test]
+    async fn l1_sweeper_task_expires_entries_without_reads() {
+        let l1 = L1Cache::new(64, 1 << 20);
+        l1.insert_value("soon".to_owned(), l1_value(b"x", Duration::from_millis(20)));
+        l1.spawn_sweeper(Duration::from_millis(10));
+
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        let (entries, _) = l1_resident(&l1);
+        assert_eq!(entries, 0);
+
+        // The task ends with the cache.
+        let weak = Arc::downgrade(l1.inner.as_ref().unwrap());
+        drop(l1);
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        assert!(weak.upgrade().is_none());
+    }
+
+    #[test]
+    fn l1_value_ttl_never_exceeds_the_l2_ttl() {
+        let cfg = ApiCacheConfig {
+            local_value_ttl_ms: 250,
+            local_static_value_ttl_secs: 60,
+            ..ApiCacheConfig::default()
+        };
+        let ms = |life| l1_value_ttl(&cfg, life).map(|ttl| ttl.as_millis() as u64);
+
+        // Epoch keys: the short local TTL, never past L2.
+        assert_eq!(ms(L1Life::Epoch { ttl_secs: 60 }), Some(250));
+        assert_eq!(ms(L1Life::Epoch { ttl_secs: 1 }), Some(250));
+        let short = ApiCacheConfig {
+            local_value_ttl_ms: 5_000,
+            ..cfg.clone()
+        };
+        assert_eq!(
+            l1_value_ttl(&short, L1Life::Epoch { ttl_secs: 1 }),
+            Some(Duration::from_secs(1))
+        );
+
+        // Static keys: until L2 drops them, capped by the static ceiling.
+        assert_eq!(
+            ms(L1Life::Static {
+                ttl_secs: 60,
+                remaining_ms: None
+            }),
+            Some(60_000)
+        );
+        assert_eq!(
+            ms(L1Life::Static {
+                ttl_secs: 60,
+                remaining_ms: Some(300)
+            }),
+            Some(300)
+        );
+        assert_eq!(
+            ms(L1Life::Static {
+                ttl_secs: 3600,
+                remaining_ms: Some(3_000_000)
+            }),
+            Some(60_000)
+        );
+        assert_eq!(
+            ms(L1Life::Static {
+                ttl_secs: 60,
+                remaining_ms: Some(0)
+            }),
+            None
+        );
+
+        // A zero static ceiling means the epoch rule.
+        let legacy = ApiCacheConfig {
+            local_static_value_ttl_secs: 0,
+            ..cfg.clone()
+        };
+        assert_eq!(
+            l1_value_ttl(
+                &legacy,
+                L1Life::Static {
+                    ttl_secs: 60,
+                    remaining_ms: None
+                }
+            ),
+            Some(Duration::from_millis(250))
+        );
+
+        // No local value TTL disables L1 values outright.
+        let off = ApiCacheConfig {
+            local_value_ttl_ms: 0,
+            ..cfg
+        };
+        assert_eq!(l1_value_ttl(&off, L1Life::Epoch { ttl_secs: 60 }), None);
+        assert_eq!(
+            l1_value_ttl(
+                &off,
+                L1Life::Static {
+                    ttl_secs: 60,
+                    remaining_ms: None
+                }
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn l1_concurrent_inserts_reads_and_sweeps_stay_within_budget() {
+        const BUDGET: usize = 256 * 1024;
+        let l1 = L1Cache::new(4096, BUDGET);
+        let threads: Vec<_> = (0..8)
+            .map(|t| {
+                let l1 = l1.clone();
+                std::thread::spawn(move || {
+                    for i in 0..2_000u32 {
+                        let key = format!("k:{}:{}", t, i % 128);
+                        let len = 16 + (i as usize * 613) % 8_192;
+                        let ttl = if i % 7 == 0 {
+                            Duration::ZERO
+                        } else {
+                            Duration::from_secs(60)
+                        };
+                        l1.insert_value(
+                            key.clone(),
+                            L1Value {
+                                bytes: Bytes::from(vec![b'x'; len]),
+                                expires_at: Instant::now() + ttl,
+                                span: ByteSpan::Unknown,
+                                etag: None,
+                            },
+                        );
+                        if let Some(bytes) = l1_bytes(&l1, &key) {
+                            assert_eq!(bytes.len(), len);
+                        }
+                        l1_bytes(&l1, &format!("k:{}:{}", (t + 1) % 8, i % 128));
+                        if i % 250 == 0 {
+                            l1.sweep_expired();
+                        }
+                    }
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        l1.sweep_expired();
+        let (entries, bytes) = l1_resident(&l1);
+        assert!(bytes <= BUDGET as u64, "{bytes} resident of {BUDGET}");
+        assert!(entries > 0);
+    }
+
+    #[test]
+    fn l1_keeps_the_located_span_with_the_value() {
+        let l1 = L1Cache::new(16, 1 << 20);
+        let span = ByteSpan::Range { start: 5, end: 10 };
+        l1.insert_value(
+            "located".to_owned(),
+            L1Value {
+                bytes: Bytes::from_static(br#"{"a":[1,2]}"#),
+                expires_at: Instant::now() + Duration::from_secs(1),
+                span,
+                etag: Some(HeaderValue::from_static("\"tag\"")),
+            },
+        );
+        let value = l1.get_value("located").unwrap();
+        assert_eq!(value.span, span);
+        assert_eq!(&value.bytes[5..10], b"[1,2]");
+        assert_eq!(value.etag, Some(HeaderValue::from_static("\"tag\"")));
+    }
+
+    #[test]
+    fn etags_are_digested_for_web_values_only() {
+        let bytes = Bytes::from_static(b"gzip-bytes");
+        let web = CacheOptions {
+            max_value_bytes: 1024,
+            is_batch: false,
+            check: CachedCheck::None,
+        };
+        assert_eq!(etag_for(web, &bytes), Some(strong_etag(&bytes)));
+        let batch = CacheOptions {
+            is_batch: true,
+            ..web
+        };
+        assert_eq!(etag_for(batch, &bytes), None);
+    }
+
+    #[test]
+    fn cached_checks_validate_and_locate() {
+        let none = CacheOptions {
+            max_value_bytes: 1024,
+            is_batch: false,
+            check: CachedCheck::None,
+        };
+        let bytes = Bytes::from_static(b"{\"rows\":[1]}");
+        assert_eq!(check_cached_bytes(none, &bytes), Some(ByteSpan::Unknown));
+        assert_eq!(locate_fresh_bytes(none, &bytes), ByteSpan::Unknown);
+
+        let validate = CacheOptions {
+            check: CachedCheck::Validate(|bytes| bytes.starts_with(b"{")),
+            ..none
+        };
+        assert_eq!(
+            check_cached_bytes(validate, &bytes),
+            Some(ByteSpan::Unknown)
+        );
+        assert_eq!(
+            check_cached_bytes(validate, &Bytes::from_static(b"nope")),
+            None
+        );
+
+        fn locate(bytes: &Bytes) -> Option<ByteSpan> {
+            let start = bytes.iter().position(|b| *b == b'[')?;
+            let end = bytes.iter().rposition(|b| *b == b']')? + 1;
+            Some(ByteSpan::Range { start, end })
+        }
+        let located = CacheOptions {
+            check: CachedCheck::Locate(locate),
+            ..none
+        };
+        let span = ByteSpan::Range { start: 8, end: 11 };
+        assert_eq!(check_cached_bytes(located, &bytes), Some(span));
+        assert_eq!(locate_fresh_bytes(located, &bytes), span);
+        let flat = Bytes::from_static(b"{}");
+        assert_eq!(check_cached_bytes(located, &flat), None);
+        assert_eq!(locate_fresh_bytes(located, &flat), ByteSpan::Unknown);
+    }
+
+    #[derive(Deserialize, Serialize, PartialEq, Debug, Clone)]
     struct TypedCachePayload {
         #[serde(default)]
         items: Vec<i64>,
@@ -2807,6 +3426,91 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn redis_cache_locates_static_values_on_every_tier() {
+        let Some(mut conn) = coverage_redis().await else {
+            return;
+        };
+        fn locate(bytes: &Bytes) -> Option<ByteSpan> {
+            let start = bytes.iter().position(|b| *b == b'[')?;
+            let end = bytes.iter().rposition(|b| *b == b']')? + 1;
+            Some(ByteSpan::Range { start, end })
+        }
+        let event_id = next_event_id();
+        let cfg = test_config();
+        let cache = test_cache(&conn, &cfg);
+        let payload = TypedCachePayload { items: vec![4, 5] };
+        let expected = ByteSpan::Range { start: 9, end: 14 };
+
+        // Fresh encode: located once, kept in L1.
+        let fresh = cache
+            .get_or_fetch_static_json_located("jp", event_id, "located".into(), 60, locate, async {
+                Ok(payload.clone())
+            })
+            .await
+            .unwrap();
+        assert_eq!(fresh.bytes, Bytes::from_static(br#"{"items":[4,5]}"#));
+        assert_eq!(fresh.span, expected);
+        let l1 = cache
+            .get_or_fetch_static_json_located::<TypedCachePayload, _>(
+                "jp",
+                event_id,
+                "located".into(),
+                60,
+                locate,
+                async { Err(ApiError::ServiceUnavailable("should not fetch".into())) },
+            )
+            .await
+            .unwrap();
+        assert_eq!(l1.span, expected);
+
+        // L2 hit in another process: the locator runs on the way into L1.
+        let other = test_cache(&conn, &cfg);
+        let l2 = other
+            .get_or_fetch_static_json_located::<TypedCachePayload, _>(
+                "jp",
+                event_id,
+                "located".into(),
+                60,
+                locate,
+                async { Err(ApiError::ServiceUnavailable("should not fetch".into())) },
+            )
+            .await
+            .unwrap();
+        assert_eq!(l2.span, expected);
+        assert_eq!(l2.bytes, fresh.bytes);
+
+        // An L2 value the locator rejects is a miss.
+        let key = static_value_key("jp", event_id, "located-bad");
+        redis_set(&mut conn, &key, b"{}").await;
+        let refetched = test_cache(&conn, &cfg)
+            .get_or_fetch_static_json_located(
+                "jp",
+                event_id,
+                "located-bad".into(),
+                60,
+                locate,
+                async { Ok(TypedCachePayload { items: vec![6] }) },
+            )
+            .await
+            .unwrap();
+        assert_eq!(refetched.span, ByteSpan::Range { start: 9, end: 12 });
+
+        // TTL 0 bypasses the cache but still locates.
+        let bypass = cache
+            .get_or_fetch_static_json_located(
+                "jp",
+                event_id,
+                "located-0".into(),
+                0,
+                locate,
+                async { Ok(TypedCachePayload { items: vec![7] }) },
+            )
+            .await
+            .unwrap();
+        assert_eq!(bypass.span, ByteSpan::Range { start: 9, end: 12 });
+    }
+
+    #[tokio::test]
     async fn redis_cache_covers_gzip_l1_l2_and_batch_paths() {
         let Some(mut conn) = coverage_redis().await else {
             return;
@@ -2831,6 +3535,9 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(encoded.encoding, CachedJsonEncoding::Gzip);
+        // The ETag is the digest of the wire (gzip) bytes, on every tier.
+        let etag = strong_etag(&encoded.bytes);
+        assert_eq!(encoded.etag, Some(etag.clone()));
 
         let l1_gzip = cache
             .get_or_fetch_encoded_json::<TypedCachePayload, _>(
@@ -2844,6 +3551,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(l1_gzip.encoding, CachedJsonEncoding::Gzip);
+        assert_eq!(l1_gzip.etag, Some(etag.clone()));
 
         let combined_l2 = test_cache(&conn, &cfg)
             .get_or_fetch_encoded_json::<TypedCachePayload, _>(
@@ -2857,6 +3565,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(combined_l2.encoding, CachedJsonEncoding::Gzip);
+        assert_eq!(combined_l2.etag, Some(etag.clone()));
 
         let l2_cache = test_cache(&conn, &cfg);
         l2_cache.store_l1_control(control_cache_key("jp", event_id), 0, false);
@@ -2872,6 +3581,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(l2_gzip.encoding, CachedJsonEncoding::Gzip);
+        assert_eq!(l2_gzip.etag, Some(etag));
 
         let value = value_key("jp", event_id, 0, "identity-only");
         redis_set(&mut conn, &value, br#"{"items":[8,9]}"#).await;
@@ -2897,6 +3607,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(batch.encoding, CachedJsonEncoding::Gzip);
+        assert!(batch.etag.is_none());
 
         let identity = cache
             .get_or_fetch_batch_encoded_json(

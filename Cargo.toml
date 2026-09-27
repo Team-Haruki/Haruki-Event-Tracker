@@ -34,6 +34,7 @@ tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.7", features = [
     "compression-gzip",
     "compression-br",
+    "compression-zstd",
     "trace",
     "catch-panic",
 ] }
@@ -57,6 +58,10 @@ sea-orm = { version = "2.0.0-rc.38", default-features = false, features = [
     "sqlite-use-returning-for-3_35",
 ] }
 sea-query = "=1.0.0-rc.33"
+# Binds sea-query values on a raw sqlx connection (writer flush session).
+sea-query-sqlx = { version = "=0.8.0-rc.15", default-features = false, features = [
+    "sqlx-postgres",
+] }
 
 # Allocator: musl's malloc serialises concurrent allocation, which dominated
 # CPU on large cached responses (see src/main.rs).
@@ -97,6 +102,9 @@ anyhow = "1"
 # Utilities
 ahash = "0.8"
 bytes = "1"
+# In-process L1 of the API cache: byte-weighted, sharded, MIT, no new
+# transitive crates (ahash/hashbrown/parking_lot are already in the tree).
+quick_cache = "0.6"
 chrono = { version = "0.4", default-features = false, features = [
     "clock",
     "serde",
@@ -109,6 +117,8 @@ opendal = { version = "0.57", default-features = false, features = ["services-fs
 
 [dev-dependencies]
 tokio = { version = "1.52", features = ["full", "test-util", "macros"] }
+# Decoders for the compression tests; the same features tower-http enables.
+async-compression = { version = "0.4", features = ["tokio", "gzip", "brotli", "zstd"] }
 
 [profile.release]
 lto = "thin"

@@ -66,6 +66,33 @@ impl PublicUserIdMode {
     }
 }
 
+/// `(SELECT user_id_key FROM event_<id>_users WHERE <mode column> = $uid
+/// LIMIT 1)`: the player's key, resolved before the ranking table is
+/// touched.
+///
+/// Per-player ranking queries filter on `user_id_key = <this>` instead of
+/// joining the users table and filtering on its id column. The scalar is
+/// evaluated once (PostgreSQL: an InitPlan) and then drives a probe on the
+/// `(…, user_id_key, time_id)` index — a plan that does not depend on the
+/// planner's `n_distinct(user_id_key)` estimate, whereas the join form
+/// flips to a reverse scan of the whole ranking table for an unknown id
+/// once that estimate drops. `IN (SELECT …)` would be pulled up into that
+/// same join (and with a `LIMIT` still sorts every row of the player;
+/// MySQL rejects `LIMIT` inside `IN` subqueries altogether). `LIMIT 1`
+/// keeps the scalar from failing should a `unique_id` ever be duplicated
+/// (its unique index exists only where the writer created it); both id
+/// columns are unique, so the limited row is the player's only one.
+pub(crate) fn user_key_lookup(event_id: i64, user_id: &str, mode: PublicUserIdMode) -> Expr {
+    let users_tbl = Alias::new(intern(TableKind::EventUsers, event_id));
+    let sub = Query::select()
+        .column((users_tbl.clone(), event_users::Column::UserIdKey))
+        .from(users_tbl.clone())
+        .and_where(Expr::col((users_tbl, mode.output_column())).eq(user_id))
+        .limit(1)
+        .to_owned();
+    Expr::SubQuery(None, Box::new(sub.into()))
+}
+
 #[derive(Debug, FromQueryResult)]
 struct UniqueIdRow {
     unique_id: Option<String>,

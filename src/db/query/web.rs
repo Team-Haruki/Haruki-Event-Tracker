@@ -3,19 +3,22 @@ use std::collections::HashMap;
 use sea_orm::sea_query::{
     Alias, Expr, IntoCondition, JoinType, Order, Query, SelectStatement, SimpleExpr,
 };
-use sea_orm::{DbErr, ExprTrait, FromQueryResult};
+use sea_orm::{DatabaseBackend, DbErr, ExprTrait, FromQueryResult};
 
 use crate::db::engine::DatabaseEngine;
 use crate::db::entity::{event, event_users, time_id, world_bloom};
 use crate::db::query::edge::{
     Edge, EdgeSpec, TimeWindow, and_where_time_id_within, edge_keys_select, time_id_upper_bound,
 };
-use crate::db::query::user::PublicUserIdMode;
+use crate::db::query::keys::col_in_keys;
+use crate::db::query::trace::{TraceSubject, fetch_trace};
+use crate::db::query::user::{PublicUserIdMode, user_key_lookup};
 use crate::db::table_name::{TableKind, intern};
 use crate::model::api::{
     RecordedRankData, RecordedRankingSchema, RecordedUserNameSchema,
     RecordedWorldBloomRankingSchema, TopRankingPlayerGrowthSchema, WebRankingItemSchema,
 };
+use crate::model::enums::SekaiServerRegion;
 
 #[derive(Debug, Clone)]
 pub struct WebRankingFilter {
@@ -67,6 +70,18 @@ pub struct WebTraceFilter {
     pub end_time: Option<i64>,
     pub cursor: Option<i64>,
     pub limit: Option<u64>,
+}
+
+impl WebTraceFilter {
+    /// The whole history: no time bounds, cursor or limit.
+    pub fn unbounded() -> Self {
+        Self {
+            start_time: None,
+            end_time: None,
+            cursor: None,
+            limit: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -265,12 +280,47 @@ pub(crate) struct PlayerGrowthRow {
     pub(crate) score: i64,
 }
 
-fn select_user_profile_columns(stmt: &mut SelectStatement, users_tbl: Alias) {
+/// Which users-table columns a page row carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UserProjection {
+    /// Name and the whole profile (card, word, honours, missions, frames —
+    /// three of them multi-KB JSON blobs): what web pages show.
+    Profile,
+    /// Name only; the profile fields come back empty. For consumers that
+    /// never look at them (cloud snapshots), so the blobs are not read
+    /// from the users table, decoded, or cached.
+    NameOnly,
+}
+
+fn select_user_profile_columns(
+    stmt: &mut SelectStatement,
+    users_tbl: Alias,
+    projection: UserProjection,
+) {
     stmt.expr_as(
         Expr::col((users_tbl.clone(), event_users::Column::Name)),
         Alias::new("name"),
-    )
-    .expr_as(
+    );
+    if projection == UserProjection::NameOnly {
+        // Typed NULL parameters: the row decoder still sees every column,
+        // and a bare `NULL` literal would be text-typed on PostgreSQL.
+        for (col, null) in [
+            ("cheerful_team_id", Expr::val(None::<i64>)),
+            ("card_id", Expr::val(None::<i64>)),
+            ("card_level", Expr::val(None::<i64>)),
+            ("card_master_rank", Expr::val(None::<i64>)),
+            ("card_special_training_status", Expr::val(None::<String>)),
+            ("card_default_image", Expr::val(None::<String>)),
+            ("profile_word", Expr::val(None::<String>)),
+            ("profile_honors_json", Expr::val(None::<String>)),
+            ("honor_missions_json", Expr::val(None::<String>)),
+            ("player_frames_json", Expr::val(None::<String>)),
+        ] {
+            stmt.expr_as(null, Alias::new(col));
+        }
+        return;
+    }
+    stmt.expr_as(
         Expr::col((users_tbl.clone(), event_users::Column::CheerfulTeamId)),
         Alias::new("cheerful_team_id"),
     )
@@ -341,7 +391,7 @@ fn ranking_select(event_id: i64, mode: PublicUserIdMode) -> SelectStatement {
         Expr::col((event_tbl.clone(), event::Column::Rank)),
         Alias::new("rank"),
     );
-    select_user_profile_columns(&mut stmt, users_tbl.clone());
+    select_user_profile_columns(&mut stmt, users_tbl.clone(), UserProjection::Profile);
     stmt.from(event_tbl.clone())
         .inner_join(
             time_tbl.clone(),
@@ -386,7 +436,7 @@ fn world_bloom_select(event_id: i64, mode: PublicUserIdMode) -> SelectStatement 
         Expr::col((wl_tbl.clone(), world_bloom::Column::CharacterId)),
         Alias::new("character_id"),
     );
-    select_user_profile_columns(&mut stmt, users_tbl.clone());
+    select_user_profile_columns(&mut stmt, users_tbl.clone(), UserProjection::Profile);
     stmt.from(wl_tbl.clone())
         .inner_join(
             time_tbl.clone(),
@@ -610,12 +660,15 @@ fn and_where_not_superseded(
 }
 
 pub(crate) fn latest_rank_window_select(
+    backend: DatabaseBackend,
     event_id: i64,
     filter: &WebRankingFilter,
     mode: PublicUserIdMode,
+    projection: UserProjection,
 ) -> SelectStatement {
     let latest = match window_rank_keys(filter) {
         Some(ranks) => edge_keys_select(&EdgeSpec {
+            backend,
             tbl: intern(TableKind::Event, event_id),
             time_tbl: intern(TableKind::TimeId, event_id),
             key_col: "rank",
@@ -627,9 +680,9 @@ pub(crate) fn latest_rank_window_select(
             score_max: filter.score_max,
             max_time_id: filter.as_of_time_id,
         }),
-        None => grouped_latest_rank(event_id, filter, true),
+        None => grouped_latest_rank(backend, event_id, filter, true),
     };
-    latest_rank_window_join(event_id, filter, mode, latest)
+    latest_rank_window_join(event_id, filter, mode, projection, latest)
 }
 
 /// `MAX(time_id) GROUP BY rank`: the fallback for rank windows too wide
@@ -637,6 +690,7 @@ pub(crate) fn latest_rank_window_select(
 /// `derive_time_id_bounds` adds the `time_id` range implied by the time
 /// filters (off only for the pre-`edge` reference in tests).
 pub(crate) fn grouped_latest_rank(
+    backend: DatabaseBackend,
     event_id: i64,
     filter: &WebRankingFilter,
     derive_time_id_bounds: bool,
@@ -685,9 +739,11 @@ pub(crate) fn grouped_latest_rank(
         latest.and_where(Expr::col((event_tbl.clone(), event::Column::Rank)).lte(rank_max));
     }
     if let Some(ranks) = &filter.rank_in {
-        latest.and_where(
-            Expr::col((event_tbl.clone(), event::Column::Rank)).is_in(ranks.iter().copied()),
-        );
+        latest.and_where(col_in_keys(
+            backend,
+            Expr::col((event_tbl.clone(), event::Column::Rank)),
+            ranks,
+        ));
     }
     if let Some(cut) = filter.as_of_time_id {
         latest.and_where(Expr::col((event_tbl.clone(), event::Column::TimeId)).lte(cut));
@@ -705,6 +761,7 @@ pub(crate) fn latest_rank_window_join(
     event_id: i64,
     filter: &WebRankingFilter,
     mode: PublicUserIdMode,
+    projection: UserProjection,
     latest: SelectStatement,
 ) -> SelectStatement {
     let event_tbl = Alias::new(intern(TableKind::Event, event_id));
@@ -733,7 +790,7 @@ pub(crate) fn latest_rank_window_join(
         Expr::col((event_tbl.clone(), event::Column::Rank)),
         Alias::new("rank"),
     );
-    select_user_profile_columns(&mut stmt, users_tbl.clone());
+    select_user_profile_columns(&mut stmt, users_tbl.clone(), projection);
     stmt.from(event_tbl.clone())
         .inner_join(
             time_tbl.clone(),
@@ -778,13 +835,16 @@ pub(crate) fn latest_rank_window_join(
 }
 
 fn latest_world_bloom_rank_window_select(
+    backend: DatabaseBackend,
     event_id: i64,
     character_id: i64,
     filter: &WebRankingFilter,
     mode: PublicUserIdMode,
+    projection: UserProjection,
 ) -> SelectStatement {
     let latest = match window_rank_keys(filter) {
         Some(ranks) => edge_keys_select(&EdgeSpec {
+            backend,
             tbl: intern(TableKind::WorldBloom, event_id),
             time_tbl: intern(TableKind::TimeId, event_id),
             key_col: "rank",
@@ -796,12 +856,13 @@ fn latest_world_bloom_rank_window_select(
             score_max: filter.score_max,
             max_time_id: filter.as_of_time_id,
         }),
-        None => grouped_latest_world_bloom_rank(event_id, character_id, filter, true),
+        None => grouped_latest_world_bloom_rank(backend, event_id, character_id, filter, true),
     };
-    latest_world_bloom_rank_window_join(event_id, character_id, filter, mode, latest)
+    latest_world_bloom_rank_window_join(event_id, character_id, filter, mode, projection, latest)
 }
 
 pub(crate) fn grouped_latest_world_bloom_rank(
+    backend: DatabaseBackend,
     event_id: i64,
     character_id: i64,
     filter: &WebRankingFilter,
@@ -848,9 +909,11 @@ pub(crate) fn grouped_latest_world_bloom_rank(
         latest.and_where(Expr::col((wl_tbl.clone(), world_bloom::Column::Rank)).lte(rank_max));
     }
     if let Some(ranks) = &filter.rank_in {
-        latest.and_where(
-            Expr::col((wl_tbl.clone(), world_bloom::Column::Rank)).is_in(ranks.iter().copied()),
-        );
+        latest.and_where(col_in_keys(
+            backend,
+            Expr::col((wl_tbl.clone(), world_bloom::Column::Rank)),
+            ranks,
+        ));
     }
     if let Some(cut) = filter.as_of_time_id {
         latest.and_where(Expr::col((wl_tbl.clone(), world_bloom::Column::TimeId)).lte(cut));
@@ -869,6 +932,7 @@ pub(crate) fn latest_world_bloom_rank_window_join(
     character_id: i64,
     filter: &WebRankingFilter,
     mode: PublicUserIdMode,
+    projection: UserProjection,
     latest: SelectStatement,
 ) -> SelectStatement {
     let wl_tbl = Alias::new(intern(TableKind::WorldBloom, event_id));
@@ -901,7 +965,7 @@ pub(crate) fn latest_world_bloom_rank_window_join(
         Expr::col((wl_tbl.clone(), world_bloom::Column::CharacterId)),
         Alias::new("character_id"),
     );
-    select_user_profile_columns(&mut stmt, users_tbl.clone());
+    select_user_profile_columns(&mut stmt, users_tbl.clone(), projection);
     stmt.from(wl_tbl.clone())
         .inner_join(
             time_tbl.clone(),
@@ -973,7 +1037,13 @@ pub async fn search_ranking_rows(
     let time_tbl = Alias::new(intern(TableKind::TimeId, event_id));
     let users_tbl = Alias::new(intern(TableKind::EventUsers, event_id));
     let stmt = if filter.is_rank_window() {
-        latest_rank_window_select(event_id, filter, mode)
+        latest_rank_window_select(
+            engine.backend(),
+            event_id,
+            filter,
+            mode,
+            UserProjection::Profile,
+        )
     } else {
         let mut stmt = ranking_select(event_id, mode);
         apply_common_filters(
@@ -1043,7 +1113,14 @@ pub async fn search_world_bloom_ranking_rows(
     let time_tbl = Alias::new(intern(TableKind::TimeId, event_id));
     let users_tbl = Alias::new(intern(TableKind::EventUsers, event_id));
     let stmt = if filter.is_rank_window() {
-        latest_world_bloom_rank_window_select(event_id, character_id, filter, mode)
+        latest_world_bloom_rank_window_select(
+            engine.backend(),
+            event_id,
+            character_id,
+            filter,
+            mode,
+            UserProjection::Profile,
+        )
     } else {
         let mut stmt = world_bloom_select(event_id, mode);
         stmt.and_where(
@@ -1188,7 +1265,8 @@ fn dedupe_snapshot<R>(rows: Vec<R>, rank: impl Fn(&R) -> i64, user: impl Fn(&R) 
 /// The ranking at one consistent cut: for each requested rank, its latest
 /// row within `cut`, unless that row's player has a newer row elsewhere
 /// (then the rank is left out rather than show the player twice). Ranks
-/// without rows are absent too. Ordered by rank.
+/// without rows are absent too. Ordered by rank. `projection` picks how
+/// much of the users row comes along.
 #[tracing::instrument(skip(engine, ranks), fields(event_id, n = ranks.len()))]
 pub async fn rank_snapshot_rows(
     engine: &DatabaseEngine,
@@ -1196,12 +1274,13 @@ pub async fn rank_snapshot_rows(
     ranks: &[i64],
     cut: RankSnapshotCut,
     mode: PublicUserIdMode,
+    projection: UserProjection,
 ) -> Result<Vec<RankingPageRow>, DbErr> {
     if ranks.is_empty() {
         return Ok(Vec::new());
     }
     let filter = rank_snapshot_filter(ranks, cut);
-    let stmt = latest_rank_window_select(event_id, &filter, mode);
+    let stmt = latest_rank_window_select(engine.backend(), event_id, &filter, mode, projection);
     let rows = RankingPageRow::find_by_statement(engine.backend().build(&stmt))
         .all(engine.conn())
         .await?;
@@ -1217,12 +1296,20 @@ pub async fn world_bloom_rank_snapshot_rows(
     ranks: &[i64],
     cut: RankSnapshotCut,
     mode: PublicUserIdMode,
+    projection: UserProjection,
 ) -> Result<Vec<WorldBloomRankingPageRow>, DbErr> {
     if ranks.is_empty() {
         return Ok(Vec::new());
     }
     let filter = rank_snapshot_filter(ranks, cut);
-    let stmt = latest_world_bloom_rank_window_select(event_id, character_id, &filter, mode);
+    let stmt = latest_world_bloom_rank_window_select(
+        engine.backend(),
+        event_id,
+        character_id,
+        &filter,
+        mode,
+        projection,
+    );
     let rows = WorldBloomRankingPageRow::find_by_statement(engine.backend().build(&stmt))
         .all(engine.conn())
         .await?;
@@ -1249,7 +1336,6 @@ pub async fn user_rank_as_of(
         Some(_) => intern(TableKind::WorldBloom, event_id),
         None => intern(TableKind::Event, event_id),
     });
-    let users_tbl = Alias::new(intern(TableKind::EventUsers, event_id));
     let time_id_col = Alias::new("time_id");
     let mut stmt = Query::select();
     stmt.expr_as(
@@ -1257,12 +1343,10 @@ pub async fn user_rank_as_of(
         Alias::new("rank"),
     )
     .from(tbl.clone())
-    .inner_join(
-        users_tbl.clone(),
+    .and_where(
         Expr::col((tbl.clone(), Alias::new("user_id_key")))
-            .equals((users_tbl.clone(), event_users::Column::UserIdKey)),
-    )
-    .and_where(Expr::col((users_tbl, mode.output_column())).eq(user_id));
+            .eq(user_key_lookup(event_id, user_id, mode)),
+    );
     if let Some(character_id) = character_id {
         stmt.and_where(Expr::col((tbl.clone(), Alias::new("character_id"))).eq(character_id));
     }
@@ -1287,6 +1371,7 @@ pub async fn user_rank_as_of(
 /// back for the score and timestamp. Only the earliest row is used by the
 /// growth, so the window's other rows are never read.
 pub(crate) fn earliest_player_rows_select(
+    backend: DatabaseBackend,
     tbl: &'static str,
     time_tbl: &'static str,
     character_id: Option<i64>,
@@ -1298,6 +1383,7 @@ pub(crate) fn earliest_player_rows_select(
     keys.sort_unstable();
     keys.dedup();
     let edge = edge_keys_select(&EdgeSpec {
+        backend,
         tbl,
         time_tbl,
         key_col: "user_id_key",
@@ -1408,6 +1494,7 @@ pub async fn fetch_top_player_growths(
         .map(RankingPageRow::user_id_key)
         .collect::<Vec<_>>();
     let stmt = earliest_player_rows_select(
+        engine.backend(),
         intern(TableKind::Event, event_id),
         intern(TableKind::TimeId, event_id),
         None,
@@ -1439,6 +1526,7 @@ pub async fn fetch_world_bloom_top_player_growths(
         .map(WorldBloomRankingPageRow::user_id_key)
         .collect::<Vec<_>>();
     let stmt = earliest_player_rows_select(
+        engine.backend(),
         intern(TableKind::WorldBloom, event_id),
         intern(TableKind::TimeId, event_id),
         Some(character_id),
@@ -1457,202 +1545,93 @@ pub async fn fetch_world_bloom_top_player_growths(
     ))
 }
 
-#[tracing::instrument(skip(engine, filter), fields(event_id, user_id = %user_id))]
+/// A player's rows (the public id in `mode`), oldest first, in `filter`.
+/// See `db::query::trace` for the query shape and the `region` cache key.
+#[tracing::instrument(skip(engine, filter), fields(region = %region, event_id, user_id = %user_id))]
 pub async fn search_user_trace(
     engine: &DatabaseEngine,
+    region: SekaiServerRegion,
     event_id: i64,
     user_id: &str,
     filter: &WebTraceFilter,
     mode: PublicUserIdMode,
 ) -> Result<Vec<RecordedRankData>, DbErr> {
-    let users_tbl = Alias::new(intern(TableKind::EventUsers, event_id));
-    let time_tbl = Alias::new(intern(TableKind::TimeId, event_id));
-    // Traces only surface `(timestamp, user_id, score, rank)`; the lean
-    // select skips the users-table profile columns (three of them multi-KB
-    // JSON blobs) that `ranking_select` drags along for page rows.
-    let mut stmt = crate::db::query::ranking::ranking_select(event_id, mode);
-    stmt.and_where(Expr::col((users_tbl, mode.output_column())).eq(user_id));
-    apply_trace_filters(
-        &mut stmt,
-        Expr::col((time_tbl.clone(), time_id::Column::Timestamp)),
+    fetch_trace(
+        engine,
+        region,
+        event_id,
+        None,
+        TraceSubject::User(user_id),
         filter,
-    );
-    and_where_time_id_within(
-        &mut stmt,
-        Expr::col((
-            Alias::new(intern(TableKind::Event, event_id)),
-            event::Column::TimeId,
-        )),
-        intern(TableKind::TimeId, event_id),
-        trace_time_window(filter),
-    );
-    stmt.order_by((time_tbl, time_id::Column::Timestamp), Order::Asc);
-    if let Some(limit) = filter.limit {
-        stmt.limit(limit);
-    }
-
-    let backend = engine.backend();
-    Ok(
-        RecordedRankingSchema::find_by_statement(backend.build(&stmt))
-            .all(engine.conn())
-            .await?
-            .into_iter()
-            .map(RecordedRankData::Normal)
-            .collect(),
+        mode,
     )
+    .await
 }
 
-#[tracing::instrument(skip(engine, filter), fields(event_id, character_id, user_id = %user_id))]
+#[tracing::instrument(skip(engine, filter), fields(region = %region, event_id, character_id, user_id = %user_id))]
 pub async fn search_world_bloom_user_trace(
     engine: &DatabaseEngine,
+    region: SekaiServerRegion,
     event_id: i64,
     character_id: i64,
     user_id: &str,
     filter: &WebTraceFilter,
     mode: PublicUserIdMode,
 ) -> Result<Vec<RecordedRankData>, DbErr> {
-    let users_tbl = Alias::new(intern(TableKind::EventUsers, event_id));
-    let wl_tbl = Alias::new(intern(TableKind::WorldBloom, event_id));
-    let time_tbl = Alias::new(intern(TableKind::TimeId, event_id));
-    let mut stmt = crate::db::query::world_bloom::wl_select(event_id, mode);
-    stmt.and_where(Expr::col((users_tbl, mode.output_column())).eq(user_id))
-        .and_where(Expr::col((wl_tbl, world_bloom::Column::CharacterId)).eq(character_id));
-    apply_trace_filters(
-        &mut stmt,
-        Expr::col((time_tbl.clone(), time_id::Column::Timestamp)),
+    fetch_trace(
+        engine,
+        region,
+        event_id,
+        Some(character_id),
+        TraceSubject::User(user_id),
         filter,
-    );
-    and_where_time_id_within(
-        &mut stmt,
-        Expr::col((
-            Alias::new(intern(TableKind::WorldBloom, event_id)),
-            world_bloom::Column::TimeId,
-        )),
-        intern(TableKind::TimeId, event_id),
-        trace_time_window(filter),
-    );
-    stmt.order_by((time_tbl, time_id::Column::Timestamp), Order::Asc);
-    if let Some(limit) = filter.limit {
-        stmt.limit(limit);
-    }
-
-    let backend = engine.backend();
-    Ok(
-        RecordedWorldBloomRankingSchema::find_by_statement(backend.build(&stmt))
-            .all(engine.conn())
-            .await?
-            .into_iter()
-            .map(RecordedRankData::WorldBloom)
-            .collect(),
+        mode,
     )
+    .await
 }
 
-#[tracing::instrument(skip(engine, filter), fields(event_id, rank))]
+/// Every row stored at `rank`, whoever held it, oldest first.
+#[tracing::instrument(skip(engine, filter), fields(region = %region, event_id, rank))]
 pub async fn search_rank_trace(
     engine: &DatabaseEngine,
+    region: SekaiServerRegion,
     event_id: i64,
     rank: i64,
     filter: &WebTraceFilter,
     mode: PublicUserIdMode,
 ) -> Result<Vec<RecordedRankData>, DbErr> {
-    let event_tbl = Alias::new(intern(TableKind::Event, event_id));
-    let time_tbl = Alias::new(intern(TableKind::TimeId, event_id));
-    let mut stmt = crate::db::query::ranking::ranking_select(event_id, mode);
-    stmt.and_where(Expr::col((event_tbl, event::Column::Rank)).eq(rank));
-    apply_trace_filters(
-        &mut stmt,
-        Expr::col((time_tbl.clone(), time_id::Column::Timestamp)),
+    fetch_trace(
+        engine,
+        region,
+        event_id,
+        None,
+        TraceSubject::Rank(rank),
         filter,
-    );
-    and_where_time_id_within(
-        &mut stmt,
-        Expr::col((
-            Alias::new(intern(TableKind::Event, event_id)),
-            event::Column::TimeId,
-        )),
-        intern(TableKind::TimeId, event_id),
-        trace_time_window(filter),
-    );
-    stmt.order_by((time_tbl, time_id::Column::Timestamp), Order::Asc);
-    if let Some(limit) = filter.limit {
-        stmt.limit(limit);
-    }
-
-    let backend = engine.backend();
-    Ok(
-        RecordedRankingSchema::find_by_statement(backend.build(&stmt))
-            .all(engine.conn())
-            .await?
-            .into_iter()
-            .map(RecordedRankData::Normal)
-            .collect(),
+        mode,
     )
+    .await
 }
 
-#[tracing::instrument(skip(engine, filter), fields(event_id, character_id, rank))]
+#[tracing::instrument(skip(engine, filter), fields(region = %region, event_id, character_id, rank))]
 pub async fn search_world_bloom_rank_trace(
     engine: &DatabaseEngine,
+    region: SekaiServerRegion,
     event_id: i64,
     character_id: i64,
     rank: i64,
     filter: &WebTraceFilter,
     mode: PublicUserIdMode,
 ) -> Result<Vec<RecordedRankData>, DbErr> {
-    let wl_tbl = Alias::new(intern(TableKind::WorldBloom, event_id));
-    let time_tbl = Alias::new(intern(TableKind::TimeId, event_id));
-    let mut stmt = crate::db::query::world_bloom::wl_select(event_id, mode);
-    stmt.and_where(Expr::col((wl_tbl.clone(), world_bloom::Column::Rank)).eq(rank))
-        .and_where(Expr::col((wl_tbl, world_bloom::Column::CharacterId)).eq(character_id));
-    apply_trace_filters(
-        &mut stmt,
-        Expr::col((time_tbl.clone(), time_id::Column::Timestamp)),
+    fetch_trace(
+        engine,
+        region,
+        event_id,
+        Some(character_id),
+        TraceSubject::Rank(rank),
         filter,
-    );
-    and_where_time_id_within(
-        &mut stmt,
-        Expr::col((
-            Alias::new(intern(TableKind::WorldBloom, event_id)),
-            world_bloom::Column::TimeId,
-        )),
-        intern(TableKind::TimeId, event_id),
-        trace_time_window(filter),
-    );
-    stmt.order_by((time_tbl, time_id::Column::Timestamp), Order::Asc);
-    if let Some(limit) = filter.limit {
-        stmt.limit(limit);
-    }
-
-    let backend = engine.backend();
-    Ok(
-        RecordedWorldBloomRankingSchema::find_by_statement(backend.build(&stmt))
-            .all(engine.conn())
-            .await?
-            .into_iter()
-            .map(RecordedRankData::WorldBloom)
-            .collect(),
+        mode,
     )
-}
-
-/// The trace filters as one inclusive window (the cursor is exclusive).
-fn trace_time_window(filter: &WebTraceFilter) -> TimeWindow {
-    TimeWindow::new(filter.start_time, filter.end_time)
-        .with_start(filter.cursor.and_then(|cursor| cursor.checked_add(1)))
-}
-
-fn apply_trace_filters(
-    stmt: &mut SelectStatement,
-    timestamp_col: SimpleExpr,
-    filter: &WebTraceFilter,
-) {
-    if let Some(start_time) = filter.start_time {
-        stmt.and_where(timestamp_col.clone().gte(start_time));
-    }
-    if let Some(end_time) = filter.end_time {
-        stmt.and_where(timestamp_col.clone().lte(end_time));
-    }
-    if let Some(cursor) = filter.cursor {
-        stmt.and_where(timestamp_col.gt(cursor));
-    }
+    .await
 }
 
 fn build_top_player_growths(
@@ -2058,9 +2037,16 @@ pub(crate) mod tests {
             cursor: None,
             limit: Some(10),
         };
-        let trace = search_rank_trace(&engine, event_id, 2, &filter, PublicUserIdMode::Unique)
-            .await
-            .unwrap();
+        let trace = search_rank_trace(
+            &engine,
+            SekaiServerRegion::Jp,
+            event_id,
+            2,
+            &filter,
+            PublicUserIdMode::Unique,
+        )
+        .await
+        .unwrap();
 
         let rows = trace
             .into_iter()
@@ -2097,6 +2083,7 @@ pub(crate) mod tests {
         };
         let trace = search_world_bloom_rank_trace(
             &engine,
+            SekaiServerRegion::Jp,
             event_id,
             17,
             2,

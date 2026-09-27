@@ -10,9 +10,11 @@ use sea_orm::{DbErr, ExprTrait, FromQueryResult};
 
 use crate::db::engine::DatabaseEngine;
 use crate::db::entity::{event_users, time_id, world_bloom};
-use crate::db::query::user::PublicUserIdMode;
+use crate::db::query::keys::col_in_keys;
+use crate::db::query::user::{PublicUserIdMode, user_key_lookup};
 use crate::db::table_name::{TableKind, intern};
 use crate::model::api::RecordedWorldBloomRankingSchema;
+use crate::model::enums::SekaiServerRegion;
 
 pub(crate) fn wl_select(event_id: i64, mode: PublicUserIdMode) -> SelectStatement {
     let wl_tbl = Alias::new(intern(TableKind::WorldBloom, event_id));
@@ -62,13 +64,16 @@ pub async fn fetch_latest_world_bloom_ranking(
     character_id: i64,
     mode: PublicUserIdMode,
 ) -> Result<Option<RecordedWorldBloomRankingSchema>, DbErr> {
-    let users_tbl = Alias::new(intern(TableKind::EventUsers, event_id));
     let wl_tbl = Alias::new(intern(TableKind::WorldBloom, event_id));
     // Ordering by the World Bloom table's own `time_id` (an invariant keeps
     // it in `timestamp` order — see `ranking.rs`) lets the
-    // `(character_id, *, time_id)` indexes provide the order.
+    // `(character_id, *, time_id)` indexes provide the order; the player's
+    // key is resolved first (`user_key_lookup`) so the probe is constant.
     let stmt = wl_select(event_id, mode)
-        .and_where(Expr::col((users_tbl, mode.output_column())).eq(user_id))
+        .and_where(
+            Expr::col((wl_tbl.clone(), world_bloom::Column::UserIdKey))
+                .eq(user_key_lookup(event_id, user_id, mode)),
+        )
         .and_where(Expr::col((wl_tbl.clone(), world_bloom::Column::CharacterId)).eq(character_id))
         .order_by((wl_tbl, world_bloom::Column::TimeId), Order::Desc)
         .limit(1)
@@ -80,26 +85,40 @@ pub async fn fetch_latest_world_bloom_ranking(
         .await
 }
 
+/// A player's whole chapter history, oldest first, through the trace query
+/// (see `ranking::fetch_all_rankings`).
 #[tracing::instrument(skip(engine), fields(event_id, user_id = %user_id, character_id))]
 pub async fn fetch_all_world_bloom_rankings(
     engine: &DatabaseEngine,
+    region: SekaiServerRegion,
     event_id: i64,
     user_id: &str,
     character_id: i64,
     mode: PublicUserIdMode,
 ) -> Result<Vec<RecordedWorldBloomRankingSchema>, DbErr> {
-    let users_tbl = Alias::new(intern(TableKind::EventUsers, event_id));
-    let wl_tbl = Alias::new(intern(TableKind::WorldBloom, event_id));
-    let stmt = wl_select(event_id, mode)
-        .and_where(Expr::col((users_tbl, mode.output_column())).eq(user_id))
-        .and_where(Expr::col((wl_tbl.clone(), world_bloom::Column::CharacterId)).eq(character_id))
-        .order_by((wl_tbl, world_bloom::Column::TimeId), Order::Asc)
-        .to_owned();
-
-    let backend = engine.backend();
-    RecordedWorldBloomRankingSchema::find_by_statement(backend.build(&stmt))
-        .all(engine.conn())
-        .await
+    let rows = crate::db::query::web::search_world_bloom_user_trace(
+        engine,
+        region,
+        event_id,
+        character_id,
+        user_id,
+        &crate::db::query::web::WebTraceFilter::unbounded(),
+        mode,
+    )
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|row| match row {
+            crate::model::api::RecordedRankData::WorldBloom(row) => row,
+            crate::model::api::RecordedRankData::Normal(row) => RecordedWorldBloomRankingSchema {
+                timestamp: row.timestamp,
+                user_id: row.user_id,
+                score: row.score,
+                rank: row.rank,
+                character_id: Some(character_id),
+            },
+        })
+        .collect())
 }
 
 #[tracing::instrument(skip(engine), fields(event_id, rank, character_id))]
@@ -159,7 +178,11 @@ pub async fn fetch_all_world_bloom_rankings_by_ranks(
 
     let wl_tbl = Alias::new(intern(TableKind::WorldBloom, event_id));
     let stmt = wl_select(event_id, mode)
-        .and_where(Expr::col((wl_tbl.clone(), world_bloom::Column::Rank)).is_in(ranks.to_vec()))
+        .and_where(col_in_keys(
+            engine.backend(),
+            Expr::col((wl_tbl.clone(), world_bloom::Column::Rank)),
+            ranks,
+        ))
         .and_where(Expr::col((wl_tbl.clone(), world_bloom::Column::CharacterId)).eq(character_id))
         .order_by((wl_tbl.clone(), world_bloom::Column::Rank), Order::Asc)
         .order_by((wl_tbl, world_bloom::Column::TimeId), Order::Asc)

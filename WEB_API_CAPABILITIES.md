@@ -74,11 +74,71 @@ GET .../leaderboards/world-bloom/{character_id}/details/rank/{rank}
 GET .../leaderboards/world-bloom/{character_id}/details/user/{user_id}
 ```
 
-`{user_id}` accepts either the public `unique_id` or a positive numeric game UID (a bare numeric id is always treated as a game UID; `idType=unique` / `idType=uid` force the interpretation). A game UID is mapped to the event-specific anonymous ID before querying, so detail cache keys still use anonymous IDs, but the response then reveals that one player's raw UID (see the next section). This lookup does not require a Toolbox binding. Query params: `interval`, `at`, `includeTrace`, `includePlayerTrace`, `includeProfile`, `cursor`, `limit` (trace pages are cursor-paginated).
+`{user_id}` accepts either the public `unique_id` or a positive numeric game UID (a bare numeric id is always treated as a game UID; `idType=unique` / `idType=uid` force the interpretation). A game UID is mapped to the event-specific anonymous ID before querying, so detail cache keys still use anonymous IDs, but the response then reveals that one player's raw UID (see the next section). This lookup does not require a Toolbox binding. Query params: `interval`, `at`, `includeTrace`, `includePlayerTrace`, `includeProfile`, `cursor`, `limit` (trace pages are cursor-paginated), `traceFormat` (`rows` | `columns`, see below).
 
 A trace with no rows in the requested window — typically a `cursor` poll with nothing newer — is an empty `rankTrace` / `playerTrace`, not a 404; the detail 404s only when the rank has never been held or the player was never tracked in the event.
 
 User details carry `ranked`. A player tracked in the event who no longer holds a tracked rank gets `"ranked": false` with `current`, `previous` and `next` omitted (their last row's rank belongs to someone else now, who is never shown in their place), while `playerTrace` and `profile` still describe them. The private user details follow the same rule. The cloud `sk/query?userId=` keeps answering 404 for such a player.
+
+#### Compact trace encoding (`traceFormat=columns`)
+
+`rankTrace` / `playerTrace` default to an array of row objects `{timestamp, userId, score, rank, characterId?}` (`traceFormat=rows`, or the param absent — byte-identical to servers without this option). With `traceFormat=columns` (details/rank, details/user, check-room, the private details; total and World Bloom scopes) each trace is instead one **columns object**: every column is stored once as a delta list, a constant, or a run list. It is lossless — decoding gives exactly the row array, same order, same values, same `characterId` presence — and roughly 18x smaller raw / 3x smaller gzipped than the rows (rank-100 trace, 6.3k rows: 813 KB / 50 KB gzip → 44 KB / 17 KB; 34k rows: 4.4 MB / 267 KB → 235 KB / 85 KB). An empty trace (a `cursor` poll with nothing newer) is still an omitted field in both formats; a cursor increment is a columns object of just the new rows. Any other value of `traceFormat` is a `400`.
+
+```jsonc
+{
+  "format": "columns",     // always this literal
+  "n": 6,                  // row count (n >= 1 when present)
+  "t0": 1700000000,        // timestamp of row 0
+  "dt": [2, 1, 7, 1, 1],   // n-1 deltas: timestamp[i] = timestamp[i-1] + dt[i-1]
+  "s0": 100,               // score of row 0
+  "ds": [30, 1, 69, 1, 49],// n-1 deltas: score[i] = score[i-1] + ds[i-1]
+  "rank": 7,               // rank of every row — OR, when the rank moves:
+  // "r0": 3, "dr": [0, -1, 2],  rank[0] = r0, rank[i] = rank[i-1] + dr[i-1]
+  "users": ["a", "b", "c"],// distinct userIds in first-appearance order
+  "u": [[0, 0], [2, 1], [4, 0], [5, 2]],
+                           // runs [startRow, index into users]: rows 0-1 are "a",
+                           // 2-3 "b", 4 "a", 5 "c"; first start is 0, starts ascend
+  "characterId": 17        // only World Bloom: every row's characterId — OR, if it
+  // "cid": [17, 17, null]    varies (it never does in practice): one entry per row,
+                           // null for rows without one; never both keys
+}
+```
+
+The object above is the trace `[{"timestamp":1700000000,"userId":"a","score":100,"rank":7}, {"timestamp":1700000002,"userId":"a","score":130,"rank":7}, {"timestamp":1700000003,"userId":"b","score":131,"rank":7}, {"timestamp":1700000010,"userId":"b","score":200,"rank":7}, {"timestamp":1700000011,"userId":"a","score":201,"rank":7}, {"timestamp":1700000012,"userId":"c","score":250,"rank":7}]`. Exactly one of `rank` or `r0`+`dr` is present; `dt`, `ds` and `dr` have `n-1` entries (`[]` for one row); all numbers are integers within JavaScript's safe range. The columns are computed once per cached trace (their own cache entry next to the row trace, same TTL bucket), so requesting them never decodes rows per request.
+
+Reference decoder (TypeScript). A client that sends `traceFormat=columns` must still accept an array: an older server ignores the param and answers rows, so branch on `Array.isArray` / `format === "columns"` rather than on the server version:
+
+```ts
+type TraceRow = { timestamp: number; userId: string; score: number; rank: number; characterId?: number };
+type TraceColumns = {
+  format: "columns"; n: number;
+  t0: number; dt: number[]; s0: number; ds: number[];
+  rank?: number; r0?: number; dr?: number[];
+  users: string[]; u: [number, number][];
+  characterId?: number; cid?: (number | null)[];
+};
+
+export function decodeTrace(trace: TraceRow[] | TraceColumns | undefined): TraceRow[] {
+  if (!trace) return [];                       // omitted field: no rows
+  if (Array.isArray(trace)) return trace;      // rows (older server or traceFormat=rows)
+  if (trace.format !== "columns") throw new Error("unknown trace format");
+  const rows: TraceRow[] = new Array(trace.n);
+  let timestamp = trace.t0, score = trace.s0, rank = trace.rank ?? trace.r0!, run = 0;
+  for (let i = 0; i < trace.n; i++) {
+    if (i > 0) {
+      timestamp += trace.dt[i - 1];
+      score += trace.ds[i - 1];
+      if (trace.dr) rank += trace.dr[i - 1];
+    }
+    if (run + 1 < trace.u.length && trace.u[run + 1][0] === i) run++;
+    const row: TraceRow = { timestamp, userId: trace.users[trace.u[run][1]], score, rank };
+    const cid = trace.cid ? trace.cid[i] : trace.characterId;
+    if (cid != null) row.characterId = cid;
+    rows[i] = row;
+  }
+  return rows;
+}
+```
 
 ### Exact UID Lookup (check-room)
 
@@ -98,7 +158,7 @@ GET .../leaderboards/total/private/details/user/{user_id}
 GET .../leaderboards/world-bloom/{character_id}/private/details/user/{user_id}
 ```
 
-Guarded by `private::require_subject`: the subject comes from the WebSocket proxy extension or trusted-proxy (Oathkeeper) headers, and ownership of `(server, user_id)` is verified against the Toolbox backend (`toolbox` config). 401 without a subject.
+Guarded by `private::require_subject`: the subject comes from the WebSocket proxy extension or trusted-proxy (Oathkeeper) headers, and ownership of `(server, user_id)` is verified against the Toolbox backend (`toolbox` config; a positive answer is reused for `verify_cache_ttl_secs`, rejections are re-checked every time). 401 without a subject. Query params: `includeTrace`, `includeProfile`, `cursor`, `limit` — the trace pages exactly like the public detail's `playerTrace` (`cursor` = last seen timestamp, strictly newer rows, `limit` clamped to 10000, oldest first); without `cursor`/`limit` the whole history is returned. A cursor poll with nothing newer is an empty `playerTrace` for a tracked player, not a 404. Responses are never cached.
 
 ### Realtime (WebSocket)
 
@@ -107,7 +167,7 @@ GET /ws-ticket
 GET /ws?ticket=...
 ```
 
-`/ws-ticket` issues a single-use 45-second ticket to subjects resolved from trusted-proxy headers. The socket accepts `subscribe` / `unsubscribe` / `ping` frames plus proxied requests for any `/api/v2/web/...` path, and pushes `ready` / `updated` / `online` events for subscribed `(server, event_id)` topics. Tracker writes trigger the `updated` broadcasts: `{"type":"updated","server":"cn","eventId":180,"timestamp":1760000000,"version":4242}`. `version` is the event's API-cache epoch after the write. It is omitted when the process has no API cache, and on a cluster reader until its database has confirmably replayed the write (WAL position reached): an unconfirmed update still refreshes caches, but announces no version; fetch `...?v=<version>` over HTTP to get a cacheable response for exactly that data. Proxied request frames keep their `{"id","ok","status","data"}` reply unchanged.
+`/ws-ticket` issues a single-use 45-second ticket to subjects resolved from trusted-proxy headers. The socket accepts `subscribe` / `unsubscribe` / `ping` frames plus proxied requests for any `/api/v2/web/...` path, and pushes `ready` / `updated` / `online` events for subscribed `(server, event_id)` topics. Tracker writes trigger the `updated` broadcasts: `{"type":"updated","server":"cn","eventId":180,"timestamp":1760000000,"version":4242}`. `version` is the event's API-cache epoch after the write. It is omitted when the process has no API cache, and on a cluster reader until its database has confirmably replayed the write (WAL position reached): an unconfirmed update still refreshes caches, but announces no version; fetch `...?v=<version>` over HTTP to get a cacheable response for exactly that data. Proxied request frames keep their `{"id","ok","status","data"}` reply unchanged; a socket runs up to 4 of them at once and queues 64 more (beyond that a frame is answered `429` immediately), so replies arrive in completion order and must be matched by `id`. Client frames are capped at 64 KiB. The server pings every `realtime.ws_ping_interval_secs` and closes a socket that sent nothing (pong included) for `ws_idle_timeout_secs`. If a socket falls behind the broadcast channel it receives one version-less `updated` per subscribed topic, which the client should treat as "refetch uncached". `online` frames are coalesced per topic to at most one per `online_broadcast_interval_secs`.
 
 ### User Profile Search
 

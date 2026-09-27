@@ -214,7 +214,11 @@ GET /api/v2/web/events/{server}/{event_id}/leaderboards/total/details/user/{id}?
 - writer 仍是采集单点（与今天相同）。CN05↔CN08 掉到 DERP 时写入变慢但不丢：
   `flush_interval_secs: 15` 攒批，cron 的 `try_lock` 跳过堆积的 tick。
 - 每次 flush 事务跨 29 ms 链路做若干次往返，估算 100~200 ms，秒级采集下可接受；
-  `flush_hot_ranks: 10` 的即时落库同样受此延迟。
+  `flush_hot_ranks: 10` 的即时落库同样受此延迟。writer 角色的 flush 在同一条连接上完成
+  （users upsert、事务、提交后的 `pg_current_wal_lsn()` 合并为 6~7 次往返；见
+  `db::pg_session`），并受 `gorm_config.write_timeout`（默认 5s）约束：超时的连接
+  直接丢弃不回池，事务内同时设置 `statement_timeout` / `idle_in_transaction_session_timeout`。
+  writer 关闭了取连接前的 ping（`test_before_acquire`），reader 保留。
 - 热备上的查询与 WAL 回放冲突可能被取消（`hot_standby_feedback=on` 缓解，代价是主库
   膨胀受热备长查询牵制；trace 查询有并发上限，可接受）。
 - Oathkeeper 规则不热加载，改完必须重启 `haruki-toolbox-services-oathkeeper-1`。

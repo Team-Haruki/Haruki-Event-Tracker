@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::model::sekai::{UserPlayerFrame, UserProfileHonor};
+use crate::model::trace_columns::TracePayload;
 
 #[derive(Debug, Clone, Serialize, Deserialize, FromQueryResult)]
 #[serde(rename_all = "camelCase")]
@@ -63,17 +64,21 @@ impl<'de> Deserialize<'de> for RecordedRankData {
 /// and re-encodes thousands of rows per request; `Rows` holds typed rows.
 ///
 /// `Raw` serializes verbatim only through sonic-rs (the service's JSON
-/// encoder); other serializers would see sonic's lazy-value wrapper.
+/// encoder), which is asked to emit the text as a raw value the same way
+/// its own `LazyValue` is; other serializers would see a one-field struct.
 #[derive(Debug, Clone)]
 pub enum TraceRows {
     Rows(Vec<RecordedRankData>),
     Raw {
-        /// The array's JSON text, used to decode on demand.
+        /// The array's JSON text.
         text: sonic_rs::FastStr,
-        /// The same array, serialized verbatim.
-        value: sonic_rs::OwnedLazyValue,
     },
 }
+
+/// sonic-rs's marker for "write this string as raw JSON" (its
+/// `LazyValue` serializes through the same struct name and field). The
+/// splice tests pin it: a rename would show up as a quoted string.
+const SONIC_RAW_VALUE_TOKEN: &str = "$sonic_rs::LazyValue";
 
 impl Default for TraceRows {
     fn default() -> Self {
@@ -89,7 +94,8 @@ impl From<Vec<RecordedRankData>> for TraceRows {
 
 impl TraceRows {
     /// Borrows the `rankData` array of a cached trace response without
-    /// decoding its rows. A response without `rankData` has no rows.
+    /// decoding its rows, scanning the document to find it. A response
+    /// without `rankData` has no rows.
     pub fn from_trace_json(json: &bytes::Bytes) -> sonic_rs::Result<Self> {
         let value = match sonic_rs::get_from_bytes(json, ["rankData"]) {
             Ok(value) => value,
@@ -103,14 +109,46 @@ impl TraceRows {
         }
         Ok(Self::Raw {
             text: value.as_raw_faststr(),
-            value: value.into(),
         })
+    }
+
+    /// Like [`Self::from_trace_json`] with the array's byte range already
+    /// known (see [`SubjectTraceResponseSchema::rank_data_range`]): the
+    /// array is sliced out of `json` without a scan, sharing its buffer.
+    /// `None` means the response has no rows. A range that doesn't frame an
+    /// array in these bytes falls back to scanning.
+    pub fn from_trace_json_range(
+        json: &bytes::Bytes,
+        range: Option<std::ops::Range<usize>>,
+    ) -> sonic_rs::Result<Self> {
+        let Some(range) = range else {
+            return Ok(Self::default());
+        };
+        let framed = range.start < range.end
+            && range.end <= json.len()
+            && json[range.start] == b'['
+            && json[range.end - 1] == b']';
+        if !framed {
+            tracing::warn!(
+                ?range,
+                len = json.len(),
+                "cached trace range does not frame an array"
+            );
+            return Self::from_trace_json(json);
+        }
+        match sonic_rs::FastStr::from_bytes(json.slice(range)) {
+            Ok(text) => Ok(Self::Raw { text }),
+            Err(err) => {
+                tracing::warn!(%err, "cached trace range is not UTF-8");
+                Self::from_trace_json(json)
+            }
+        }
     }
 
     pub fn is_empty(&self) -> bool {
         match self {
             Self::Rows(rows) => rows.is_empty(),
-            Self::Raw { text, .. } => text
+            Self::Raw { text } => text
                 .strip_prefix('[')
                 .is_some_and(|rest| rest.trim_start().starts_with(']')),
         }
@@ -120,7 +158,7 @@ impl TraceRows {
     pub fn to_rows(&self) -> sonic_rs::Result<std::borrow::Cow<'_, [RecordedRankData]>> {
         match self {
             Self::Rows(rows) => Ok(std::borrow::Cow::Borrowed(rows)),
-            Self::Raw { text, .. } => sonic_rs::from_str(text).map(std::borrow::Cow::Owned),
+            Self::Raw { text } => sonic_rs::from_str(text).map(std::borrow::Cow::Owned),
         }
     }
 
@@ -132,7 +170,7 @@ impl TraceRows {
 
     /// Mutable typed rows, decoding a raw array in place first.
     pub fn rows_mut(&mut self) -> sonic_rs::Result<&mut Vec<RecordedRankData>> {
-        if let Self::Raw { text, .. } = self {
+        if let Self::Raw { text } = self {
             *self = Self::Rows(sonic_rs::from_str(text)?);
         }
         match self {
@@ -147,9 +185,14 @@ impl Serialize for TraceRows {
     where
         S: serde::Serializer,
     {
+        use serde::ser::SerializeStruct;
         match self {
             Self::Rows(rows) => rows.serialize(serializer),
-            Self::Raw { value, .. } => value.serialize(serializer),
+            Self::Raw { text } => {
+                let mut raw = serializer.serialize_struct(SONIC_RAW_VALUE_TOKEN, 1)?;
+                raw.serialize_field(SONIC_RAW_VALUE_TOKEN, text.as_str())?;
+                raw.end()
+            }
         }
     }
 }
@@ -407,19 +450,41 @@ impl SubjectTraceResponseSchema {
     /// its first row must decode. Cheap enough for every L2 hit, and strict
     /// enough that typed callers and raw splicing never meet a stale shape.
     pub fn json_is_well_formed(json: &[u8]) -> sonic_rs::Result<()> {
+        Self::rank_data_range(json).map(|_| ())
+    }
+
+    /// [`Self::json_is_well_formed`] that also reports where the `rankData`
+    /// array lies in `json` (`None`: no rows). The check already parses the
+    /// document, so the range costs nothing extra, and `TraceRows` can
+    /// then slice the array out of the same bytes without rescanning.
+    pub fn rank_data_range(json: &[u8]) -> sonic_rs::Result<Option<std::ops::Range<usize>>> {
         let shape: SubjectTraceShape<'_> = sonic_rs::from_slice(json)?;
         let Some(rows) = shape.rank_data else {
-            return Ok(());
+            return Ok(None);
         };
         if !sonic_rs::JsonValueTrait::is_array(&rows) {
             return Err(<sonic_rs::Error as serde::de::Error>::custom(
                 "rankData is not an array",
             ));
         }
-        match sonic_rs::get_from_str(rows.as_raw_str(), sonic_rs::pointer![0]) {
-            Ok(first) => sonic_rs::from_str::<RecordedRankData>(first.as_raw_str()).map(|_| ()),
-            Err(err) if err.is_not_found() => Ok(()),
-            Err(err) => Err(err),
+        let raw = rows.as_raw_str();
+        match sonic_rs::get_from_str(raw, sonic_rs::pointer![0]) {
+            Ok(first) => sonic_rs::from_str::<RecordedRankData>(first.as_raw_str()).map(|_| ())?,
+            Err(err) if err.is_not_found() => {}
+            Err(err) => return Err(err),
+        }
+        // The lazy value borrows from `json`, so its address gives the
+        // offset; anything else means sonic copied and the range is unknown.
+        let base = json.as_ptr() as usize;
+        let start = (raw.as_ptr() as usize).wrapping_sub(base);
+        let end = start.wrapping_add(raw.len());
+        if raw.as_ptr() as usize >= base && end <= json.len() && &json[start..end] == raw.as_bytes()
+        {
+            Ok(Some(start..end))
+        } else {
+            Err(<sonic_rs::Error as serde::de::Error>::custom(
+                "rankData is not addressable in the cached bytes",
+            ))
         }
     }
 }
@@ -517,10 +582,10 @@ pub struct WebRankDetailResponseSchema {
     pub next: Option<WebRankingItemSchema>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metrics: Option<RankingScoreGrowthSchema>,
-    #[serde(skip_serializing_if = "TraceRows::is_empty", default)]
-    pub rank_trace: TraceRows,
-    #[serde(skip_serializing_if = "TraceRows::is_empty", default)]
-    pub player_trace: TraceRows,
+    #[serde(skip_serializing_if = "TracePayload::is_empty", default)]
+    pub rank_trace: TracePayload,
+    #[serde(skip_serializing_if = "TracePayload::is_empty", default)]
+    pub player_trace: TracePayload,
     pub interval_seconds: i64,
     pub window_start: i64,
     pub window_end: i64,
@@ -552,8 +617,8 @@ pub struct WebUserDetailResponseSchema {
     pub previous: Option<WebRankingItemSchema>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next: Option<WebRankingItemSchema>,
-    #[serde(skip_serializing_if = "TraceRows::is_empty", default)]
-    pub player_trace: TraceRows,
+    #[serde(skip_serializing_if = "TracePayload::is_empty", default)]
+    pub player_trace: TracePayload,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub profile: Option<RecordedUserNameSchema>,
 }
@@ -678,16 +743,17 @@ mod trace_rows_tests {
             vec![normal(1), normal(2)],
             vec![world_bloom(1), world_bloom(2)],
         ] {
-            let raw = TraceRows::from_trace_json(&trace_json(rows.clone())).unwrap();
+            let json = trace_json(rows.clone());
+            let raw = TraceRows::from_trace_json(&json).unwrap();
             assert!(matches!(raw, TraceRows::Raw { .. }));
             assert!(!raw.is_empty());
-            let spliced = sonic_rs::to_string(&Detail {
-                rank_trace: raw.clone(),
+            let typed = sonic_rs::to_string(&Detail {
+                rank_trace: rows.clone().into(),
                 tail: 7,
             })
             .unwrap();
-            let typed = sonic_rs::to_string(&Detail {
-                rank_trace: rows.clone().into(),
+            let spliced = sonic_rs::to_string(&Detail {
+                rank_trace: raw.clone(),
                 tail: 7,
             })
             .unwrap();
@@ -696,7 +762,53 @@ mod trace_rows_tests {
                 sonic_rs::to_string(&raw.rows()).unwrap(),
                 sonic_rs::to_string(&rows).unwrap()
             );
+
+            // The sliced fast path yields the same bytes as the scan.
+            let start = json.iter().position(|b| *b == b'[').unwrap();
+            let end = json.iter().rposition(|b| *b == b']').unwrap() + 1;
+            let sliced = TraceRows::from_trace_json_range(&json, Some(start..end)).unwrap();
+            let fast = sonic_rs::to_string(&Detail {
+                rank_trace: sliced.clone(),
+                tail: 7,
+            })
+            .unwrap();
+            assert_eq!(fast, typed);
+            assert_eq!(
+                sonic_rs::to_string(&sliced.rows()).unwrap(),
+                sonic_rs::to_string(&rows).unwrap()
+            );
         }
+    }
+
+    #[test]
+    fn raw_trace_rows_from_range_fall_back_to_scanning_when_the_range_is_off() {
+        let rows = vec![normal(1), world_bloom(2)];
+        let json = trace_json(rows.clone());
+        let typed = sonic_rs::to_string(&rows).unwrap();
+        let start = json.iter().position(|b| *b == b'[').unwrap();
+        let end = json.iter().rposition(|b| *b == b']').unwrap() + 1;
+        for range in [
+            start + 1..end,
+            start..end - 1,
+            start..end + 1,
+            end..start,
+            0..json.len(),
+            start..json.len() + 10,
+        ] {
+            let rows = TraceRows::from_trace_json_range(&json, Some(range.clone())).unwrap();
+            assert_eq!(sonic_rs::to_string(&rows).unwrap(), typed, "{range:?}");
+        }
+        assert!(
+            TraceRows::from_trace_json_range(&json, None)
+                .unwrap()
+                .is_empty()
+        );
+        // A range that frames some other array is a caller bug the check
+        // can't see, so the range must come from the same bytes.
+        let text = String::from_utf8(json.to_vec()).unwrap();
+        let padded = bytes::Bytes::from(format!("{text}          "));
+        let rows = TraceRows::from_trace_json_range(&padded, Some(start..end)).unwrap();
+        assert_eq!(sonic_rs::to_string(&rows).unwrap(), typed);
     }
 
     #[test]
@@ -755,6 +867,30 @@ mod trace_rows_tests {
         let valid = subject_trace(vec![normal(1), normal(2)]);
         SubjectTraceResponseSchema::json_is_well_formed(&valid).unwrap();
         SubjectTraceResponseSchema::json_is_well_formed(&subject_trace(Vec::new())).unwrap();
+        assert_eq!(
+            SubjectTraceResponseSchema::rank_data_range(&subject_trace(Vec::new())).unwrap(),
+            None
+        );
+        let range = SubjectTraceResponseSchema::rank_data_range(&valid)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            std::str::from_utf8(&valid[range.clone()]).unwrap(),
+            sonic_rs::to_string(&vec![normal(1), normal(2)]).unwrap()
+        );
+        let bytes = bytes::Bytes::from(valid.clone());
+        let spliced = TraceRows::from_trace_json_range(&bytes, Some(range)).unwrap();
+        assert_eq!(
+            sonic_rs::to_string(&spliced).unwrap(),
+            sonic_rs::to_string(&TraceRows::from_trace_json(&bytes).unwrap()).unwrap()
+        );
+        // A World Bloom trace too, whose rows carry an extra field.
+        let wb = subject_trace(vec![world_bloom(1)]);
+        let range = SubjectTraceResponseSchema::rank_data_range(&wb)
+            .unwrap()
+            .unwrap();
+        assert_eq!(&wb[range.start..range.start + 1], b"[");
+        assert_eq!(&wb[range.end - 1..range.end], b"]");
         let text = String::from_utf8(valid).unwrap();
         let rejected = [
             text.replacen(r#""meta":"#, r#""metaOld":"#, 1),
@@ -767,6 +903,10 @@ mod trace_rows_tests {
         for bad in rejected {
             assert!(
                 SubjectTraceResponseSchema::json_is_well_formed(bad.as_bytes()).is_err(),
+                "{bad}"
+            );
+            assert!(
+                SubjectTraceResponseSchema::rank_data_range(bad.as_bytes()).is_err(),
                 "{bad}"
             );
         }

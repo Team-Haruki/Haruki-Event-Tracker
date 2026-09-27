@@ -1,27 +1,30 @@
 use serde::Deserialize;
 
+use crate::api::cache::CachedJson;
 use crate::api::error::ApiError;
 use crate::api::extract::{ApiAudience, prepare_audience_user_id_mode, resolve_region_engine};
 use crate::api::handler::web::{
     build_overview, build_overview_until, build_world_bloom_overview,
-    build_world_bloom_overview_until, cached_overview_bytes, overview_status,
+    build_world_bloom_overview_until, cached_overview_bytes, cached_trace_rows, overview_status,
 };
 use crate::api::json::{EncodedJson, Json};
 use crate::api::state::AppState;
 use crate::db::engine::DatabaseEngine;
 use crate::db::query::heartbeat::fetch_time_id_timestamp;
+use crate::db::query::user::get_user_data;
 use crate::db::query::web::RankSnapshotCut;
 use crate::model::api::{
     LeaderboardOverviewSchema, RecordedRankData, TraceRows, WebRankDetailResponseSchema,
     WebRankingItemSchema, WebSubjectSchema, WebUserDetailResponseSchema,
 };
 use crate::model::enums::SekaiServerRegion;
+use crate::model::trace_columns::{TraceFormat, TracePayload};
 
 use super::snapshot::{
     SnapshotBuildRequest, build_rank_snapshots_response, resolve_rank_cut, resolve_user_rank,
     snapshot_shows_user,
 };
-use super::trace::{SubjectTraceQuery, build_subject_trace_json, build_subject_trace_response};
+use super::trace::{SubjectTraceQuery, build_subject_trace_columns_json, build_subject_trace_json};
 use super::util::{interval_seconds, meta, positive_timestamp, user_id_of_rank_data};
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -310,9 +313,16 @@ pub struct WebDetailQuery {
     id_type: Option<String>,
     /// `check-room` only: the raw upstream UID to look up.
     user_id: Option<String>,
+    /// `rows` (default) or `columns` (`TraceColumns`) for `rankTrace` /
+    /// `playerTrace`.
+    trace_format: Option<String>,
 }
 
 impl WebDetailQuery {
+    pub(crate) fn trace_format(&self) -> Result<TraceFormat, ApiError> {
+        TraceFormat::parse(self.trace_format.as_deref()).map_err(ApiError::BadRequest)
+    }
+
     /// Whether `details/user/{user_id}` resolves `user_id` as a raw upstream
     /// UID — such a response carries that UID and must stay private.
     pub(crate) fn looks_up_raw_uid(&self, user_id: &str) -> Result<bool, ApiError> {
@@ -418,6 +428,7 @@ pub(crate) async fn web_rank_detail_for_scope(
     if rank <= 0 {
         return Err(ApiError::BadRequest("rank must be positive".into()));
     }
+    let trace_format = query.trace_format()?;
     let interval = interval_seconds(query.interval);
     let at = positive_timestamp(query.at);
     let snapshot = build_rank_snapshots_response(
@@ -442,40 +453,34 @@ pub(crate) async fn web_rank_detail_for_scope(
         .into_iter()
         .find(|item| item.rank == rank)
         .ok_or(ApiError::NotFound)?;
-    let mut rank_trace = TraceRows::default();
+    let mut rank_trace = TracePayload::default();
     if query.include_trace.unwrap_or(false) {
-        rank_trace = detail_trace(
-            build_subject_trace_json(
-                state.clone(),
-                server.clone(),
-                event_id,
-                character_id,
-                rank.to_string(),
-                detail_trace_query(&query, "rank"),
-                "web:v2",
-                ApiAudience::Web,
-            )
-            .await,
-        )?;
+        rank_trace = detail_trace_in_format(
+            &state,
+            &server,
+            event_id,
+            character_id,
+            rank.to_string(),
+            detail_trace_query(&query, "rank"),
+            trace_format,
+        )
+        .await?;
     }
-    let mut player_trace = TraceRows::default();
+    let mut player_trace = TracePayload::default();
     if query.include_player_trace.unwrap_or(false)
         && let Some(current) = item.current.as_ref()
         && let Some(user_id) = user_id_of_rank_data(&current.rank_data)
     {
-        player_trace = detail_trace(
-            build_subject_trace_json(
-                state.clone(),
-                server.clone(),
-                event_id,
-                character_id,
-                user_id,
-                detail_trace_query(&query, "user"),
-                "web:v2",
-                ApiAudience::Web,
-            )
-            .await,
-        )?;
+        player_trace = detail_trace_in_format(
+            &state,
+            &server,
+            event_id,
+            character_id,
+            user_id,
+            detail_trace_query(&query, "user"),
+            trace_format,
+        )
+        .await?;
     }
     Ok(Json(WebRankDetailResponseSchema {
         meta: snapshot.meta,
@@ -572,13 +577,13 @@ fn reveal_subject(
     if let Some(current) = detail.current.as_mut() {
         reveal_item(current, unique_id, raw);
     }
-    let rows = detail.player_trace.rows_mut().map_err(|err| {
-        tracing::warn!(%err, "cached subject trace failed to decode");
-        ApiError::ServiceUnavailable("api cache decode failed".into())
-    })?;
-    for row in rows {
-        reveal_rank_data(row, unique_id, raw);
-    }
+    detail
+        .player_trace
+        .rename_user(unique_id, raw)
+        .map_err(|err| {
+            tracing::warn!(%err, "cached subject trace failed to decode");
+            ApiError::ServiceUnavailable("api cache decode failed".into())
+        })?;
     if let Some(profile) = detail.profile.as_mut()
         && profile.user_id == unique_id
     {
@@ -614,6 +619,7 @@ async fn web_user_detail_by_unique_id(
     user_id: String,
     query: WebDetailQuery,
 ) -> Result<Json<WebUserDetailResponseSchema>, ApiError> {
+    let trace_format = query.trace_format()?;
     let at = positive_timestamp(query.at);
     let (rank, cut) = Box::pin(resolve_user_rank(
         &state,
@@ -651,49 +657,36 @@ async fn web_user_detail_by_unique_id(
     } else {
         None
     };
+    // The profile is the users-table row, read directly: `resolve_user_rank`
+    // above already established that the player has rows in this scope
+    // (World Bloom: in this chapter) — a player without any is a 404 before
+    // this point — so no trace has to be run to prove it. A lookup failure
+    // leaves the profile out, as it always has.
     let profile = if query.include_profile.unwrap_or(false) {
-        match build_subject_trace_response(
-            state.clone(),
-            server.clone(),
-            event_id,
-            character_id,
-            user_id.clone(),
-            SubjectTraceQuery {
-                subject_type: Some("user".to_owned()),
-                include_current: Some(true),
-                start_time: None,
-                end_time: None,
-                cursor: None,
-                limit: Some(1),
-            },
-            "web:v2",
-            ApiAudience::Web,
-        )
-        .await
-        {
-            Ok(trace) => trace.user_data,
-            Err(ApiError::NotFound) => None,
-            Err(err) => return Err(err),
-        }
+        let (region, engine) = resolve_region_engine(&state, &server)?;
+        let mode =
+            prepare_audience_user_id_mode(&state, &engine, region, event_id, ApiAudience::Web)
+                .await?;
+        get_user_data(&engine, event_id, &user_id, mode)
+            .await
+            .ok()
+            .flatten()
     } else {
         None
     };
     let player_trace = if query.include_trace.unwrap_or(false) {
-        detail_trace(
-            build_subject_trace_json(
-                state,
-                server,
-                event_id,
-                character_id,
-                user_id,
-                detail_trace_query(&query, "user"),
-                "web:v2",
-                ApiAudience::Web,
-            )
-            .await,
-        )?
+        detail_trace_in_format(
+            &state,
+            &server,
+            event_id,
+            character_id,
+            user_id,
+            detail_trace_query(&query, "user"),
+            trace_format,
+        )
+        .await?
     } else {
-        TraceRows::default()
+        TracePayload::default()
     };
     let (current, previous, next) = match item {
         Some(item) => (item.current, item.previous, item.next),
@@ -711,12 +704,54 @@ async fn web_user_detail_by_unique_id(
     }))
 }
 
+/// The detail's trace in the requested wire form, each spliced from its
+/// own cached bytes without decoding rows per request.
+async fn detail_trace_in_format(
+    state: &AppState,
+    server: &str,
+    event_id: i64,
+    character_id: Option<i64>,
+    subject: String,
+    query: SubjectTraceQuery,
+    format: TraceFormat,
+) -> Result<TracePayload, ApiError> {
+    match format {
+        TraceFormat::Rows => detail_trace(
+            Box::pin(build_subject_trace_json(
+                state.clone(),
+                server.to_owned(),
+                event_id,
+                character_id,
+                subject,
+                query,
+                "web:v2",
+                ApiAudience::Web,
+            ))
+            .await,
+        )
+        .map(TracePayload::Rows),
+        TraceFormat::Columns => detail_trace_columns(
+            Box::pin(build_subject_trace_columns_json(
+                state.clone(),
+                server.to_owned(),
+                event_id,
+                character_id,
+                subject,
+                query,
+                "web:v2",
+                ApiAudience::Web,
+            ))
+            .await,
+        ),
+    }
+}
+
 /// A detail's trace is optional content: no rows in the window (typically
 /// a `cursor` poll with nothing newer) is an empty increment, not a 404.
 /// The cached trace's `rankData` array is spliced in without decoding it.
-fn detail_trace(trace: Result<bytes::Bytes, ApiError>) -> Result<TraceRows, ApiError> {
+fn detail_trace(trace: Result<CachedJson, ApiError>) -> Result<TraceRows, ApiError> {
     match trace {
-        Ok(json) => TraceRows::from_trace_json(&json).map_err(|err| {
+        Ok(json) => cached_trace_rows(&json).map_err(|err| {
             tracing::warn!(%err, "cached subject trace has no usable rankData");
             ApiError::ServiceUnavailable("api cache decode failed".into())
         }),
@@ -725,10 +760,25 @@ fn detail_trace(trace: Result<bytes::Bytes, ApiError>) -> Result<TraceRows, ApiE
     }
 }
 
+/// `detail_trace` for the cached columns object.
+fn detail_trace_columns(trace: Result<bytes::Bytes, ApiError>) -> Result<TracePayload, ApiError> {
+    match trace {
+        Ok(json) => TracePayload::columns_from_json(&json).map_err(|err| {
+            tracing::warn!(%err, "cached trace columns are unusable");
+            ApiError::ServiceUnavailable("api cache decode failed".into())
+        }),
+        Err(ApiError::NotFound) => Ok(TracePayload::default()),
+        Err(err) => Err(err),
+    }
+}
+
+/// A detail splices only the trace's rows (`detail_trace`), so the trace's
+/// own `current` is never asked for: for a user subject that spares the
+/// latest-row lookup, and it keys the cache the same way for every detail.
 fn detail_trace_query(query: &WebDetailQuery, subject_type: &str) -> SubjectTraceQuery {
     SubjectTraceQuery {
         subject_type: Some(subject_type.to_owned()),
-        include_current: Some(true),
+        include_current: Some(false),
         start_time: None,
         end_time: None,
         cursor: query.cursor,
@@ -933,7 +983,9 @@ mod tests {
         .0;
         assert!(detail.current.is_some());
         assert!(detail.subject.is_none());
-        assert_eq!(detail.profile.unwrap().name, "Alpha");
+        let profile = detail.profile.unwrap();
+        assert_eq!(profile.name, "Alpha");
+        assert_eq!(profile.user_id, unique(&state, NORMAL_EVENT, "100"));
         assert_eq!(detail.player_trace.rows().len(), 2);
 
         let mut without_trace = detail_query();
@@ -1245,6 +1297,209 @@ mod tests {
         }
     }
 
+    fn columns_query() -> WebDetailQuery {
+        WebDetailQuery {
+            trace_format: Some("columns".into()),
+            ..detail_query()
+        }
+    }
+
+    fn rows_of(payload: &TracePayload) -> String {
+        sonic_rs::to_string(&payload.rows()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn detail_traces_in_columns_format_round_trip_to_the_row_form() {
+        let state = test_state().await;
+        for (event, chapter) in [(NORMAL_EVENT, None), (WORLD_BLOOM_EVENT, Some(17))] {
+            let rows = web_rank_detail_for_scope(
+                state.clone(),
+                "jp".into(),
+                event,
+                chapter,
+                1,
+                detail_query(),
+            )
+            .await
+            .unwrap()
+            .0;
+            // `traceFormat=rows` and an absent param are the same bytes.
+            let explicit_rows = web_rank_detail_for_scope(
+                state.clone(),
+                "jp".into(),
+                event,
+                chapter,
+                1,
+                WebDetailQuery {
+                    trace_format: Some("rows".into()),
+                    ..detail_query()
+                },
+            )
+            .await
+            .unwrap()
+            .0;
+            let rows_json = sonic_rs::to_string(&rows).unwrap();
+            assert_eq!(sonic_rs::to_string(&explicit_rows).unwrap(), rows_json);
+            assert!(rows_json.contains(r#""rankTrace":[{"#), "{rows_json}");
+            assert!(rows_json.contains(r#""playerTrace":[{"#), "{rows_json}");
+
+            let columns = web_rank_detail_for_scope(
+                state.clone(),
+                "jp".into(),
+                event,
+                chapter,
+                1,
+                columns_query(),
+            )
+            .await
+            .unwrap()
+            .0;
+            let columns_json = sonic_rs::to_string(&columns).unwrap();
+            assert!(
+                columns_json.contains(r#""rankTrace":{"format":"columns","n":"#),
+                "{columns_json}"
+            );
+            assert!(
+                columns_json.contains(r#""playerTrace":{"format":"columns","n":"#),
+                "{columns_json}"
+            );
+            assert_eq!(columns.rank_trace.format(), TraceFormat::Columns);
+            assert_eq!(columns.player_trace.format(), TraceFormat::Columns);
+            assert_eq!(rows_of(&columns.rank_trace), rows_of(&rows.rank_trace));
+            assert_eq!(rows_of(&columns.player_trace), rows_of(&rows.player_trace));
+            assert!(!columns.rank_trace.is_empty());
+            if chapter.is_some() {
+                assert!(
+                    columns_json.contains(r#""characterId":17"#),
+                    "{columns_json}"
+                );
+            }
+            // The columns object decodes back into the response type too.
+            let decoded: WebRankDetailResponseSchema = sonic_rs::from_str(&columns_json).unwrap();
+            assert_eq!(rows_of(&decoded.rank_trace), rows_of(&rows.rank_trace));
+
+            let user_rows = web_user_detail_for_scope(
+                state.clone(),
+                "jp".into(),
+                event,
+                chapter,
+                unique(&state, event, "100"),
+                detail_query(),
+            )
+            .await
+            .unwrap()
+            .0;
+            let user_columns = web_user_detail_for_scope(
+                state.clone(),
+                "jp".into(),
+                event,
+                chapter,
+                unique(&state, event, "100"),
+                columns_query(),
+            )
+            .await
+            .unwrap()
+            .0;
+            assert_eq!(user_columns.player_trace.format(), TraceFormat::Columns);
+            assert_eq!(
+                rows_of(&user_columns.player_trace),
+                rows_of(&user_rows.player_trace)
+            );
+            assert_eq!(user_columns.player_trace.rows().len(), 2);
+
+            // Cursor polls: an increment encodes on its own; nothing newer
+            // is an empty (omitted) trace in either format.
+            let mut increment = columns_query();
+            increment.cursor = Some(1_710_000_000);
+            let increment = web_user_detail_for_scope(
+                state.clone(),
+                "jp".into(),
+                event,
+                chapter,
+                unique(&state, event, "100"),
+                increment,
+            )
+            .await
+            .unwrap()
+            .0;
+            assert_eq!(increment.player_trace.format(), TraceFormat::Columns);
+            assert_eq!(increment.player_trace.rows().len(), 1);
+            let mut exhausted = columns_query();
+            exhausted.cursor = Some(1_710_000_060);
+            let exhausted =
+                web_rank_detail_for_scope(state.clone(), "jp".into(), event, chapter, 1, exhausted)
+                    .await
+                    .unwrap()
+                    .0;
+            assert!(exhausted.rank_trace.is_empty());
+            assert!(exhausted.player_trace.is_empty());
+            let json = sonic_rs::to_string(&exhausted).unwrap();
+            assert!(!json.contains("Trace\""), "{json}");
+
+            // Raw-UID lookups reveal the subject inside the columns too.
+            let mut by_uid = columns_query();
+            by_uid.id_type = Some("uid".into());
+            let by_uid = web_user_detail_for_scope(
+                state.clone(),
+                "jp".into(),
+                event,
+                chapter,
+                "100".into(),
+                by_uid,
+            )
+            .await
+            .unwrap()
+            .0;
+            assert_eq!(by_uid.player_trace.format(), TraceFormat::Columns);
+            let json = sonic_rs::to_string(&by_uid).unwrap();
+            assert!(json.contains(r#""users":["100"]"#), "{json}");
+            assert!(
+                by_uid
+                    .player_trace
+                    .rows()
+                    .iter()
+                    .all(|row| user_id_of_rank_data(row).as_deref() == Some("100"))
+            );
+        }
+
+        // An unknown format is a 400 before any lookup.
+        for (rank_query, user_query) in [(
+            WebDetailQuery {
+                trace_format: Some("csv".into()),
+                ..detail_query()
+            },
+            WebDetailQuery {
+                trace_format: Some("Columns".into()),
+                ..detail_query()
+            },
+        )] {
+            assert!(matches!(
+                web_rank_detail_for_scope(
+                    state.clone(),
+                    "jp".into(),
+                    NORMAL_EVENT,
+                    None,
+                    1,
+                    rank_query
+                )
+                .await,
+                Err(ApiError::BadRequest(_))
+            ));
+            assert!(matches!(
+                web_user_detail_for_scope(
+                    state.clone(),
+                    "jp".into(),
+                    NORMAL_EVENT,
+                    None,
+                    unique(&state, NORMAL_EVENT, "100"),
+                    user_query
+                )
+                .await,
+                Err(ApiError::BadRequest(_))
+            ));
+        }
+    }
+
     #[test]
     fn detail_trace_query_forwards_cursor_and_limit() {
         let query = WebDetailQuery {
@@ -1261,8 +1516,65 @@ mod tests {
         let trace_query = detail_trace_query(&query, "user");
 
         assert_eq!(trace_query.subject_type.as_deref(), Some("user"));
+        assert_eq!(trace_query.include_current, Some(false));
         assert_eq!(trace_query.cursor, Some(1_786_726_540));
         assert_eq!(trace_query.limit, Some(5_000));
+    }
+
+    #[tokio::test]
+    async fn user_detail_profiles_follow_the_chapter_scope() {
+        let state = test_state().await;
+        // Alpha (100) has rows in chapters 17 and 19; Beta (200) only in 17.
+        let alpha = unique(&state, WORLD_BLOOM_EVENT, "100");
+        let beta = unique(&state, WORLD_BLOOM_EVENT, "200");
+        for query in [detail_query(), live_query()] {
+            let detail = web_user_detail_for_scope(
+                state.clone(),
+                "jp".into(),
+                WORLD_BLOOM_EVENT,
+                Some(19),
+                alpha.clone(),
+                query,
+            )
+            .await
+            .unwrap()
+            .0;
+            assert!(detail.ranked);
+            let profile = detail
+                .profile
+                .expect("a player in the chapter has a profile");
+            assert_eq!(profile.user_id, alpha);
+            assert_eq!(profile.name, "Alpha");
+        }
+        // Beta never appears in chapter 19: not found, profile or not.
+        for include_profile in [Some(true), Some(false)] {
+            let mut query = live_query();
+            query.include_profile = include_profile;
+            assert!(matches!(
+                web_user_detail_for_scope(
+                    state.clone(),
+                    "jp".into(),
+                    WORLD_BLOOM_EVENT,
+                    Some(19),
+                    beta.clone(),
+                    query,
+                )
+                .await,
+                Err(ApiError::NotFound)
+            ));
+        }
+        let detail = web_user_detail_for_scope(
+            state.clone(),
+            "jp".into(),
+            WORLD_BLOOM_EVENT,
+            Some(17),
+            beta.clone(),
+            live_query(),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(detail.profile.unwrap().name, "Beta");
     }
 
     #[test]

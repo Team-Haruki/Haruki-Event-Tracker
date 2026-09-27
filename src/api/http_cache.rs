@@ -18,12 +18,17 @@
 //! the key already contains the epoch.
 //!
 //! The layer sits outside `CompressionLayer`, so it hashes (and counts
-//! `Content-Length` of) what is actually sent. WebSocket request frames
-//! run the web routes without this layer and are unaffected.
+//! `Content-Length` of) what is actually sent. Bodies served from the
+//! precompressed cache carry their digest along ([`PrecomputedEtag`], made
+//! once per cache generation) and skip the per-request hash, as long as the
+//! response still has the encoding the digest was made for. WebSocket
+//! request frames run the web routes without this layer and are unaffected.
 
-use axum::body::{Body, to_bytes};
+use axum::body::{Body, HttpBody, to_bytes};
 use axum::extract::Request;
-use axum::http::header::{CACHE_CONTROL, CONTENT_LENGTH, ETAG, IF_NONE_MATCH, VARY};
+use axum::http::header::{
+    CACHE_CONTROL, CONTENT_ENCODING, CONTENT_LENGTH, ETAG, IF_NONE_MATCH, VARY,
+};
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
@@ -44,6 +49,16 @@ pub struct ServedEpoch(pub i64);
 /// Response extension: never let a shared cache keep this response.
 #[derive(Clone, Copy, Debug)]
 pub struct PrivateResponse;
+
+/// Response extension: the strong ETag of the body's exact bytes, digested
+/// when they were produced, and the `Content-Encoding` they carried then.
+/// It is honoured only while the response still has that encoding; a body
+/// the compression layer re-encoded is hashed like any other.
+#[derive(Clone, Debug)]
+pub struct PrecomputedEtag {
+    pub etag: HeaderValue,
+    pub content_encoding: Option<HeaderValue>,
+}
 
 pub fn private(response: impl IntoResponse) -> Response {
     let mut response = response.into_response();
@@ -75,18 +90,38 @@ pub async fn web_cache_headers(req: Request, next: Next) -> Response {
         LIVE_CACHE_CONTROL
     };
 
+    let precomputed = response
+        .extensions()
+        .get::<PrecomputedEtag>()
+        .filter(|tag| response.headers().get(CONTENT_ENCODING) == tag.content_encoding.as_ref())
+        .map(|tag| tag.etag.clone());
     let (mut parts, body) = response.into_parts();
-    let bytes = match to_bytes(body, MAX_BUFFERED_BODY_BYTES).await {
-        Ok(bytes) => bytes,
-        Err(err) => {
-            tracing::error!(%err, "web response body read failed");
-            return with_cache_control(
-                StatusCode::INTERNAL_SERVER_ERROR.into_response(),
-                UNCACHEABLE_CACHE_CONTROL,
-            );
+    let (etag, body) = match precomputed {
+        Some(etag) => {
+            // The body is complete bytes from the cache; its exact size
+            // hint is what the buffered path would have measured.
+            if let Some(len) = body.size_hint().exact() {
+                parts.headers.insert(CONTENT_LENGTH, HeaderValue::from(len));
+            }
+            (etag, body)
+        }
+        None => {
+            let bytes = match to_bytes(body, MAX_BUFFERED_BODY_BYTES).await {
+                Ok(bytes) => bytes,
+                Err(err) => {
+                    tracing::error!(%err, "web response body read failed");
+                    return with_cache_control(
+                        StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+                        UNCACHEABLE_CACHE_CONTROL,
+                    );
+                }
+            };
+            parts
+                .headers
+                .insert(CONTENT_LENGTH, HeaderValue::from(bytes.len()));
+            (strong_etag(&bytes), Body::from(bytes))
         }
     };
-    let etag = strong_etag(&bytes);
     parts.headers.insert(ETAG, etag.clone());
     parts
         .headers
@@ -104,10 +139,7 @@ pub async fn web_cache_headers(req: Request, next: Next) -> Response {
         return not_modified;
     }
 
-    parts
-        .headers
-        .insert(CONTENT_LENGTH, HeaderValue::from(bytes.len()));
-    Response::from_parts(parts, Body::from(bytes))
+    Response::from_parts(parts, body)
 }
 
 fn with_cache_control(mut response: Response, value: &'static str) -> Response {
@@ -125,7 +157,9 @@ fn requested_version(query: Option<&str>) -> Option<i64> {
         .and_then(|(_, value)| value.parse::<i64>().ok())
 }
 
-fn strong_etag(bytes: &[u8]) -> HeaderValue {
+/// A strong ETag: the first 16 bytes of SHA-256 over the wire bytes, hex.
+/// The API cache digests precompressed values with this same function.
+pub(crate) fn strong_etag(bytes: &[u8]) -> HeaderValue {
     let digest = Sha256::digest(bytes);
     let mut tag = String::with_capacity(34);
     tag.push('"');
@@ -273,6 +307,108 @@ mod tests {
                 get(|| async { EncodedJson::identity(Bytes::from_static(br#"{"n":3}"#)) }),
             )
             .layer(axum::middleware::from_fn(web_cache_headers))
+    }
+
+    fn precomputed_router() -> Router {
+        use tower_http::compression::CompressionLayer;
+        const GZIP_BODY: &[u8] = b"not really gzip but served as such, long enough to compress";
+        const PLAIN_BODY: &[u8] =
+            br#"{"n":1,"padding":"................................................"}"#;
+        Router::new()
+            .route(
+                "/api/v2/web/gzip",
+                get(|| async {
+                    EncodedJson::gzip(Bytes::from_static(GZIP_BODY))
+                        .with_etag(Some(strong_etag(GZIP_BODY)))
+                }),
+            )
+            .route(
+                "/api/v2/web/wrong-tag",
+                get(|| async {
+                    EncodedJson::gzip(Bytes::from_static(GZIP_BODY))
+                        .with_etag(Some(HeaderValue::from_static("\"stale\"")))
+                }),
+            )
+            .route(
+                "/api/v2/web/plain",
+                get(|| async {
+                    EncodedJson::identity(Bytes::from_static(PLAIN_BODY))
+                        .with_etag(Some(strong_etag(PLAIN_BODY)))
+                }),
+            )
+            .layer(CompressionLayer::new())
+            .layer(axum::middleware::from_fn(web_cache_headers))
+    }
+
+    #[tokio::test]
+    async fn precomputed_etags_are_used_verbatim_and_answer_304() {
+        let router = precomputed_router();
+        let body_bytes = b"not really gzip but served as such, long enough to compress";
+        let expected = strong_etag(body_bytes);
+
+        let response = get_with(&router, "/api/v2/web/gzip", &[("accept-encoding", "gzip")]).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(header(&response, "etag"), Some(expected.to_str().unwrap()));
+        assert_eq!(header(&response, "content-encoding"), Some("gzip"));
+        assert_eq!(header(&response, "cache-control"), Some(LIVE_CACHE_CONTROL));
+        assert_eq!(header(&response, "vary"), Some("accept-encoding"));
+        assert_eq!(
+            header(&response, "content-length"),
+            Some(body_bytes.len().to_string().as_str())
+        );
+        assert_eq!(body(response).await, Bytes::from_static(body_bytes));
+
+        let not_modified = get_with(
+            &router,
+            "/api/v2/web/gzip",
+            &[
+                ("accept-encoding", "gzip"),
+                ("if-none-match", expected.to_str().unwrap()),
+            ],
+        )
+        .await;
+        assert_eq!(not_modified.status(), StatusCode::NOT_MODIFIED);
+        assert_eq!(
+            header(&not_modified, "etag"),
+            Some(expected.to_str().unwrap())
+        );
+        assert!(body(not_modified).await.is_empty());
+
+        // The tag is trusted as given: the layer never rehashes a body
+        // whose encoding still matches, so the cache must digest the
+        // exact wire bytes (which the cache tests pin).
+        let wrong = get_with(&router, "/api/v2/web/wrong-tag", &[]).await;
+        assert_eq!(header(&wrong, "etag"), Some("\"stale\""));
+    }
+
+    #[tokio::test]
+    async fn precomputed_etag_is_dropped_when_the_body_was_re_encoded() {
+        let router = precomputed_router();
+        let plain = br#"{"n":1,"padding":"................................................"}"#;
+        let precomputed = strong_etag(plain);
+
+        // No compression negotiated: identity bytes, precomputed tag holds.
+        let identity = get_with(&router, "/api/v2/web/plain", &[]).await;
+        assert!(header(&identity, "content-encoding").is_none());
+        assert_eq!(
+            header(&identity, "etag"),
+            Some(precomputed.to_str().unwrap())
+        );
+        assert_eq!(
+            header(&identity, "content-length"),
+            Some(plain.len().to_string().as_str())
+        );
+
+        // The compression layer gzips the identity body: the tag made for
+        // the plain bytes no longer describes the wire bytes and the layer
+        // hashes what it actually sends.
+        let compressed =
+            get_with(&router, "/api/v2/web/plain", &[("accept-encoding", "gzip")]).await;
+        assert_eq!(header(&compressed, "content-encoding"), Some("gzip"));
+        let etag = header(&compressed, "etag").unwrap().to_owned();
+        assert_ne!(etag, precomputed.to_str().unwrap());
+        let wire = body(compressed).await;
+        assert_eq!(etag, strong_etag(&wire).to_str().unwrap());
     }
 
     #[tokio::test]
@@ -446,9 +582,12 @@ mod tests {
             let part = |name: &str, v: i64| format!("{base}/{name}?interval=60&v={v}");
             let gzip = [("accept-encoding", "gzip, br")];
 
-            // Fresh fetch (accepted into the cache), then a cache hit.
+            // Fresh fetch (accepted into the cache), then a cache hit. The
+            // precomputed tag on both is the digest of the gzip wire bytes,
+            // exactly what hashing the body would give, and answers 304.
             let mut first = Vec::new();
             for name in ["top100", "borders", "growth"] {
+                let mut tags = Vec::new();
                 for _ in 0..2 {
                     let response = get_with(&router, &part(name, epoch), &gzip).await;
                     assert_eq!(response.status(), StatusCode::OK, "{name}");
@@ -458,7 +597,28 @@ mod tests {
                         Some(VERSIONED_CACHE_CONTROL),
                         "{name}"
                     );
+                    assert!(
+                        response.extensions().get::<PrecomputedEtag>().is_some(),
+                        "{name}"
+                    );
+                    let etag = header(&response, "etag").unwrap().to_owned();
+                    let length: usize = header(&response, "content-length")
+                        .unwrap()
+                        .parse()
+                        .unwrap();
+                    let wire = body(response).await;
+                    assert_eq!(wire.len(), length, "{name}");
+                    assert_eq!(etag, strong_etag(&wire).to_str().unwrap(), "{name}");
+                    tags.push(etag);
                 }
+                assert_eq!(tags[0], tags[1], "{name}");
+                let revalidated = get_with(
+                    &router,
+                    &part(name, epoch),
+                    &[("accept-encoding", "gzip, br"), ("if-none-match", &tags[0])],
+                )
+                .await;
+                assert_eq!(revalidated.status(), StatusCode::NOT_MODIFIED, "{name}");
                 let plain = get_with(&router, &part(name, epoch), &[]).await;
                 // Identity bodies are served too, but never immutable.
                 assert_eq!(header(&plain, "cache-control"), Some(LIVE_CACHE_CONTROL));

@@ -17,13 +17,13 @@ use tokio_cron_scheduler::{Job, JobScheduler, JobSchedulerError};
 use crate::api::cache::ApiCache;
 use crate::api::limiter::ApiQueryLimiter;
 use crate::api::private_lookup::PrivateLookupVerifier;
-use crate::api::realtime::RealtimeHub;
+use crate::api::realtime::{RealtimeHub, RealtimeSettings};
 use crate::api::state::{AppState, ClusterState};
 use crate::api::ws_ticket::WsTicketStore;
 use crate::cluster::subscriber::{SubscriberConfig, SubscriberDeps};
 use crate::cluster::{ClusterLink, UpdateBus};
 use crate::config::{ClusterRole, Config, RedisConfig, ServerConfig};
-use crate::db::engine::{DatabaseEngine, EngineError};
+use crate::db::engine::{DatabaseEngine, EngineError, EngineRole};
 use crate::model::enums::SekaiServerRegion;
 use crate::privacy::UidAnonymizer;
 use crate::sekai_api::client::{BuildError as SekaiClientError, HarukiSekaiAPIClient};
@@ -64,9 +64,7 @@ pub async fn build(cfg: &Config) -> Result<AppContext, BootstrapError> {
     validate_cluster_config(cfg)?;
     let anonymizer = build_anonymizer(cfg)?;
     let private_lookup = PrivateLookupVerifier::from_config(&cfg.toolbox);
-    let realtime = RealtimeHub::with_min_push_interval(std::time::Duration::from_secs(
-        cfg.realtime.push_min_interval_secs,
-    ));
+    let realtime = RealtimeHub::with_settings(RealtimeSettings::from(&cfg.realtime));
     // A reader never tracks, whatever the per-server flags say.
     let tracker_enabled = !role.is_reader()
         && cfg
@@ -297,8 +295,13 @@ async fn configure_server(
         return Ok(());
     }
     tracing::info!(%server, read_only = role.is_reader(), "connecting database");
+    let engine_role = if role.is_writer() {
+        EngineRole::Writer
+    } else {
+        EngineRole::Serving
+    };
     let engine = Arc::new(
-        DatabaseEngine::connect(&server_cfg.db)
+        DatabaseEngine::connect(&server_cfg.db, engine_role)
             .await?
             .with_read_only(role.is_reader()),
     );

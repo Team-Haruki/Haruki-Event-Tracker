@@ -10,7 +10,7 @@ use std::time::Instant;
 
 use bytes::Bytes;
 
-use haruki_event_tracker::db::engine::DatabaseEngine;
+use haruki_event_tracker::db::engine::{DatabaseEngine, EngineRole};
 use haruki_event_tracker::db::query::batch::batch_insert_event_rankings;
 use haruki_event_tracker::db::query::growth::fetch_ranking_score_growths;
 use haruki_event_tracker::db::query::lines::fetch_ranking_lines;
@@ -240,7 +240,9 @@ async fn main() {
         dsn: format!("sqlite://{db_path}?mode=rwc"),
         ..Default::default()
     };
-    let engine = DatabaseEngine::connect(&cfg).await.expect("connect");
+    let engine = DatabaseEngine::connect(&cfg, EngineRole::Serving)
+        .await
+        .expect("connect");
     create_event_tables(&engine, SekaiServerRegion::Jp, EVENT_ID, false)
         .await
         .expect("schema");
@@ -291,6 +293,7 @@ async fn main() {
     time_iters("search_user_trace (full history)", 50, || async {
         search_user_trace(
             &engine,
+            SekaiServerRegion::Jp,
             EVENT_ID,
             "10000005",
             &trace_filter,

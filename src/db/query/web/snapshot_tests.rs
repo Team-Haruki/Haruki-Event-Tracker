@@ -11,12 +11,12 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use sea_orm::{ConnectionTrait, DatabaseBackend};
 
 use crate::db::engine::DatabaseEngine;
-use crate::db::query::batch::batch_insert_flush;
+use crate::db::query::batch::{UserMemo, batch_insert_flush};
 use crate::db::query::edge::tests::{Rng, quiet_connect};
 use crate::db::query::user::PublicUserIdMode;
 use crate::db::query::web::{
-    RankSnapshotCut, RankingPageRow, WorldBloomRankingPageRow, latest_rank_cut, rank_snapshot_rows,
-    user_rank_as_of, world_bloom_rank_snapshot_rows,
+    RankSnapshotCut, RankingPageRow, UserProjection, WorldBloomRankingPageRow, latest_rank_cut,
+    rank_snapshot_rows, user_rank_as_of, world_bloom_rank_snapshot_rows,
 };
 use crate::db::schema::create_event_tables;
 use crate::db::table_name::{TableKind, intern};
@@ -233,7 +233,7 @@ async fn run_generated(engine: &DatabaseEngine, first_event_id: i64, seeds: u64)
                 &records,
                 &[],
                 &mut HashMap::new(),
-                &mut HashMap::new(),
+                &mut UserMemo::default(),
             )
             .await
             .unwrap();
@@ -247,9 +247,10 @@ async fn run_generated(engine: &DatabaseEngine, first_event_id: i64, seeds: u64)
                 at: None,
                 as_of_time_id: latest_rank_cut(engine, event_id, None).await.unwrap(),
             };
-            let snapshot = rank_snapshot_rows(engine, event_id, &top, cut, mode)
-                .await
-                .unwrap();
+            let snapshot =
+                rank_snapshot_rows(engine, event_id, &top, cut, mode, UserProjection::Profile)
+                    .await
+                    .unwrap();
             let context = format!("seed {seed} flush {index}");
             assert_one_rank_per_player(&snapshot, &context);
             assert_eq!(
@@ -264,9 +265,16 @@ async fn run_generated(engine: &DatabaseEngine, first_event_id: i64, seeds: u64)
             for _ in 0..4 {
                 let n = rng.range(1, TOP);
                 let ranks: Vec<i64> = (n - 1..=n + 1).filter(|r| *r >= 1).collect();
-                let part = rank_snapshot_rows(engine, event_id, &ranks, cut, mode)
-                    .await
-                    .unwrap();
+                let part = rank_snapshot_rows(
+                    engine,
+                    event_id,
+                    &ranks,
+                    cut,
+                    mode,
+                    UserProjection::Profile,
+                )
+                .await
+                .unwrap();
                 let expected: BTreeMap<_, _> = full
                     .iter()
                     .filter(|(rank, _)| ranks.contains(rank))
@@ -307,9 +315,10 @@ async fn run_generated(engine: &DatabaseEngine, first_event_id: i64, seeds: u64)
                 at: None,
                 as_of_time_id: cut_time_id,
             };
-            let again = rank_snapshot_rows(engine, event_id, &top, cut, mode)
-                .await
-                .unwrap();
+            let again =
+                rank_snapshot_rows(engine, event_id, &top, cut, mode, UserProjection::Profile)
+                    .await
+                    .unwrap();
             assert_eq!(
                 snapshot_map(&again),
                 snapshot_map(&before),
@@ -358,7 +367,7 @@ async fn world_bloom_snapshot_drops_stale_occupant_and_honours_cut() {
     let anonymizer = UidAnonymizer::enabled("snapshot-test");
     let mode = PublicUserIdMode::Raw;
     let mut state = HashMap::new();
-    let mut keys = HashMap::new();
+    let mut keys = UserMemo::default();
     // t0: 1 -> rank 99, 2 -> rank 100. t1: player 1 drops to 100 but rank
     // 99 (now player 3) is only written at t2, in a later flush.
     for flush in [
@@ -394,10 +403,17 @@ async fn world_bloom_snapshot_drops_stale_occupant_and_honours_cut() {
         .await
         .unwrap();
     assert_eq!(latest, Some(T0 + 2));
-    let rows =
-        world_bloom_rank_snapshot_rows(&engine, event_id, CHARACTER, &ranks, at(latest), mode)
-            .await
-            .unwrap();
+    let rows = world_bloom_rank_snapshot_rows(
+        &engine,
+        event_id,
+        CHARACTER,
+        &ranks,
+        at(latest),
+        mode,
+        UserProjection::Profile,
+    )
+    .await
+    .unwrap();
     assert_eq!(view(rows), vec![(99, "3".into()), (100, "1".into())]);
 
     // At the middle cut rank 99 still names player 1, who is at 100 by
@@ -409,6 +425,7 @@ async fn world_bloom_snapshot_drops_stale_occupant_and_honours_cut() {
         &ranks,
         at(Some(T0 + 1)),
         mode,
+        UserProjection::Profile,
     )
     .await
     .unwrap();
@@ -452,7 +469,7 @@ async fn flush_writes_main_and_world_bloom_rows_atomically() {
         &main,
         &wl,
         &mut state,
-        &mut HashMap::new(),
+        &mut UserMemo::default(),
     )
     .await;
     assert!(result.is_err(), "the chapter insert must fail");
@@ -507,7 +524,7 @@ async fn a_large_backlog_flushes_in_one_transaction() {
         &main,
         &wl,
         &mut HashMap::new(),
-        &mut HashMap::new(),
+        &mut UserMemo::default(),
     )
     .await
     .unwrap();
