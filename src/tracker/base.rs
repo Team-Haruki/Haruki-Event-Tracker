@@ -18,7 +18,10 @@ use thiserror::Error;
 
 use crate::db::engine::DatabaseEngine;
 use crate::db::privacy::ensure_user_table_extensions;
-use crate::db::query::batch::{batch_insert_flush, batch_upsert_event_users};
+use crate::db::query::batch::{
+    FlushBatch, SampleRow, UserDimRow, UserMemo, WorldBloomSampleRow, batch_upsert_event_users,
+    flush_batch,
+};
 use crate::db::query::heartbeat::{fetch_latest_heartbeat, write_heartbeat};
 use crate::db::schema::create_event_tables;
 use crate::model::enums::{SekaiEventType, SekaiServerRegion};
@@ -37,6 +40,7 @@ use crate::tracker::diff::{
     merge_rankings,
 };
 use crate::tracker::invalidation::CacheInvalidation;
+use crate::tracker::pending::{FlushChunk, PendingBuffer};
 use crate::tracker::state::{
     check_event_ended_flag, load_rank_state, save_rank_state, set_event_ended_flag,
 };
@@ -127,13 +131,14 @@ pub struct EventTrackerBase {
     /// (fresh process) falls back to Redis to resume across restarts.
     last_border_hash: Option<[u8; 32]>,
     /// Diffed-but-not-yet-flushed rows, each keeping its own sample
-    /// timestamp. `prev_rank_state` / `wl_sample_state` advance at *sample*
-    /// time so the next tick diffs against what is already pending; Redis
-    /// `rank_state` and the border hash advance only on flush, so a crash
-    /// loses at most one window of intermediate points and converges on
-    /// restart exactly like a failed write does today.
-    pending_records: Vec<PlayerEventRankingRecordSchema>,
-    pending_wl_rows: Vec<PlayerWorldBloomRankingRecordSchema>,
+    /// timestamp, plus the newest profile of each user whose stored row
+    /// needs rewriting. `prev_rank_state` / `wl_sample_state` advance at
+    /// *sample* time so the next tick diffs against what is already
+    /// pending; Redis `rank_state` and the border hash advance only once
+    /// the buffer is fully flushed, so a crash loses at most one window of
+    /// intermediate points and converges on restart exactly like a failed
+    /// write does today.
+    pending: PendingBuffer,
     pending_changed_ranks: HashMap<i64, RankState>,
     pending_border_cache: Option<(String, [u8; 32])>,
     pending_since: Option<i64>,
@@ -145,10 +150,13 @@ pub struct EventTrackerBase {
     /// dedupe rows that are still pending in memory — this map can.
     wl_sample_state: HashMap<(i64, i64), PlayerState>,
     prev_world_bloom_state: HashMap<WorldBloomKey, PlayerState>,
-    /// `uid -> user_id_key` learned from earlier ticks. Lets the World Bloom
-    /// pre-diff drop unchanged rows before their profiles are deep-cloned
-    /// and serialized; misses just mean the row is treated as changed.
-    wl_user_keys: HashMap<i64, i64>,
+    /// What this writer knows the users table to hold (`uid -> key` and
+    /// dimension values), fed by every committed flush. Lets the World
+    /// Bloom pre-diff drop unchanged rows before their profiles are
+    /// deep-cloned and serialized, and lets a flush skip the users
+    /// read-back and upsert for users whose profile did not change; misses
+    /// just mean the user is treated as changed.
+    user_memo: UserMemo,
 }
 
 impl EventTrackerBase {
@@ -193,8 +201,7 @@ impl EventTrackerBase {
             last_border_failure_warn_at: None,
             border_retry_after: None,
             last_border_hash: None,
-            pending_records: Vec::new(),
-            pending_wl_rows: Vec::new(),
+            pending: PendingBuffer::default(),
             pending_changed_ranks: HashMap::new(),
             pending_border_cache: None,
             pending_since: None,
@@ -202,7 +209,7 @@ impl EventTrackerBase {
             wl_sample_state: HashMap::new(),
             prev_rank_state: HashMap::new(),
             prev_world_bloom_state: HashMap::new(),
-            wl_user_keys: HashMap::new(),
+            user_memo: UserMemo::default(),
         }
     }
 
@@ -337,6 +344,7 @@ impl EventTrackerBase {
             self.event_id,
             &self.anonymizer,
             &records,
+            &mut self.user_memo,
         )
         .await
         {
@@ -466,22 +474,30 @@ impl EventTrackerBase {
                     .map(|(rank, state)| (*rank, state.clone())),
             );
             self.pending_changed_ranks.extend(changed_ranks);
-            self.pending_records.extend(records);
+            for r in &records {
+                if let Some(row) = self.buffer_profile(r) {
+                    self.pending.push_main(row);
+                }
+            }
         }
 
         let wl_rows = self.build_world_bloom_records(data);
-        for row in &wl_rows {
-            if let Ok(uid) = row.base.user_id.parse::<i64>() {
-                self.wl_sample_state.insert(
-                    (row.character_id, uid),
-                    PlayerState {
-                        score: row.base.score,
-                        rank: row.base.rank,
-                    },
-                );
-            }
+        for r in &wl_rows {
+            let Some(row) = self.buffer_profile(&r.base) else {
+                continue;
+            };
+            self.wl_sample_state.insert(
+                (r.character_id, row.uid),
+                PlayerState {
+                    score: row.score,
+                    rank: row.rank,
+                },
+            );
+            self.pending.push_world_bloom(WorldBloomSampleRow {
+                row,
+                character_id: r.character_id,
+            });
         }
-        self.pending_wl_rows.extend(wl_rows);
 
         if !only_world_bloom && let Some((cache_key, border_hash)) = &data.border_cache {
             // Sample-time advance dedups the merge on following ticks; the
@@ -495,61 +511,62 @@ impl EventTrackerBase {
         }
     }
 
+    /// The compact row of a diffed record, after offering its dimension
+    /// values to the pending buffer (kept only if the memo does not
+    /// already hold them). Records come from the diff with numeric ids;
+    /// anything else cannot be stored and is dropped with a warning.
+    fn buffer_profile(&mut self, r: &PlayerEventRankingRecordSchema) -> Option<SampleRow> {
+        let row = match SampleRow::from_record(r) {
+            Ok(row) => row,
+            Err(err) => {
+                tracing::warn!(%err, "dropping a ranking row with a non-numeric user id");
+                return None;
+            }
+        };
+        let info = UserDimRow::from_record(self.server, self.event_id, &self.anonymizer, r);
+        self.pending
+            .offer_profile(row.uid, row.timestamp, info, &self.user_memo);
+        Some(row)
+    }
+
     fn has_pending_rows(&self) -> bool {
-        !self.pending_records.is_empty() || !self.pending_wl_rows.is_empty()
+        !self.pending.is_empty()
     }
 
     fn should_flush(&self, now: i64, force: bool) -> bool {
         if force || self.tuning.flush_interval_secs == 0 || self.pending_hot {
             return true;
         }
-        if self.pending_records.len() + self.pending_wl_rows.len() >= self.tuning.flush_max_rows {
+        if self.pending.rows() >= self.tuning.flush_max_rows {
             return true;
         }
         should_refresh_after_end(self.pending_since, now, self.tuning.flush_interval_secs)
     }
 
-    /// Write the pending buffer in one transaction (`batch_insert_flush`).
-    /// On success the flushed-state
-    /// side effects run (Redis `rank_state`, border hash, epoch bump); on
-    /// failure the rows are put back and retried on the next flush trigger.
+    /// Write the pending buffer (`flush_batch`), one transaction per chunk
+    /// of at most `flush_max_rows` rows cut at sample boundaries — a
+    /// backlog left by a long outage drains in bounded transactions that
+    /// each fit the write timeout, and a reader still sees whole samples.
+    /// Once the buffer is empty the flushed-state side effects run (Redis
+    /// `rank_state`, border hash); on failure the chunk is put back and
+    /// retried on the next flush trigger.
     async fn flush_pending(
         &mut self,
         write_idle_heartbeat: bool,
         now: i64,
     ) -> Result<bool, TrackerError> {
-        let records = std::mem::take(&mut self.pending_records);
-        let wl_rows = std::mem::take(&mut self.pending_wl_rows);
-        let will_write = !records.is_empty() || !wl_rows.is_empty();
-        self.begin_cache_update(will_write).await;
-        let outcome = match batch_insert_flush(
-            &self.db,
-            self.server,
-            self.event_id,
-            &self.anonymizer,
-            &records,
-            &wl_rows,
-            &mut self.prev_world_bloom_state,
-            &mut self.wl_user_keys,
-        )
-        .await
-        {
-            Ok(outcome) => outcome,
-            Err(err) => {
-                self.abort_cache_update("failed to clear API cache dirty after insert error")
-                    .await;
-                self.pending_records = records;
-                self.pending_wl_rows = wl_rows;
-                return Err(err.into());
+        let mut wrote = false;
+        loop {
+            wrote |= self.flush_chunk(write_idle_heartbeat, now).await?;
+            if !self.has_pending_rows() {
+                break;
             }
-        };
-        let batch_called = outcome.wrote_rows();
-        if will_write && !batch_called {
-            self.abort_cache_update("failed to clear API cache dirty after no-op flush")
-                .await;
+            tracing::info!(
+                pending_main = self.pending.main_len(),
+                pending_world_bloom = self.pending.world_bloom_len(),
+                "flushed a backlog chunk; draining the rest"
+            );
         }
-        self.complete_cache_update(batch_called, outcome.lsn, write_idle_heartbeat, now)
-            .await?;
 
         let changed_ranks = std::mem::take(&mut self.pending_changed_ranks);
         if !changed_ranks.is_empty()
@@ -565,6 +582,48 @@ impl EventTrackerBase {
         }
         self.pending_since = None;
         self.pending_hot = false;
+        Ok(wrote)
+    }
+
+    /// One flush transaction: the oldest whole samples up to
+    /// `flush_max_rows` rows. Returns whether it wrote rows.
+    async fn flush_chunk(
+        &mut self,
+        write_idle_heartbeat: bool,
+        now: i64,
+    ) -> Result<bool, TrackerError> {
+        let chunk: FlushChunk = self.pending.take_chunk(self.tuning.flush_max_rows);
+        let will_write = !chunk.is_empty();
+        self.begin_cache_update(will_write).await;
+        let outcome = match flush_batch(
+            &self.db,
+            self.event_id,
+            FlushBatch {
+                main: &chunk.main,
+                world_bloom: &chunk.world_bloom,
+                profiles: self.pending.profiles(),
+            },
+            &mut self.prev_world_bloom_state,
+            &mut self.user_memo,
+        )
+        .await
+        {
+            Ok(outcome) => outcome,
+            Err(err) => {
+                self.abort_cache_update("failed to clear API cache dirty after insert error")
+                    .await;
+                self.pending.put_back(chunk);
+                return Err(err.into());
+            }
+        };
+        self.pending.forget_flushed(&chunk, &self.user_memo);
+        let batch_called = outcome.wrote_rows();
+        if will_write && !batch_called {
+            self.abort_cache_update("failed to clear API cache dirty after no-op flush")
+                .await;
+        }
+        self.complete_cache_update(batch_called, outcome.lsn, write_idle_heartbeat, now)
+            .await?;
         Ok(batch_called)
     }
 
@@ -577,8 +636,8 @@ impl EventTrackerBase {
             return;
         }
         tracing::info!(
-            pending_main = self.pending_records.len(),
-            pending_world_bloom = self.pending_wl_rows.len(),
+            pending_main = self.pending.main_len(),
+            pending_world_bloom = self.pending.world_bloom_len(),
             "flushing pending rows before shutdown"
         );
         if let Err(err) = self.flush_pending(false, Utc::now().timestamp()).await {
@@ -617,7 +676,7 @@ impl EventTrackerBase {
                 {
                     return true;
                 }
-                let Some(&user_id_key) = self.wl_user_keys.get(&uid) else {
+                let Some(user_id_key) = self.user_memo.user_id_key(uid) else {
                     return false;
                 };
                 self.prev_world_bloom_state
@@ -872,6 +931,7 @@ pub(crate) mod tests {
     use std::sync::atomic::{AtomicI64, Ordering};
 
     use crate::db::entity::time_id;
+    use crate::db::query::batch::UserMemoEntry;
     use crate::db::query::lines::fetch_ranking_lines;
     use crate::db::table_name::{TableKind, intern};
 
@@ -985,7 +1045,16 @@ pub(crate) mod tests {
 
         let world_bloom = tracker.build_world_bloom_records(&data);
         assert_eq!(world_bloom.len(), 1);
-        tracker.wl_user_keys.insert(200, 7);
+        tracker.user_memo.insert(
+            200,
+            UserMemoEntry {
+                user_id_key: 7,
+                name: "player-200".into(),
+                cheerful_team_id: None,
+                unique_id: None,
+                profile_hash: None,
+            },
+        );
         tracker.prev_world_bloom_state.insert(
             WorldBloomKey {
                 user_id_key: 7,
@@ -1069,7 +1138,7 @@ pub(crate) mod tests {
                 .await
                 .unwrap()
         );
-        assert_eq!(tracker.pending_records.len(), 2);
+        assert_eq!(tracker.pending.main_len(), 2);
         assert_eq!(tracker.pending_since, Some(t));
         assert_eq!(tracker.prev_rank_state[&50].score, 1_100);
 
@@ -1080,7 +1149,7 @@ pub(crate) mod tests {
                 .await
                 .unwrap()
         );
-        assert!(tracker.pending_records.is_empty());
+        assert!(tracker.pending.is_empty());
         assert_eq!(tracker.pending_since, None);
 
         // A change touching a hot rank flushes without waiting.
@@ -1098,7 +1167,7 @@ pub(crate) mod tests {
                 .unwrap()
         );
         assert!(!tracker.pending_hot);
-        assert!(tracker.pending_records.is_empty());
+        assert!(tracker.pending.is_empty());
     }
 
     static BORDER_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -1212,7 +1281,7 @@ pub(crate) mod tests {
                     .unwrap()
             );
         }
-        assert_eq!(tracker.pending_records.len(), 2);
+        assert_eq!(tracker.pending.main_len(), 2);
         // Upstream failure while the two samples are still buffered.
         tracker.write_status_heartbeat(t + 2, 1).await.unwrap();
         assert!(
@@ -1272,7 +1341,7 @@ pub(crate) mod tests {
                 .await
                 .unwrap()
         );
-        assert_eq!(tracker.wl_user_keys.len(), 1);
+        assert_eq!(tracker.user_memo.len(), 1);
         assert_eq!(tracker.prev_world_bloom_state.len(), 1);
         assert_eq!(tracker.wl_sample_state.len(), 1);
 
