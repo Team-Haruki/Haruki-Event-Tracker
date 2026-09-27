@@ -10,6 +10,7 @@ use axum_server::tls_rustls::{RustlsAcceptor, RustlsConfig};
 use haruki_event_tracker::db::engine::{DatabaseEngine, EngineRole};
 use haruki_event_tracker::db::maintenance;
 use haruki_event_tracker::db::repair::repair_time_ids;
+use haruki_event_tracker::db::schema::{CoveringIndexAction, create_covering_indexes};
 use haruki_event_tracker::model::enums::SekaiServerRegion;
 use haruki_event_tracker::tracker::parser::EventDataParser;
 use haruki_event_tracker::{api, app, config, logger, shutdown};
@@ -28,6 +29,9 @@ async fn main() -> ExitCode {
         Some(REPAIR_TIME_IDS) => return repair_time_ids_cli(std::env::args().skip(2)).await,
         Some(VACUUM_FINISHED_EVENTS) => {
             return vacuum_finished_events_cli(std::env::args().skip(2)).await;
+        }
+        Some(CREATE_COVERING_INDEXES) => {
+            return create_covering_indexes_cli(std::env::args().skip(2)).await;
         }
         _ => {}
     }
@@ -158,11 +162,18 @@ async fn main() -> ExitCode {
 
 const REPAIR_TIME_IDS: &str = "repair-time-ids";
 const REPAIR_USAGE: &str = "usage: haruki-event-tracker repair-time-ids --region <jp|en|tw|kr|cn> --event <id> [--dry-run] [--config <uri>]";
+const CREATE_COVERING_INDEXES: &str = "create-covering-indexes";
+const COVERING_USAGE: &str = "usage: haruki-event-tracker create-covering-indexes --region <jp|en|tw|kr|cn> [--event <id>] [--dry-run] [--config <uri>]";
 
-/// `repair-time-ids`: restore `time_id` order == `timestamp` order for one
-/// event (see `db::repair`). Runs against the region's configured DB, in
-/// one transaction; `--dry-run` only reports.
-async fn repair_time_ids_cli(args: impl Iterator<Item = String>) -> ExitCode {
+/// The arguments the maintenance subcommands share.
+struct OpsArgs {
+    region: SekaiServerRegion,
+    event_id: Option<i64>,
+    dry_run: bool,
+    cfg_location: String,
+}
+
+fn parse_ops_args(args: impl Iterator<Item = String>, usage: &str) -> Result<OpsArgs, ExitCode> {
     let mut region = None;
     let mut event_id = None;
     let mut dry_run = false;
@@ -180,33 +191,63 @@ async fn repair_time_ids_cli(args: impl Iterator<Item = String>) -> ExitCode {
             "--config" => cfg_location = value(),
             "--dry-run" => dry_run = true,
             _ => {
-                eprintln!("unknown argument {key}\n{REPAIR_USAGE}");
-                return ExitCode::from(2);
+                eprintln!("unknown argument {key}\n{usage}");
+                return Err(ExitCode::from(2));
             }
         }
     }
-    let (Some(region), Some(event_id)) = (region, event_id) else {
-        eprintln!("{REPAIR_USAGE}");
-        return ExitCode::from(2);
+    let Some(region) = region else {
+        eprintln!("{usage}");
+        return Err(ExitCode::from(2));
     };
-    let cfg_location = cfg_location.unwrap_or_else(config::config_location_from_env);
-    let cfg = match config::load_from_location(&cfg_location).await {
+    Ok(OpsArgs {
+        region,
+        event_id,
+        dry_run,
+        cfg_location: cfg_location.unwrap_or_else(config::config_location_from_env),
+    })
+}
+
+/// The region's configured database, connected.
+async fn connect_region(
+    region: SekaiServerRegion,
+    cfg_location: &str,
+) -> Result<DatabaseEngine, ExitCode> {
+    let cfg = match config::load_from_location(cfg_location).await {
         Ok(c) => c,
         Err(err) => {
             eprintln!("failed to load {cfg_location}: {err}");
-            return ExitCode::from(1);
+            return Err(ExitCode::from(1));
         }
     };
     let Some(server_cfg) = cfg.servers.get(&region) else {
         eprintln!("region {region} is not configured in {cfg_location}");
-        return ExitCode::from(1);
+        return Err(ExitCode::from(1));
     };
-    let engine = match DatabaseEngine::connect(&server_cfg.db, EngineRole::Serving).await {
-        Ok(engine) => engine,
-        Err(err) => {
+    DatabaseEngine::connect(&server_cfg.db, EngineRole::Serving)
+        .await
+        .map_err(|err| {
             eprintln!("failed to connect {region} database: {err}");
-            return ExitCode::from(1);
-        }
+            ExitCode::from(1)
+        })
+}
+
+/// `repair-time-ids`: restore `time_id` order == `timestamp` order for one
+/// event (see `db::repair`). Runs against the region's configured DB, in
+/// one transaction; `--dry-run` only reports.
+async fn repair_time_ids_cli(args: impl Iterator<Item = String>) -> ExitCode {
+    let args = match parse_ops_args(args, REPAIR_USAGE) {
+        Ok(args) => args,
+        Err(code) => return code,
+    };
+    let (region, dry_run) = (args.region, args.dry_run);
+    let Some(event_id) = args.event_id else {
+        eprintln!("{REPAIR_USAGE}");
+        return ExitCode::from(2);
+    };
+    let engine = match connect_region(region, &args.cfg_location).await {
+        Ok(engine) => engine,
+        Err(code) => return code,
     };
     let result = repair_time_ids(&engine, event_id, dry_run).await;
     let _ = engine.close().await;
@@ -543,6 +584,56 @@ fn human_bytes(bytes: i64) -> String {
         format!("{bytes}{}", UNITS[unit])
     } else {
         format!("{value:.1}{}", UNITS[unit])
+    }
+}
+
+/// `create-covering-indexes`: build the trace covering indexes
+/// (`db::schema::covering_indexes`) of one event, or of every event in the
+/// region's database, with `CREATE INDEX CONCURRENTLY`, one at a time.
+/// Existing valid indexes are skipped; `--dry-run` only reports.
+/// PostgreSQL only.
+async fn create_covering_indexes_cli(args: impl Iterator<Item = String>) -> ExitCode {
+    let args = match parse_ops_args(args, COVERING_USAGE) {
+        Ok(args) => args,
+        Err(code) => return code,
+    };
+    let engine = match connect_region(args.region, &args.cfg_location).await {
+        Ok(engine) => engine,
+        Err(code) => return code,
+    };
+    let result = create_covering_indexes(&engine, args.event_id, args.dry_run).await;
+    let _ = engine.close().await;
+    match result {
+        Ok(reports) => {
+            for report in &reports {
+                let action = match (args.dry_run, report.action) {
+                    (_, CoveringIndexAction::Skipped) => "exists, skipped",
+                    (true, CoveringIndexAction::Created) => "would create",
+                    (true, CoveringIndexAction::Rebuilt) => "would drop invalid and rebuild",
+                    (false, CoveringIndexAction::Created) => "created",
+                    (false, CoveringIndexAction::Rebuilt) => "dropped invalid and rebuilt",
+                };
+                let size = report
+                    .size_bytes
+                    .map(|bytes| format!(" {:.1} MB", bytes as f64 / 1_048_576.0))
+                    .unwrap_or_default();
+                println!(
+                    "{} {} ON {}: {action}{size} ({:.1} s)",
+                    args.region,
+                    report.index.name,
+                    report.index.table,
+                    report.elapsed.as_secs_f64()
+                );
+            }
+            if reports.is_empty() {
+                println!("{}: no event tables found", args.region);
+            }
+            ExitCode::SUCCESS
+        }
+        Err(err) => {
+            eprintln!("create-covering-indexes failed: {err}");
+            ExitCode::from(1)
+        }
     }
 }
 

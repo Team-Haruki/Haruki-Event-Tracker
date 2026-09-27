@@ -381,6 +381,7 @@ async fn web_user_detail_for_scope(
             (Some(filter), Some(character_id)) => {
                 search_world_bloom_user_trace(
                     &engine,
+                    region,
                     event_id,
                     character_id,
                     &user_id,
@@ -390,7 +391,7 @@ async fn web_user_detail_for_scope(
                 .await?
             }
             (Some(filter), None) => {
-                search_user_trace(&engine, event_id, &user_id, &filter, mode).await?
+                search_user_trace(&engine, region, event_id, &user_id, &filter, mode).await?
             }
             (None, Some(character_id)) => {
                 fetch_all_world_bloom_rankings(&engine, event_id, &user_id, character_id, mode)

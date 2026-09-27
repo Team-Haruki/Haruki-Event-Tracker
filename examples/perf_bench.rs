@@ -293,6 +293,7 @@ async fn main() {
     time_iters("search_user_trace (full history)", 50, || async {
         search_user_trace(
             &engine,
+            SekaiServerRegion::Jp,
             EVENT_ID,
             "10000005",
             &trace_filter,

@@ -10,6 +10,7 @@ use sea_orm::{DbErr, ExprTrait, FromQueryResult};
 
 use crate::db::engine::DatabaseEngine;
 use crate::db::entity::{event, event_users, time_id};
+use crate::db::query::keys::col_in_keys;
 use crate::db::query::user::{PublicUserIdMode, user_key_lookup};
 use crate::db::table_name::{TableKind, intern};
 use crate::model::api::RecordedRankingSchema;
@@ -156,7 +157,11 @@ pub async fn fetch_all_rankings_by_ranks(
 
     let event_tbl = Alias::new(intern(TableKind::Event, event_id));
     let stmt = ranking_select(event_id, mode)
-        .and_where(Expr::col((event_tbl.clone(), event::Column::Rank)).is_in(ranks.to_vec()))
+        .and_where(col_in_keys(
+            engine.backend(),
+            Expr::col((event_tbl.clone(), event::Column::Rank)),
+            ranks,
+        ))
         .order_by((event_tbl.clone(), event::Column::Rank), Order::Asc)
         .order_by((event_tbl, event::Column::TimeId), Order::Asc)
         .to_owned();

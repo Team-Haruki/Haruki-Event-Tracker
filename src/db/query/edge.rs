@@ -23,6 +23,10 @@
 //!   FROM (SELECT $1 AS rank UNION ALL SELECT $2 ...) k
 //! ```
 //!
+//! (On PostgreSQL the key table is `unnest($1)` over one array parameter —
+//! `db::query::keys` — so the statement text is the same for every key
+//! count.)
+//!
 //! The timestamp bounds are translated to `time_id` bounds through the
 //! time table's unique `timestamp` index, relying on the invariant that
 //! `time_id` order == `timestamp` order (writer: `time_id = timestamp`;
@@ -37,10 +41,11 @@
 //! key, `time_id` NULL for a key without rows — so callers join it back to
 //! the ranking table exactly as before.
 
-use sea_orm::ExprTrait;
-use sea_orm::sea_query::{Alias, Expr, Order, Query, SelectStatement, UnionType};
+use sea_orm::sea_query::{Alias, Expr, Order, Query, SelectStatement};
+use sea_orm::{DatabaseBackend, ExprTrait};
 
 use crate::db::entity::time_id;
+use crate::db::query::keys::{fence, keys_select};
 
 /// Aliases private to the correlated edge subquery; callers use their own
 /// table names outside it.
@@ -95,6 +100,8 @@ pub(crate) enum Edge {
 }
 
 pub(crate) struct EdgeSpec<'a> {
+    /// Picks the key-table form (`db::query::keys`).
+    pub backend: DatabaseBackend,
     /// Ranking table (`event_<id>` or `wl_<id>`).
     pub tbl: &'static str,
     pub time_tbl: &'static str,
@@ -164,29 +171,6 @@ pub(crate) fn and_where_time_id_within(
     }
 }
 
-/// `SELECT $1 AS <col> UNION ALL SELECT $2 AS <col> ...`. Portable across
-/// PostgreSQL, SQLite and MySQL, unlike `VALUES` lists or `unnest`.
-fn key_list(keys: &[i64], col: &str) -> SelectStatement {
-    let col = Alias::new(col);
-    let mut keys = keys.iter().copied();
-    let mut stmt = Query::select();
-    let Some(first) = keys.next() else {
-        stmt.expr_as(Expr::val(0i64), col)
-            .and_where(Expr::val(1i64).eq(0i64));
-        return stmt;
-    };
-    stmt.expr_as(Expr::val(first), col.clone());
-    stmt.unions(keys.map(|key| {
-        (
-            UnionType::All,
-            Query::select()
-                .expr_as(Expr::val(key), col.clone())
-                .to_owned(),
-        )
-    }));
-    stmt
-}
-
 /// One `(key, time_id)` row per requested key, `time_id` being the key's
 /// first/last row in the window (NULL when it has none).
 pub(crate) fn edge_keys_select(spec: &EdgeSpec<'_>) -> SelectStatement {
@@ -254,17 +238,18 @@ pub(crate) fn edge_keys_select(spec: &EdgeSpec<'_>) -> SelectStatement {
         )
         .limit(1);
 
-    Query::select()
-        .expr_as(Expr::col((keys_alias.clone(), key_col.clone())), key_col)
+    let mut stmt = Query::select();
+    stmt.expr_as(Expr::col((keys_alias.clone(), key_col.clone())), key_col)
         .expr_as(Expr::SubQuery(None, Box::new(probe.into())), tid_col)
-        .from_subquery(key_list(spec.keys, spec.key_col), keys_alias)
-        // Optimisation fence (a no-op limit: one row per key): keeps
-        // PostgreSQL from pulling this derived table up into the caller's
-        // join, which would evaluate the probe as a join condition — twice
-        // per key — instead of once per key. `OFFSET 0` alone is not
-        // portable to SQLite.
-        .limit(spec.keys.len().max(1) as u64)
-        .to_owned()
+        .from_subquery(
+            keys_select(spec.backend, spec.keys, spec.key_col),
+            keys_alias,
+        );
+    // Optimisation fence: keeps PostgreSQL from pulling this derived table
+    // up into the caller's join, which would evaluate the probe as a join
+    // condition — twice per key — instead of once per key.
+    fence(spec.backend, &mut stmt, spec.keys.len());
+    stmt
 }
 
 #[cfg(test)]

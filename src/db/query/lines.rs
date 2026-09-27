@@ -14,7 +14,7 @@
 use std::collections::HashMap;
 
 use sea_orm::sea_query::{Alias, Expr, JoinType, Order, Query, SelectStatement};
-use sea_orm::{DbErr, ExprTrait, FromQueryResult};
+use sea_orm::{DatabaseBackend, DbErr, ExprTrait, FromQueryResult};
 
 use crate::db::engine::DatabaseEngine;
 use crate::db::entity::time_id;
@@ -24,6 +24,7 @@ use crate::db::table_name::{TableKind, intern};
 use crate::model::api::RankingLineScoreSchema;
 
 pub(crate) struct RankEdgeSpec {
+    pub backend: DatabaseBackend,
     pub tbl: &'static str,
     pub time_tbl: &'static str,
     /// World Bloom chapter filter; `None` on the main event table.
@@ -60,6 +61,7 @@ pub(crate) fn rank_edge_select_until(
     max_time_id: Option<i64>,
 ) -> SelectStatement {
     let edge_sub = edge_keys_select(&EdgeSpec {
+        backend: spec.backend,
         tbl: spec.tbl,
         time_tbl: spec.time_tbl,
         key_col: "rank",
@@ -265,6 +267,7 @@ pub async fn fetch_ranking_lines_at(
     cut: RankSnapshotCut,
 ) -> Result<Vec<RankingLineScoreSchema>, DbErr> {
     let spec = RankEdgeSpec {
+        backend: engine.backend(),
         tbl: intern(TableKind::Event, event_id),
         time_tbl: intern(TableKind::TimeId, event_id),
         character_id: None,
@@ -302,6 +305,7 @@ pub async fn fetch_world_bloom_ranking_lines_at(
     cut: RankSnapshotCut,
 ) -> Result<Vec<RankingLineScoreSchema>, DbErr> {
     let spec = RankEdgeSpec {
+        backend: engine.backend(),
         tbl: intern(TableKind::WorldBloom, event_id),
         time_tbl: intern(TableKind::TimeId, event_id),
         character_id: Some(character_id),
