@@ -220,13 +220,33 @@ pub struct CloudApiConfig {
     pub tokens: Vec<String>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct RealtimeConfig {
     /// Minimum spacing between WebSocket `updated` pushes per topic
     /// (seconds). Updates inside the window coalesce into one trailing
     /// push carrying the latest timestamp. `0` pushes every update.
     pub push_min_interval_secs: u64,
+    /// `online` counts are pushed at most once per this many seconds per
+    /// topic, carrying the counts at that moment. `0` pushes on every
+    /// subscribe / unsubscribe.
+    pub online_broadcast_interval_secs: u64,
+    /// Server-side WebSocket ping interval (seconds); `0` disables the
+    /// keepalive and the idle close below.
+    pub ws_ping_interval_secs: u64,
+    /// A socket that sent no frame (pong included) for this long is closed.
+    pub ws_idle_timeout_secs: u64,
+}
+
+impl Default for RealtimeConfig {
+    fn default() -> Self {
+        Self {
+            push_min_interval_secs: 0,
+            online_broadcast_interval_secs: 2,
+            ws_ping_interval_secs: 30,
+            ws_idle_timeout_secs: 75,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -442,6 +462,10 @@ mod tests {
         assert_eq!(cfg.api_cache.default_ttl_secs, 2);
         assert_eq!(cfg.api_query.trace_global_max_concurrency, 32);
         assert_eq!(cfg.backend.access_log_sample_rate, 1.0);
+        assert_eq!(cfg.realtime.push_min_interval_secs, 0);
+        assert_eq!(cfg.realtime.online_broadcast_interval_secs, 2);
+        assert_eq!(cfg.realtime.ws_ping_interval_secs, 30);
+        assert_eq!(cfg.realtime.ws_idle_timeout_secs, 75);
         assert_eq!(cfg.toolbox.verify_cache_ttl_secs, 45);
         assert_eq!(cfg.toolbox.verify_cache_max_entries, 4096);
         assert_eq!(
