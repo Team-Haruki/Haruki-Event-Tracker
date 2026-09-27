@@ -12,8 +12,8 @@ use crate::db::engine::DatabaseEngine;
 use crate::db::query::heartbeat::fetch_time_id_timestamp;
 use crate::db::query::web::RankSnapshotCut;
 use crate::model::api::{
-    LeaderboardOverviewSchema, RecordedRankData, WebRankDetailResponseSchema, WebRankingItemSchema,
-    WebSubjectSchema, WebUserDetailResponseSchema,
+    LeaderboardOverviewSchema, RecordedRankData, TraceRows, WebRankDetailResponseSchema,
+    WebRankingItemSchema, WebSubjectSchema, WebUserDetailResponseSchema,
 };
 use crate::model::enums::SekaiServerRegion;
 
@@ -21,7 +21,7 @@ use super::snapshot::{
     SnapshotBuildRequest, build_rank_snapshots_response, resolve_rank_cut, resolve_user_rank,
     snapshot_shows_user,
 };
-use super::trace::{SubjectTraceQuery, build_subject_trace_response};
+use super::trace::{SubjectTraceQuery, build_subject_trace_json, build_subject_trace_response};
 use super::util::{interval_seconds, meta, positive_timestamp, user_id_of_rank_data};
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -442,10 +442,10 @@ pub(crate) async fn web_rank_detail_for_scope(
         .into_iter()
         .find(|item| item.rank == rank)
         .ok_or(ApiError::NotFound)?;
-    let mut rank_trace = Vec::new();
+    let mut rank_trace = TraceRows::default();
     if query.include_trace.unwrap_or(false) {
         rank_trace = detail_trace(
-            build_subject_trace_response(
+            build_subject_trace_json(
                 state.clone(),
                 server.clone(),
                 event_id,
@@ -458,13 +458,13 @@ pub(crate) async fn web_rank_detail_for_scope(
             .await,
         )?;
     }
-    let mut player_trace = Vec::new();
+    let mut player_trace = TraceRows::default();
     if query.include_player_trace.unwrap_or(false)
         && let Some(current) = item.current.as_ref()
         && let Some(user_id) = user_id_of_rank_data(&current.rank_data)
     {
         player_trace = detail_trace(
-            build_subject_trace_response(
+            build_subject_trace_json(
                 state.clone(),
                 server.clone(),
                 event_id,
@@ -554,7 +554,7 @@ async fn web_user_detail_by_raw_uid(
         query,
     )
     .await?;
-    reveal_subject(&mut detail, &unique_id, &raw);
+    reveal_subject(&mut detail, &unique_id, &raw)?;
     detail.subject = Some(WebSubjectSchema {
         user_id: raw,
         unique_id,
@@ -562,11 +562,21 @@ async fn web_user_detail_by_raw_uid(
     Ok(Json(detail))
 }
 
-fn reveal_subject(detail: &mut WebUserDetailResponseSchema, unique_id: &str, raw: &str) {
+/// Raw-UID lookups are rare and never cached, so the spliced trace is
+/// decoded here to swap the subject's rows back to the raw UID.
+fn reveal_subject(
+    detail: &mut WebUserDetailResponseSchema,
+    unique_id: &str,
+    raw: &str,
+) -> Result<(), ApiError> {
     if let Some(current) = detail.current.as_mut() {
         reveal_item(current, unique_id, raw);
     }
-    for row in &mut detail.player_trace {
+    let rows = detail.player_trace.rows_mut().map_err(|err| {
+        tracing::warn!(%err, "cached subject trace failed to decode");
+        ApiError::ServiceUnavailable("api cache decode failed".into())
+    })?;
+    for row in rows {
         reveal_rank_data(row, unique_id, raw);
     }
     if let Some(profile) = detail.profile.as_mut()
@@ -574,6 +584,7 @@ fn reveal_subject(detail: &mut WebUserDetailResponseSchema, unique_id: &str, raw
     {
         profile.user_id = raw.to_owned();
     }
+    Ok(())
 }
 
 fn reveal_item(item: &mut WebRankingItemSchema, unique_id: &str, raw: &str) {
@@ -669,7 +680,7 @@ async fn web_user_detail_by_unique_id(
     };
     let player_trace = if query.include_trace.unwrap_or(false) {
         detail_trace(
-            build_subject_trace_response(
+            build_subject_trace_json(
                 state,
                 server,
                 event_id,
@@ -682,7 +693,7 @@ async fn web_user_detail_by_unique_id(
             .await,
         )?
     } else {
-        Vec::new()
+        TraceRows::default()
     };
     let (current, previous, next) = match item {
         Some(item) => (item.current, item.previous, item.next),
@@ -702,12 +713,14 @@ async fn web_user_detail_by_unique_id(
 
 /// A detail's trace is optional content: no rows in the window (typically
 /// a `cursor` poll with nothing newer) is an empty increment, not a 404.
-fn detail_trace(
-    trace: Result<crate::model::api::SubjectTraceResponseSchema, ApiError>,
-) -> Result<Vec<RecordedRankData>, ApiError> {
+/// The cached trace's `rankData` array is spliced in without decoding it.
+fn detail_trace(trace: Result<bytes::Bytes, ApiError>) -> Result<TraceRows, ApiError> {
     match trace {
-        Ok(trace) => Ok(trace.rank_data),
-        Err(ApiError::NotFound) => Ok(Vec::new()),
+        Ok(json) => TraceRows::from_trace_json(&json).map_err(|err| {
+            tracing::warn!(%err, "cached subject trace has no usable rankData");
+            ApiError::ServiceUnavailable("api cache decode failed".into())
+        }),
+        Err(ApiError::NotFound) => Ok(TraceRows::default()),
         Err(err) => Err(err),
     }
 }
@@ -879,8 +892,8 @@ mod tests {
         assert!(detail.previous.is_some());
         assert!(detail.next.is_some());
         assert!(detail.metrics.is_some());
-        assert_eq!(detail.rank_trace.len(), 2);
-        assert_eq!(detail.player_trace.len(), 2);
+        assert_eq!(detail.rank_trace.rows().len(), 2);
+        assert_eq!(detail.player_trace.rows().len(), 2);
 
         let world = web_rank_detail_for_scope(
             state.clone(),
@@ -921,7 +934,7 @@ mod tests {
         assert!(detail.current.is_some());
         assert!(detail.subject.is_none());
         assert_eq!(detail.profile.unwrap().name, "Alpha");
-        assert_eq!(detail.player_trace.len(), 2);
+        assert_eq!(detail.player_trace.rows().len(), 2);
 
         let mut without_trace = detail_query();
         without_trace.include_trace = Some(false);
@@ -967,10 +980,11 @@ mod tests {
             assert!(detail.current.is_none());
             assert!(detail.previous.is_none());
             assert!(detail.next.is_none());
-            assert_eq!(detail.player_trace.len(), 2);
+            assert_eq!(detail.player_trace.rows().len(), 2);
             assert!(
                 detail
                     .player_trace
+                    .rows()
                     .iter()
                     .all(|row| user_id_of_rank_data(row).as_deref() == Some(gamma.as_str()))
             );
@@ -1079,7 +1093,7 @@ mod tests {
             .await
             .unwrap()
             .0;
-            assert_eq!(user.player_trace.len(), 1);
+            assert_eq!(user.player_trace.rows().len(), 1);
         }
 
         // A rank nobody has held is still a 404.
@@ -1115,6 +1129,7 @@ mod tests {
         assert!(
             detail
                 .player_trace
+                .rows()
                 .iter()
                 .all(|row| { user_id_of_rank_data(row).as_deref() == Some("100") })
         );
