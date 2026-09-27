@@ -1,6 +1,6 @@
 //! Mounts the public Tracker API routes. Middleware, outermost first: panic
 //! catcher → access log → web HTTP caching (ETag / 304 / Cache-Control on
-//! `/api/v2/web/`) → compression (gzip+brotli).
+//! `/api/v2/web/`) → compression (gzip, brotli, zstd).
 
 use std::sync::Arc;
 
@@ -10,7 +10,7 @@ use axum::routing::{get, post};
 use tower_http::CompressionLevel;
 use tower_http::catch_panic::CatchPanicLayer;
 use tower_http::compression::CompressionLayer;
-use tower_http::compression::predicate::{DefaultPredicate, Predicate, SizeAbove};
+use tower_http::compression::predicate::{And, DefaultPredicate, Predicate, SizeAbove};
 
 use crate::api::access_log::{self, ProxyTrust};
 use crate::api::handler::{health, leaderboard, private, status, web};
@@ -49,21 +49,30 @@ pub fn build_router(state: AppState, trust: Arc<ProxyTrust>) -> Router {
 
     router
         .with_state(state)
-        // Without an explicit quality tower-http hands brotli its library
-        // default (quality 11, ~1 MB/s); browsers prefer br over gzip, so
-        // every large response would eat that cost inline on a worker.
-        .layer(
-            CompressionLayer::new()
-                .gzip(true)
-                .br(true)
-                .quality(CompressionLevel::Precise(4))
-                .compress_when(SizeAbove::new(1024).and(DefaultPredicate::new())),
-        )
+        .layer(compression_layer())
         // Outside compression so ETags and 304s cover the encoded bytes;
         // inside the access log so a 304 is logged as one.
         .layer(middleware::from_fn(http_cache::web_cache_headers))
         .layer(axum::middleware::from_fn_with_state(trust, access_log::log))
         .layer(CatchPanicLayer::new())
+}
+
+/// Response compression for the public surface. Bodies already carrying a
+/// `Content-Encoding` (the precompressed cached overviews) pass through
+/// untouched.
+///
+/// Level 1 everywhere: without an explicit quality tower-http hands brotli
+/// its library default (quality 11, ~1 MB/s), and even level 4 spent 2–3 ms
+/// per large detail inline on a worker. On this data zstd 1 and br 1 are
+/// both smaller and 2–5x faster than gzip 4; gzip 1 is ~19 % larger than
+/// gzip 4, which only reaches clients without br/zstd support.
+pub fn compression_layer() -> CompressionLayer<And<SizeAbove, DefaultPredicate>> {
+    CompressionLayer::new()
+        .gzip(true)
+        .br(true)
+        .zstd(true)
+        .quality(CompressionLevel::Precise(1))
+        .compress_when(SizeAbove::new(1024).and(DefaultPredicate::new()))
 }
 
 pub fn cloud_v2_routes() -> Router<AppState> {
@@ -373,6 +382,126 @@ mod tests {
             .unwrap()
             .join()
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn compression_negotiates_zstd_br_gzip_and_skips_precompressed_bodies() {
+        use axum::http::header::{ACCEPT_ENCODING, CONTENT_ENCODING};
+        use tokio::io::AsyncReadExt;
+
+        let plain =
+            serde_json::to_string(&(0..400).map(|i| (i, "x".repeat(8))).collect::<Vec<_>>())
+                .unwrap();
+        let gzipped = {
+            use std::io::Write;
+            let mut encoder =
+                flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+            encoder.write_all(plain.as_bytes()).unwrap();
+            encoder.finish().unwrap()
+        };
+        let plain_for_route = plain.clone();
+        let gzipped_for_route = gzipped.clone();
+        let app = Router::new()
+            .route(
+                "/api/v2/web/plain",
+                axum::routing::get(move || {
+                    let body = plain_for_route.clone();
+                    async move {
+                        (
+                            [(axum::http::header::CONTENT_TYPE, "application/json")],
+                            body,
+                        )
+                    }
+                }),
+            )
+            .route(
+                "/api/v2/web/precompressed",
+                axum::routing::get(move || {
+                    let body = gzipped_for_route.clone();
+                    async move {
+                        (
+                            [
+                                (axum::http::header::CONTENT_TYPE, "application/json"),
+                                (CONTENT_ENCODING, "gzip"),
+                            ],
+                            body,
+                        )
+                    }
+                }),
+            )
+            .layer(compression_layer());
+
+        async fn fetch(app: &Router, uri: &str, accept: Option<&str>) -> (Option<String>, Vec<u8>) {
+            let mut request = Request::builder().uri(uri);
+            if let Some(accept) = accept {
+                request = request.header(ACCEPT_ENCODING, accept);
+            }
+            let response = app
+                .clone()
+                .oneshot(request.body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let encoding = response
+                .headers()
+                .get(CONTENT_ENCODING)
+                .map(|value| value.to_str().unwrap().to_owned());
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            (encoding, body.to_vec())
+        }
+
+        async fn decode(encoding: Option<&str>, body: &[u8]) -> Vec<u8> {
+            let mut out = Vec::new();
+            match encoding {
+                None => out.extend_from_slice(body),
+                Some("gzip") => {
+                    async_compression::tokio::bufread::GzipDecoder::new(body)
+                        .read_to_end(&mut out)
+                        .await
+                        .unwrap();
+                }
+                Some("br") => {
+                    async_compression::tokio::bufread::BrotliDecoder::new(body)
+                        .read_to_end(&mut out)
+                        .await
+                        .unwrap();
+                }
+                Some("zstd") => {
+                    async_compression::tokio::bufread::ZstdDecoder::new(body)
+                        .read_to_end(&mut out)
+                        .await
+                        .unwrap();
+                }
+                Some(other) => panic!("unexpected encoding {other}"),
+            }
+            out
+        }
+
+        for (accept, expected) in [
+            (Some("gzip, deflate, br, zstd"), Some("zstd")),
+            (Some("br"), Some("br")),
+            (Some("gzip"), Some("gzip")),
+            (Some("identity"), None),
+            (None, None),
+        ] {
+            let (encoding, body) = fetch(&app, "/api/v2/web/plain", accept).await;
+            assert_eq!(encoding.as_deref(), expected, "accept {accept:?}");
+            if expected.is_some() {
+                assert!(body.len() < plain.len(), "accept {accept:?} did not shrink");
+            }
+            let decoded = decode(encoding.as_deref(), &body).await;
+            assert_eq!(decoded, plain.as_bytes(), "accept {accept:?}");
+        }
+
+        // A body that arrives with its own Content-Encoding is never
+        // re-encoded, whatever the client accepts.
+        for accept in [Some("gzip, br, zstd"), Some("zstd"), None] {
+            let (encoding, body) = fetch(&app, "/api/v2/web/precompressed", accept).await;
+            assert_eq!(encoding.as_deref(), Some("gzip"), "accept {accept:?}");
+            assert_eq!(body, gzipped, "accept {accept:?}");
+        }
     }
 
     #[tokio::test]
