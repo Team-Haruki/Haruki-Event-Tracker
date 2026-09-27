@@ -13,6 +13,7 @@ use sea_orm::{ConnectOptions, ConnectionTrait, Database, DatabaseBackend, FromQu
 use crate::db::engine::DatabaseEngine;
 use crate::db::query::lines::{RankEdge, RankEdgeSpec, grouped_rank_edge_select, rank_edge_select};
 use crate::db::query::ranking::{fetch_all_rankings, fetch_latest_ranking};
+use crate::db::query::score_samples::{ScoreSample, fetch_user_score_samples};
 use crate::db::query::user::PublicUserIdMode;
 use crate::db::query::web::{
     PlayerGrowthRow, RankSnapshotCut, RankingPageRow, WebRankingCursor, WebRankingFilter,
@@ -635,7 +636,7 @@ async fn check_traces(engine: &DatabaseEngine, fx: &Fixture, rng: &mut Rng) {
 
 /// The per-player lookups that resolve the player's key first
 /// (`user::user_key_lookup`) against brute force: latest row, full
-/// history and rank at a cut — by raw id and by
+/// history, rank at a cut, and the metrics samples — by raw id and by
 /// `unique_id`, for known players and ids nobody has.
 async fn check_user_lookups(engine: &DatabaseEngine, fx: &Fixture, rng: &mut Rng) {
     let user = rng.range(1, USERS + 2);
@@ -699,6 +700,24 @@ async fn check_user_lookups(engine: &DatabaseEngine, fx: &Fixture, rng: &mut Rng
         expected.last().cloned(),
         "latest wb ranking {label}"
     );
+
+    // The metrics samples: `(timestamp, score)` up to an end, oldest first.
+    let end = bound(rng, fx);
+    for (chapter, rows) in [(None, &fx.rows), (Some(character_id), &fx.wl_rows)] {
+        let expected: Vec<ScoreSample> =
+            history(rows, &|r| chapter.is_none_or(|c| r.character == c))
+                .into_iter()
+                .filter(|(ts, ..)| end.is_none_or(|end| *ts <= end))
+                .map(|(timestamp, _, score, _)| ScoreSample { timestamp, score })
+                .collect();
+        let got = fetch_user_score_samples(engine, fx.event_id, chapter, &subject, end, mode)
+            .await
+            .unwrap();
+        assert_eq!(
+            got, expected,
+            "score samples {label} chapter={chapter:?} end={end:?}"
+        );
+    }
 
     // The rank at a cut reads the ranking table alone (orphan rows count)
     // and bounds `time_id` by the cut and by the replay point's time row.

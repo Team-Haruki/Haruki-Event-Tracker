@@ -4,6 +4,7 @@ pub mod growth;
 pub mod heartbeat;
 pub mod lines;
 pub mod ranking;
+pub mod score_samples;
 pub mod user;
 pub mod web;
 pub mod world_bloom;
