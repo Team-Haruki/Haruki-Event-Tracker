@@ -4,7 +4,7 @@ use bytes::Bytes;
 use chrono::Utc;
 use serde::Deserialize;
 
-use crate::api::cache::{CacheTtl, CachedJsonEncoding};
+use crate::api::cache::{ByteSpan, CacheTtl, CachedJson, CachedJsonEncoding};
 use crate::api::error::ApiError;
 use crate::api::extract::resolve_region_engine;
 use crate::api::json::{EncodedJson, RawJson, accepts_gzip};
@@ -23,7 +23,7 @@ use crate::db::query::web::{
     search_world_bloom_user_trace, world_bloom_rank_snapshot_rows,
 };
 use crate::model::api::{
-    EventStatusResponseSchema, RecordedRankData, UserAllRankingDataQueryResponseSchema,
+    EventStatusResponseSchema, RecordedRankData, TraceRows, UserAllRankingDataQueryResponseSchema,
     WebOverviewSchema, WebRankingPageSchema, WebUserSearchPageSchema,
 };
 use crate::model::enums::{
@@ -774,16 +774,18 @@ where
 
 /// A subject trace as the cached JSON bytes of a `SubjectTraceResponseSchema`.
 /// Callers decode it (cloud, profile lookups) or splice its `rankData` array
-/// into a web detail without decoding the rows (`TraceRows::from_trace_json`).
+/// into a web detail without decoding the rows ([`cached_trace_rows`]).
 /// Cached L2 values are checked for shape (every field but the rows, plus the
-/// first row), not by decoding every row.
+/// first row), not by decoding every row; the same check locates the rows'
+/// byte range, which travels with the value in L1 so hot details slice
+/// instead of rescanning the payload.
 pub async fn cached_subject_trace_json<T, Fut>(
     state: &AppState,
     server: &str,
     event_id: i64,
     suffix: String,
     fetch: Fut,
-) -> Result<Bytes, ApiError>
+) -> Result<CachedJson, ApiError>
 where
     T: serde::Serialize,
     Fut: std::future::Future<Output = Result<T, ApiError>>,
@@ -792,26 +794,42 @@ where
         let ttl_secs = cache.ttl(CacheTtl::TraceRank);
         let suffix = trace_bucketed_suffix(&suffix, ttl_secs, chrono::Utc::now().timestamp());
         cache
-            .get_or_fetch_static_json_bytes_checked(
+            .get_or_fetch_static_json_located(
                 server,
                 event_id,
                 suffix,
                 ttl_secs,
-                Some(subject_trace_json_is_valid),
+                locate_subject_trace_rows,
                 fetch,
             )
             .await
     } else {
-        encode_fetched(fetch).await
+        encode_fetched(fetch).await.map(CachedJson::identity)
     }
 }
 
-fn subject_trace_json_is_valid(json: &Bytes) -> bool {
-    match crate::model::api::SubjectTraceResponseSchema::json_is_well_formed(json) {
-        Ok(_) => true,
+/// The `rankData` rows of a cached subject trace, sliced out by the range
+/// the cache located; a value without a range is scanned.
+pub fn cached_trace_rows(json: &CachedJson) -> sonic_rs::Result<TraceRows> {
+    match json.span {
+        ByteSpan::Unknown => TraceRows::from_trace_json(&json.bytes),
+        ByteSpan::Absent => TraceRows::from_trace_json_range(&json.bytes, None),
+        ByteSpan::Range { start, end } => {
+            TraceRows::from_trace_json_range(&json.bytes, Some(start..end))
+        }
+    }
+}
+
+fn locate_subject_trace_rows(json: &Bytes) -> Option<ByteSpan> {
+    match crate::model::api::SubjectTraceResponseSchema::rank_data_range(json) {
+        Ok(Some(range)) => Some(ByteSpan::Range {
+            start: range.start,
+            end: range.end,
+        }),
+        Ok(None) => Some(ByteSpan::Absent),
         Err(err) => {
             tracing::warn!(%err, "api cache cached subject trace is malformed");
-            false
+            None
         }
     }
 }

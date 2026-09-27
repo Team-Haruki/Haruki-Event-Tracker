@@ -1,10 +1,11 @@
 use serde::Deserialize;
 
+use crate::api::cache::CachedJson;
 use crate::api::error::ApiError;
 use crate::api::extract::{ApiAudience, prepare_audience_user_id_mode, resolve_region_engine};
 use crate::api::handler::web::{
     build_overview, build_overview_until, build_world_bloom_overview,
-    build_world_bloom_overview_until, cached_overview_bytes, overview_status,
+    build_world_bloom_overview_until, cached_overview_bytes, cached_trace_rows, overview_status,
 };
 use crate::api::json::{EncodedJson, Json};
 use crate::api::state::AppState;
@@ -714,9 +715,9 @@ async fn web_user_detail_by_unique_id(
 /// A detail's trace is optional content: no rows in the window (typically
 /// a `cursor` poll with nothing newer) is an empty increment, not a 404.
 /// The cached trace's `rankData` array is spliced in without decoding it.
-fn detail_trace(trace: Result<bytes::Bytes, ApiError>) -> Result<TraceRows, ApiError> {
+fn detail_trace(trace: Result<CachedJson, ApiError>) -> Result<TraceRows, ApiError> {
     match trace {
-        Ok(json) => TraceRows::from_trace_json(&json).map_err(|err| {
+        Ok(json) => cached_trace_rows(&json).map_err(|err| {
             tracing::warn!(%err, "cached subject trace has no usable rankData");
             ApiError::ServiceUnavailable("api cache decode failed".into())
         }),
