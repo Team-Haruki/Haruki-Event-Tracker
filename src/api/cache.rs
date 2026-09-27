@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
+use axum::http::HeaderValue;
 use bytes::Bytes;
 use flate2::Compression;
 use flate2::write::GzEncoder;
@@ -18,6 +19,7 @@ use tokio::sync::Notify;
 use tokio::time::{self, MissedTickBehavior};
 
 use crate::api::error::ApiError;
+use crate::api::http_cache::strong_etag;
 use crate::api::stats::{CACHE_STATS, add, incr, set};
 use crate::config::ApiCacheConfig;
 
@@ -94,6 +96,10 @@ pub struct CachedJson {
     /// Where the value's sub-value of interest lies, for callers that
     /// asked the cache to locate it (see [`ApiCache::get_or_fetch_static_json_located`]).
     pub span: ByteSpan,
+    /// The strong ETag of `bytes`, digested once when a precompressed
+    /// (gzip) value was produced or admitted to L1, so the web cache-header
+    /// layer needn't hash the body per request.
+    pub etag: Option<HeaderValue>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -122,6 +128,7 @@ impl CachedJson {
             encoding: CachedJsonEncoding::Identity,
             epoch: None,
             span: ByteSpan::Unknown,
+            etag: None,
         }
     }
 
@@ -131,6 +138,7 @@ impl CachedJson {
             encoding: CachedJsonEncoding::Gzip,
             epoch: None,
             span: ByteSpan::Unknown,
+            etag: None,
         }
     }
 
@@ -141,6 +149,11 @@ impl CachedJson {
 
     fn with_span(mut self, span: ByteSpan) -> Self {
         self.span = span;
+        self
+    }
+
+    fn with_etag(mut self, etag: Option<HeaderValue>) -> Self {
+        self.etag = etag;
         self
     }
 }
@@ -850,7 +863,9 @@ impl ApiCache {
                 cache_status = cache_status(request.options, "l1_gzip_hit"),
                 "api cache L1 gzip hit"
             );
-            return Ok(CachedJson::gzip(value.bytes).at_epoch(Some(control.epoch)));
+            return Ok(CachedJson::gzip(value.bytes)
+                .at_epoch(Some(control.epoch))
+                .with_etag(value.etag));
         }
         if let Some(value) = self.l1.get_value(&key) {
             record_l1_hit(request.options);
@@ -902,8 +917,11 @@ impl ApiCache {
                     cache_status = cache_status(request.options, "l2_gzip_hit"),
                     "api cache L2 gzip hit"
                 );
-                self.store_l1_value(gzip, bytes.clone(), request.epoch_life());
-                Ok(CachedJson::gzip(bytes).at_epoch(Some(epoch)))
+                let etag = etag_for(request.options, &bytes);
+                self.store_l1_tagged(gzip, bytes.clone(), request.epoch_life(), etag.clone());
+                Ok(CachedJson::gzip(bytes)
+                    .at_epoch(Some(epoch))
+                    .with_etag(etag))
             }
             Ok(L2EncodedRead::Identity(bytes)) => {
                 record_l2_hit(request.options);
@@ -1340,10 +1358,11 @@ impl ApiCache {
             Ok(true) => {
                 self.store_l1_value(ctx.value_key.clone(), bytes, ctx.life());
                 if encoded.encoding == CachedJsonEncoding::Gzip {
-                    self.store_l1_value(
+                    self.store_l1_tagged(
                         gzip_key(&ctx.value_key),
                         encoded.bytes.clone(),
                         ctx.life(),
+                        encoded.etag.clone(),
                     );
                 }
             }
@@ -1362,37 +1381,53 @@ impl ApiCache {
         &self,
         bytes: Bytes,
         write_context: Option<CacheWriteContext>,
-        _options: CacheOptions,
+        options: CacheOptions,
     ) -> Result<CachedJson, ApiError> {
         let epoch = write_context.as_ref().map(|ctx| ctx.epoch);
         if bytes.len() < self.cfg.precompress_min_bytes {
             return Ok(CachedJson::identity(bytes).at_epoch(epoch));
         }
-        let gzip = self.gzip_response_bytes(bytes).await?;
+        let (gzip, etag) = self.gzip_response_bytes(bytes, options).await?;
         if let Some(ctx) = write_context {
             match self
                 .write_l2_if_clean(&ctx, &gzip_key(&ctx.value_key), gzip.clone(), ctx.ttl_secs)
                 .await
             {
-                Ok(true) => self.store_l1_value(gzip_key(&ctx.value_key), gzip.clone(), ctx.life()),
+                Ok(true) => self.store_l1_tagged(
+                    gzip_key(&ctx.value_key),
+                    gzip.clone(),
+                    ctx.life(),
+                    etag.clone(),
+                ),
                 Ok(false) => {}
                 Err(err) => tracing::warn!(%err, "api cache gzip write failed"),
             }
         }
-        Ok(CachedJson::gzip(gzip).at_epoch(epoch))
+        Ok(CachedJson::gzip(gzip).at_epoch(epoch).with_etag(etag))
     }
 
-    async fn gzip_response_bytes(&self, bytes: Bytes) -> Result<Bytes, ApiError> {
+    /// Gzips a response body and, for web values, digests its ETag in the
+    /// same (blocking, for large bodies) step: both happen once per cache
+    /// generation instead of once per request.
+    async fn gzip_response_bytes(
+        &self,
+        bytes: Bytes,
+        options: CacheOptions,
+    ) -> Result<(Bytes, Option<HeaderValue>), ApiError> {
         let level = self.cfg.gzip_level;
-        if bytes.len() < GZIP_SPAWN_BLOCKING_THRESHOLD {
-            return gzip_bytes(&bytes, level);
+        let inline = bytes.len() < GZIP_SPAWN_BLOCKING_THRESHOLD;
+        let encode = move || {
+            let gzip = gzip_bytes(&bytes, level)?;
+            let etag = etag_for(options, &gzip);
+            Ok((gzip, etag))
+        };
+        if inline {
+            return encode();
         }
-        tokio::task::spawn_blocking(move || gzip_bytes(&bytes, level))
-            .await
-            .map_err(|err| {
-                tracing::warn!(%err, "gzip blocking task failed");
-                ApiError::ServiceUnavailable("gzip encode error".into())
-            })?
+        tokio::task::spawn_blocking(encode).await.map_err(|err| {
+            tracing::warn!(%err, "gzip blocking task failed");
+            ApiError::ServiceUnavailable("gzip encode error".into())
+        })?
     }
 
     async fn read_l2_combined(
@@ -1530,10 +1565,25 @@ impl ApiCache {
     }
 
     fn store_l1_value(&self, key: String, bytes: Bytes, life: L1Life) {
-        self.store_l1_located(key, bytes, life, ByteSpan::Unknown);
+        self.store_l1_entry(key, bytes, life, ByteSpan::Unknown, None);
     }
 
     fn store_l1_located(&self, key: String, bytes: Bytes, life: L1Life, span: ByteSpan) {
+        self.store_l1_entry(key, bytes, life, span, None);
+    }
+
+    fn store_l1_tagged(&self, key: String, bytes: Bytes, life: L1Life, etag: Option<HeaderValue>) {
+        self.store_l1_entry(key, bytes, life, ByteSpan::Unknown, etag);
+    }
+
+    fn store_l1_entry(
+        &self,
+        key: String,
+        bytes: Bytes,
+        life: L1Life,
+        span: ByteSpan,
+        etag: Option<HeaderValue>,
+    ) {
         let Some(ttl) = l1_value_ttl(&self.cfg, life) else {
             return;
         };
@@ -1543,9 +1593,16 @@ impl ApiCache {
                 bytes,
                 expires_at: Instant::now() + ttl,
                 span,
+                etag,
             },
         );
     }
+}
+
+/// The ETag the web cache-header layer would compute for these wire bytes.
+/// Batch (cloud) values never pass that layer, so they aren't digested.
+fn etag_for(options: CacheOptions, wire_bytes: &Bytes) -> Option<HeaderValue> {
+    (!options.is_batch).then(|| strong_etag(wire_bytes))
 }
 
 /// How long a value may serve from L1, or `None` to keep it out.
@@ -1658,6 +1715,7 @@ struct L1Value {
     bytes: Bytes,
     expires_at: Instant,
     span: ByteSpan,
+    etag: Option<HeaderValue>,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -2601,6 +2659,7 @@ mod tests {
             bytes: Bytes::from_static(bytes),
             expires_at: Instant::now() + ttl,
             span: ByteSpan::Unknown,
+            etag: None,
         }
     }
 
@@ -2609,6 +2668,7 @@ mod tests {
             bytes: Bytes::from_static(bytes),
             expires_at: Instant::now() - Duration::from_secs(1),
             span: ByteSpan::Unknown,
+            etag: None,
         }
     }
 
@@ -2718,6 +2778,7 @@ mod tests {
                     bytes: Bytes::from(vec![b'x'; 4096]),
                     expires_at: Instant::now() + Duration::from_secs(60),
                     span: ByteSpan::Unknown,
+                    etag: None,
                 },
             );
         }
@@ -2742,6 +2803,7 @@ mod tests {
                 bytes: Bytes::from(vec![b'x'; 65 * 1024]),
                 expires_at: Instant::now() + Duration::from_secs(60),
                 span: ByteSpan::Unknown,
+                etag: None,
             },
         );
         assert_eq!(l1_bytes(&l1, "huge"), None);
@@ -2912,6 +2974,7 @@ mod tests {
                                 bytes: Bytes::from(vec![b'x'; len]),
                                 expires_at: Instant::now() + ttl,
                                 span: ByteSpan::Unknown,
+                                etag: None,
                             },
                         );
                         if let Some(bytes) = l1_bytes(&l1, &key) {
@@ -2944,11 +3007,29 @@ mod tests {
                 bytes: Bytes::from_static(br#"{"a":[1,2]}"#),
                 expires_at: Instant::now() + Duration::from_secs(1),
                 span,
+                etag: Some(HeaderValue::from_static("\"tag\"")),
             },
         );
         let value = l1.get_value("located").unwrap();
         assert_eq!(value.span, span);
         assert_eq!(&value.bytes[5..10], b"[1,2]");
+        assert_eq!(value.etag, Some(HeaderValue::from_static("\"tag\"")));
+    }
+
+    #[test]
+    fn etags_are_digested_for_web_values_only() {
+        let bytes = Bytes::from_static(b"gzip-bytes");
+        let web = CacheOptions {
+            max_value_bytes: 1024,
+            is_batch: false,
+            check: CachedCheck::None,
+        };
+        assert_eq!(etag_for(web, &bytes), Some(strong_etag(&bytes)));
+        let batch = CacheOptions {
+            is_batch: true,
+            ..web
+        };
+        assert_eq!(etag_for(batch, &bytes), None);
     }
 
     #[test]
@@ -3454,6 +3535,9 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(encoded.encoding, CachedJsonEncoding::Gzip);
+        // The ETag is the digest of the wire (gzip) bytes, on every tier.
+        let etag = strong_etag(&encoded.bytes);
+        assert_eq!(encoded.etag, Some(etag.clone()));
 
         let l1_gzip = cache
             .get_or_fetch_encoded_json::<TypedCachePayload, _>(
@@ -3467,6 +3551,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(l1_gzip.encoding, CachedJsonEncoding::Gzip);
+        assert_eq!(l1_gzip.etag, Some(etag.clone()));
 
         let combined_l2 = test_cache(&conn, &cfg)
             .get_or_fetch_encoded_json::<TypedCachePayload, _>(
@@ -3480,6 +3565,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(combined_l2.encoding, CachedJsonEncoding::Gzip);
+        assert_eq!(combined_l2.etag, Some(etag.clone()));
 
         let l2_cache = test_cache(&conn, &cfg);
         l2_cache.store_l1_control(control_cache_key("jp", event_id), 0, false);
@@ -3495,6 +3581,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(l2_gzip.encoding, CachedJsonEncoding::Gzip);
+        assert_eq!(l2_gzip.etag, Some(etag));
 
         let value = value_key("jp", event_id, 0, "identity-only");
         redis_set(&mut conn, &value, br#"{"items":[8,9]}"#).await;
@@ -3520,6 +3607,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(batch.encoding, CachedJsonEncoding::Gzip);
+        assert!(batch.etag.is_none());
 
         let identity = cache
             .get_or_fetch_batch_encoded_json(

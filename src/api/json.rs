@@ -11,7 +11,7 @@ use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
 use serde::Serialize;
 
-use crate::api::http_cache::ServedEpoch;
+use crate::api::http_cache::{PrecomputedEtag, ServedEpoch};
 
 pub struct Json<T>(pub T);
 pub struct RawJson(pub Bytes);
@@ -19,6 +19,7 @@ pub struct EncodedJson {
     bytes: Bytes,
     encoding: JsonEncoding,
     epoch: Option<i64>,
+    etag: Option<HeaderValue>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -33,6 +34,7 @@ impl EncodedJson {
             bytes,
             encoding: JsonEncoding::Identity,
             epoch: None,
+            etag: None,
         }
     }
 
@@ -41,6 +43,7 @@ impl EncodedJson {
             bytes,
             encoding: JsonEncoding::Gzip,
             epoch: None,
+            etag: None,
         }
     }
 
@@ -54,6 +57,14 @@ impl EncodedJson {
     /// `v=<epoch>` request immutable.
     pub fn at_epoch(mut self, epoch: Option<i64>) -> Self {
         self.epoch = epoch;
+        self
+    }
+
+    /// Carries the strong ETag of these exact bytes, digested when the
+    /// cache produced them (`PrecomputedEtag` extension), so `http_cache`
+    /// can skip hashing the body per request.
+    pub fn with_etag(mut self, etag: Option<HeaderValue>) -> Self {
+        self.etag = etag;
         self
     }
 }
@@ -116,6 +127,16 @@ impl IntoResponse for EncodedJson {
         let mut response = self.encoding_response();
         if let Some(epoch) = self.epoch {
             response.extensions_mut().insert(ServedEpoch(epoch));
+        }
+        if let Some(etag) = self.etag {
+            let content_encoding = match self.encoding {
+                JsonEncoding::Identity => None,
+                JsonEncoding::Gzip => Some(HeaderValue::from_static("gzip")),
+            };
+            response.extensions_mut().insert(PrecomputedEtag {
+                etag,
+                content_encoding,
+            });
         }
         response
     }
@@ -189,6 +210,30 @@ mod tests {
         assert!(response.headers().get(CONTENT_ENCODING).is_none());
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         assert_eq!(body, Bytes::from_static(br#"{"ok":true}"#));
+    }
+
+    #[tokio::test]
+    async fn encoded_json_carries_its_precomputed_etag_with_the_encoding() {
+        let etag = HeaderValue::from_static("\"abc\"");
+        let gzip = EncodedJson::gzip(Bytes::from_static(b"gzipped"))
+            .with_etag(Some(etag.clone()))
+            .into_response();
+        let precomputed = gzip.extensions().get::<PrecomputedEtag>().unwrap();
+        assert_eq!(precomputed.etag, etag);
+        assert_eq!(
+            precomputed.content_encoding,
+            Some(HeaderValue::from_static("gzip"))
+        );
+
+        let identity = EncodedJson::identity(Bytes::from_static(b"{}"))
+            .with_etag(Some(etag.clone()))
+            .into_response();
+        let precomputed = identity.extensions().get::<PrecomputedEtag>().unwrap();
+        assert_eq!(precomputed.etag, etag);
+        assert_eq!(precomputed.content_encoding, None);
+
+        let untagged = EncodedJson::gzip(Bytes::from_static(b"gzipped")).into_response();
+        assert!(untagged.extensions().get::<PrecomputedEtag>().is_none());
     }
 
     #[tokio::test]

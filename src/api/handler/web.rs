@@ -765,7 +765,8 @@ where
                 CachedJsonEncoding::Gzip => EncodedJson::gzip(encoded.bytes),
                 CachedJsonEncoding::Identity => EncodedJson::identity(encoded.bytes),
             }
-            .at_epoch(encoded.epoch))
+            .at_epoch(encoded.epoch)
+            .with_etag(encoded.etag))
         }
     } else {
         encode_fetched(fetch).await.map(EncodedJson::identity)
