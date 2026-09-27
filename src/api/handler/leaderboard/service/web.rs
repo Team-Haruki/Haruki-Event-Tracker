@@ -10,6 +10,7 @@ use crate::api::json::{EncodedJson, Json};
 use crate::api::state::AppState;
 use crate::db::engine::DatabaseEngine;
 use crate::db::query::heartbeat::fetch_time_id_timestamp;
+use crate::db::query::user::get_user_data;
 use crate::db::query::web::RankSnapshotCut;
 use crate::model::api::{
     LeaderboardOverviewSchema, RecordedRankData, TraceRows, WebRankDetailResponseSchema,
@@ -21,7 +22,7 @@ use super::snapshot::{
     SnapshotBuildRequest, build_rank_snapshots_response, resolve_rank_cut, resolve_user_rank,
     snapshot_shows_user,
 };
-use super::trace::{SubjectTraceQuery, build_subject_trace_json, build_subject_trace_response};
+use super::trace::{SubjectTraceQuery, build_subject_trace_json};
 use super::util::{interval_seconds, meta, positive_timestamp, user_id_of_rank_data};
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -651,30 +652,20 @@ async fn web_user_detail_by_unique_id(
     } else {
         None
     };
+    // The profile is the users-table row, read directly: `resolve_user_rank`
+    // above already established that the player has rows in this scope
+    // (World Bloom: in this chapter) — a player without any is a 404 before
+    // this point — so no trace has to be run to prove it. A lookup failure
+    // leaves the profile out, as it always has.
     let profile = if query.include_profile.unwrap_or(false) {
-        match build_subject_trace_response(
-            state.clone(),
-            server.clone(),
-            event_id,
-            character_id,
-            user_id.clone(),
-            SubjectTraceQuery {
-                subject_type: Some("user".to_owned()),
-                include_current: Some(true),
-                start_time: None,
-                end_time: None,
-                cursor: None,
-                limit: Some(1),
-            },
-            "web:v2",
-            ApiAudience::Web,
-        )
-        .await
-        {
-            Ok(trace) => trace.user_data,
-            Err(ApiError::NotFound) => None,
-            Err(err) => return Err(err),
-        }
+        let (region, engine) = resolve_region_engine(&state, &server)?;
+        let mode =
+            prepare_audience_user_id_mode(&state, &engine, region, event_id, ApiAudience::Web)
+                .await?;
+        get_user_data(&engine, event_id, &user_id, mode)
+            .await
+            .ok()
+            .flatten()
     } else {
         None
     };
@@ -725,10 +716,13 @@ fn detail_trace(trace: Result<bytes::Bytes, ApiError>) -> Result<TraceRows, ApiE
     }
 }
 
+/// A detail splices only the trace's rows (`detail_trace`), so the trace's
+/// own `current` is never asked for: for a user subject that spares the
+/// latest-row lookup, and it keys the cache the same way for every detail.
 fn detail_trace_query(query: &WebDetailQuery, subject_type: &str) -> SubjectTraceQuery {
     SubjectTraceQuery {
         subject_type: Some(subject_type.to_owned()),
-        include_current: Some(true),
+        include_current: Some(false),
         start_time: None,
         end_time: None,
         cursor: query.cursor,
@@ -933,7 +927,9 @@ mod tests {
         .0;
         assert!(detail.current.is_some());
         assert!(detail.subject.is_none());
-        assert_eq!(detail.profile.unwrap().name, "Alpha");
+        let profile = detail.profile.unwrap();
+        assert_eq!(profile.name, "Alpha");
+        assert_eq!(profile.user_id, unique(&state, NORMAL_EVENT, "100"));
         assert_eq!(detail.player_trace.rows().len(), 2);
 
         let mut without_trace = detail_query();
@@ -1261,8 +1257,65 @@ mod tests {
         let trace_query = detail_trace_query(&query, "user");
 
         assert_eq!(trace_query.subject_type.as_deref(), Some("user"));
+        assert_eq!(trace_query.include_current, Some(false));
         assert_eq!(trace_query.cursor, Some(1_786_726_540));
         assert_eq!(trace_query.limit, Some(5_000));
+    }
+
+    #[tokio::test]
+    async fn user_detail_profiles_follow_the_chapter_scope() {
+        let state = test_state().await;
+        // Alpha (100) has rows in chapters 17 and 19; Beta (200) only in 17.
+        let alpha = unique(&state, WORLD_BLOOM_EVENT, "100");
+        let beta = unique(&state, WORLD_BLOOM_EVENT, "200");
+        for query in [detail_query(), live_query()] {
+            let detail = web_user_detail_for_scope(
+                state.clone(),
+                "jp".into(),
+                WORLD_BLOOM_EVENT,
+                Some(19),
+                alpha.clone(),
+                query,
+            )
+            .await
+            .unwrap()
+            .0;
+            assert!(detail.ranked);
+            let profile = detail
+                .profile
+                .expect("a player in the chapter has a profile");
+            assert_eq!(profile.user_id, alpha);
+            assert_eq!(profile.name, "Alpha");
+        }
+        // Beta never appears in chapter 19: not found, profile or not.
+        for include_profile in [Some(true), Some(false)] {
+            let mut query = live_query();
+            query.include_profile = include_profile;
+            assert!(matches!(
+                web_user_detail_for_scope(
+                    state.clone(),
+                    "jp".into(),
+                    WORLD_BLOOM_EVENT,
+                    Some(19),
+                    beta.clone(),
+                    query,
+                )
+                .await,
+                Err(ApiError::NotFound)
+            ));
+        }
+        let detail = web_user_detail_for_scope(
+            state.clone(),
+            "jp".into(),
+            WORLD_BLOOM_EVENT,
+            Some(17),
+            beta.clone(),
+            live_query(),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(detail.profile.unwrap().name, "Beta");
     }
 
     #[test]
