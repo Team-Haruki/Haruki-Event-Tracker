@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::model::sekai::{UserPlayerFrame, UserProfileHonor};
+use crate::model::trace_columns::TracePayload;
 
 #[derive(Debug, Clone, Serialize, Deserialize, FromQueryResult)]
 #[serde(rename_all = "camelCase")]
@@ -517,10 +518,10 @@ pub struct WebRankDetailResponseSchema {
     pub next: Option<WebRankingItemSchema>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metrics: Option<RankingScoreGrowthSchema>,
-    #[serde(skip_serializing_if = "TraceRows::is_empty", default)]
-    pub rank_trace: TraceRows,
-    #[serde(skip_serializing_if = "TraceRows::is_empty", default)]
-    pub player_trace: TraceRows,
+    #[serde(skip_serializing_if = "TracePayload::is_empty", default)]
+    pub rank_trace: TracePayload,
+    #[serde(skip_serializing_if = "TracePayload::is_empty", default)]
+    pub player_trace: TracePayload,
     pub interval_seconds: i64,
     pub window_start: i64,
     pub window_end: i64,
@@ -552,8 +553,8 @@ pub struct WebUserDetailResponseSchema {
     pub previous: Option<WebRankingItemSchema>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next: Option<WebRankingItemSchema>,
-    #[serde(skip_serializing_if = "TraceRows::is_empty", default)]
-    pub player_trace: TraceRows,
+    #[serde(skip_serializing_if = "TracePayload::is_empty", default)]
+    pub player_trace: TracePayload,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub profile: Option<RecordedUserNameSchema>,
 }

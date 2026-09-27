@@ -33,6 +33,7 @@ use crate::model::api::{
     UserLatestRankingQueryResponseSchema, WebRankingItemSchema, WebUserDetailResponseSchema,
 };
 use crate::model::enums::SekaiServerRegion;
+use crate::model::trace_columns::{TraceFormat, TracePayload};
 
 #[derive(Debug, Clone)]
 pub struct PrivateSubject(pub String);
@@ -55,6 +56,8 @@ pub struct PrivateWebDetailQuery {
     owner_id: Option<String>,
     include_trace: Option<bool>,
     include_profile: Option<bool>,
+    /// `rows` (default) or `columns`, as for the public details.
+    trace_format: Option<String>,
 }
 
 pub async fn require_subject(
@@ -292,6 +295,8 @@ async fn web_user_detail_for_scope(
         &user_id,
     )
     .await?;
+    let trace_format =
+        TraceFormat::parse(query.trace_format.as_deref()).map_err(ApiError::BadRequest)?;
     let mode = prepare_private_user_id_mode(&state, &engine, region, event_id).await?;
     let current = match character_id {
         Some(character_id) => {
@@ -372,6 +377,10 @@ async fn web_user_detail_for_scope(
     if current.is_none() && player_trace.is_empty() && profile.is_none() {
         return Err(ApiError::NotFound);
     }
+    let player_trace = TracePayload::encode(player_trace, trace_format).map_err(|err| {
+        tracing::error!(%err, "trace columns encode error");
+        ApiError::ServiceUnavailable("json encode error".into())
+    })?;
     Ok(Json(WebUserDetailResponseSchema {
         meta: LeaderboardMetaSchema {
             server,
@@ -388,7 +397,7 @@ async fn web_user_detail_for_scope(
         current,
         previous,
         next,
-        player_trace: player_trace.into(),
+        player_trace,
         profile,
     }))
 }
@@ -504,6 +513,7 @@ mod tests {
             owner_id: Some("identity-1".into()),
             include_trace: Some(true),
             include_profile: Some(true),
+            trace_format: None,
         }
     }
 
@@ -593,6 +603,56 @@ mod tests {
         assert!(world.current.is_some());
         assert!(world.next.is_some());
         assert_eq!(world.meta.character_id, Some(17));
+    }
+
+    #[tokio::test]
+    async fn private_web_details_offer_the_columns_trace_format() {
+        let state = test_state(true).await;
+        let rows = web_total_user_detail(
+            State(state.clone()),
+            Path(("jp".into(), NORMAL_EVENT, "100".into())),
+            Query(detail_query()),
+            subject(),
+        )
+        .await
+        .unwrap()
+        .0;
+        let columns = web_total_user_detail(
+            State(state.clone()),
+            Path(("jp".into(), NORMAL_EVENT, "100".into())),
+            Query(PrivateWebDetailQuery {
+                trace_format: Some("columns".into()),
+                ..detail_query()
+            }),
+            subject(),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(columns.player_trace.format(), TraceFormat::Columns);
+        assert_eq!(
+            sonic_rs::to_string(&columns.player_trace.rows()).unwrap(),
+            sonic_rs::to_string(&rows.player_trace.rows()).unwrap()
+        );
+        let json = sonic_rs::to_string(&columns).unwrap();
+        assert!(
+            json.contains(r#""playerTrace":{"format":"columns""#),
+            "{json}"
+        );
+        assert!(json.contains(r#""users":["100"]"#), "{json}");
+        assert!(matches!(
+            web_total_user_detail(
+                State(state),
+                Path(("jp".into(), NORMAL_EVENT, "100".into())),
+                Query(PrivateWebDetailQuery {
+                    trace_format: Some("csv".into()),
+                    ..detail_query()
+                }),
+                subject(),
+            )
+            .await,
+            Err(ApiError::BadRequest(_))
+        ));
     }
 
     #[tokio::test]

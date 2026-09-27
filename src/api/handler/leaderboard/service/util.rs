@@ -16,6 +16,13 @@ pub(super) fn user_id_of_rank_data(rank_data: &RecordedRankData) -> Option<Strin
     }
 }
 
+pub(super) fn timestamp_of_rank_data(rank_data: &RecordedRankData) -> i64 {
+    match rank_data {
+        RecordedRankData::Normal(data) => data.timestamp,
+        RecordedRankData::WorldBloom(data) => data.timestamp,
+    }
+}
+
 pub(super) fn meta(
     server: &str,
     event_id: i64,

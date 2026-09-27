@@ -64,7 +64,7 @@ World Bloom events have per-character chapters tracked in parallel. `EventTracke
 
 ### Models package
 
-`src/model/` holds *all* shared types — API request/response schemas (`api.rs`), DB config (`db_config.rs`), domain enums (`enums.rs` — `SekaiServerRegion`, `SekaiEventType`, `SekaiEventStatus`, the `SEKAI_EVENT_RANKING_LINES_NORMAL` / `_WORLD_BLOOM` constants), event master data structs (`event.rs`), upstream Sekai API DTOs (`sekai.rs`), and tracker state structs (`tracker.rs`). `db` and `tracker` both depend on `model`; `model` depends on nothing internal — keep it that way to avoid cycles.
+`src/model/` holds *all* shared types — API request/response schemas (`api.rs`), the columnar trace encoding behind `traceFormat=columns` (`trace_columns.rs` — `TraceColumns` codec and the `TracePayload` detail field that splices either wire form), DB config (`db_config.rs`), domain enums (`enums.rs` — `SekaiServerRegion`, `SekaiEventType`, `SekaiEventStatus`, the `SEKAI_EVENT_RANKING_LINES_NORMAL` / `_WORLD_BLOOM` constants), event master data structs (`event.rs`), upstream Sekai API DTOs (`sekai.rs`), and tracker state structs (`tracker.rs`). `db` and `tracker` both depend on `model`; `model` depends on nothing internal — keep it that way to avoid cycles.
 
 ## Conventions
 

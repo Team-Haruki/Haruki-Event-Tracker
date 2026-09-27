@@ -3,4 +3,5 @@ pub mod db_config;
 pub mod enums;
 pub mod event;
 pub mod sekai;
+pub mod trace_columns;
 pub mod tracker;
