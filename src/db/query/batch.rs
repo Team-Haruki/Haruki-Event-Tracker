@@ -408,7 +408,7 @@ async fn batch_get_or_create_user_id_keys<C: ConnectionTrait>(
     conn: &C,
     backend: DatabaseBackend,
     table_name: &str,
-    users: &HashMap<i64, UserDimRow>,
+    users: &HashMap<i64, &UserDimRow>,
     memo: &UserMemo,
 ) -> Result<ResolvedUsers, DbErr> {
     let use_unique_ids = users.values().any(|u| u.unique_id.is_some());
@@ -471,7 +471,7 @@ async fn batch_get_or_create_user_id_keys<C: ConnectionTrait>(
         )));
     }
     for (uid, cheerful_team_id) in upserts {
-        let info = &users[&uid];
+        let info = users[&uid];
         learned.push((
             uid,
             UserMemoEntry {
@@ -504,7 +504,7 @@ fn user_row_changed(entry: &UserMemoEntry, info: &UserDimRow) -> bool {
 async fn upsert_user_rows<C: ConnectionTrait>(
     conn: &C,
     table_name: &str,
-    users: &HashMap<i64, UserDimRow>,
+    users: &HashMap<i64, &UserDimRow>,
     upserts: &[DirtyUser],
     use_unique_ids: bool,
 ) -> Result<(), DbErr> {
@@ -517,7 +517,7 @@ async fn upsert_user_rows<C: ConnectionTrait>(
         }
         ins.columns(columns.clone());
         for &(uid, cheerful_team_id) in chunk {
-            let info = &users[&uid];
+            let info = users[&uid];
             let mut values = user_upsert_values(&uid.to_string(), cheerful_team_id, info);
             if use_unique_ids {
                 values.push(info.unique_id.clone().into());
@@ -656,7 +656,7 @@ async fn select_user_rows<C: ConnectionTrait>(
     Ok(rows)
 }
 
-fn parse_uid(user_id: &str) -> Result<i64, DbErr> {
+pub(crate) fn parse_uid(user_id: &str) -> Result<i64, DbErr> {
     user_id
         .parse()
         .map_err(|_| DbErr::Custom(format!("user_id {user_id:?} is not a numeric id")))
@@ -713,11 +713,66 @@ pub async fn batch_upsert_event_users(
     let backend = engine.backend();
     let users_tbl = intern(TableKind::EventUsers, event_id);
     let users = collect_users(server, event_id, anonymizer, records.iter())?;
+    let users: HashMap<i64, &UserDimRow> = users.iter().map(|(&uid, u)| (uid, u)).collect();
 
     let resolved =
         batch_get_or_create_user_id_keys(engine.conn(), backend, users_tbl, &users, memo).await?;
     memo.absorb(resolved.learned);
     Ok(())
+}
+
+/// One ranking row as the tracker buffers it: the four stored columns and
+/// nothing else, so a backlog costs 32 bytes per row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SampleRow {
+    pub timestamp: i64,
+    pub uid: i64,
+    pub score: i64,
+    pub rank: i64,
+}
+
+impl SampleRow {
+    pub fn from_record(r: &PlayerEventRankingRecordSchema) -> Result<Self, DbErr> {
+        Ok(Self {
+            timestamp: r.timestamp,
+            uid: parse_uid(&r.user_id)?,
+            score: r.score,
+            rank: r.rank,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WorldBloomSampleRow {
+    pub row: SampleRow,
+    pub character_id: i64,
+}
+
+/// The rows of one flush plus the dimension values they need. `profiles`
+/// holds the newest values per uid for every user whose stored row may
+/// differ from what the memo holds; a uid absent from it must be in the
+/// memo (its key is taken from there and the users table is not touched).
+/// The map may be a superset of the users the rows reference.
+#[derive(Debug, Clone, Copy)]
+pub struct FlushBatch<'a> {
+    pub main: &'a [SampleRow],
+    pub world_bloom: &'a [WorldBloomSampleRow],
+    pub profiles: &'a HashMap<i64, UserDimRow>,
+}
+
+impl FlushBatch<'_> {
+    pub fn is_empty(&self) -> bool {
+        self.main.is_empty() && self.world_bloom.is_empty()
+    }
+
+    /// Distinct uids the rows reference.
+    fn uids(&self) -> HashSet<i64> {
+        self.main
+            .iter()
+            .map(|r| r.uid)
+            .chain(self.world_bloom.iter().map(|r| r.row.uid))
+            .collect()
+    }
 }
 
 /// Rows a flush wrote, per table, and (PostgreSQL) the WAL position right
@@ -782,11 +837,8 @@ pub async fn batch_insert_world_bloom_rankings(
 }
 
 struct FlushInput<'a> {
-    server: SekaiServerRegion,
     event_id: i64,
-    anonymizer: &'a UidAnonymizer,
-    main: &'a [PlayerEventRankingRecordSchema],
-    world_bloom: &'a [PlayerWorldBloomRankingRecordSchema],
+    batch: FlushBatch<'a>,
     prev_state: &'a HashMap<WorldBloomKey, PlayerState>,
     memo: &'a UserMemo,
 }
@@ -798,24 +850,9 @@ struct FlushWrite {
     learned: Vec<(i64, UserMemoEntry)>,
 }
 
-/// Writes one tracker flush — main and World Bloom rows of every buffered
-/// sample — in a single transaction, so a reader (or a streaming replica)
-/// sees either none of it or all of it: never a sample with only some of
-/// its rank moves, and never main rows without the chapter rows sampled
-/// with them. `flush_max_rows` / hot-rank triggers only decide *when* the
-/// whole buffer flushes; nothing splits it.
-///
-/// World Bloom rows are diffed against `prev_state` first (a no-change
-/// batch writes nothing), and the state only advances after the commit (a
-/// failed flush retries the same diff; the inserts' DO NOTHING dedups any
-/// rows that already landed). `running` advances per record within the
-/// batch: a coalesced flush can carry several samples for one
-/// `(user, chapter)`, and a value that oscillates back to the pre-batch
-/// state is still a real trace point. `memo` likewise learns the users
-/// rows only once they are committed.
-///
-/// On PostgreSQL the flush is bounded by the engine's `write_timeout`; a
-/// timed-out flush surfaces as an error and is safe to retry.
+/// Record-shaped entry to [`flush_batch`]: every record's dimension values
+/// are offered as the profile (newest sample per user wins, see
+/// [`collect_users`]), so nothing is assumed about the memo.
 #[allow(clippy::too_many_arguments)]
 #[tracing::instrument(
     skip(engine, anonymizer, main, world_bloom, prev_state, memo),
@@ -834,12 +871,73 @@ pub async fn batch_insert_flush(
     if main.is_empty() && world_bloom.is_empty() {
         return Ok(FlushOutcome::default());
     }
-    let input = FlushInput {
+    let profiles = collect_users(
         server,
         event_id,
         anonymizer,
-        main,
-        world_bloom,
+        main.iter().chain(world_bloom.iter().map(|r| &r.base)),
+    )?;
+    let main_rows = main
+        .iter()
+        .map(SampleRow::from_record)
+        .collect::<Result<Vec<_>, _>>()?;
+    let wl_rows = world_bloom
+        .iter()
+        .map(|r| {
+            Ok(WorldBloomSampleRow {
+                row: SampleRow::from_record(&r.base)?,
+                character_id: r.character_id,
+            })
+        })
+        .collect::<Result<Vec<_>, DbErr>>()?;
+    flush_batch(
+        engine,
+        event_id,
+        FlushBatch {
+            main: &main_rows,
+            world_bloom: &wl_rows,
+            profiles: &profiles,
+        },
+        prev_state,
+        memo,
+    )
+    .await
+}
+
+/// Writes one tracker flush — main and World Bloom rows of every sample in
+/// `batch` — in a single transaction, so a reader (or a streaming replica)
+/// sees either none of it or all of it: never a sample with only some of
+/// its rank moves, and never main rows without the chapter rows sampled
+/// with them. The tracker only ever hands over whole samples.
+///
+/// World Bloom rows are diffed against `prev_state` first (a no-change
+/// batch writes nothing), and the state only advances after the commit (a
+/// failed flush retries the same diff; the inserts' DO NOTHING dedups any
+/// rows that already landed). `running` advances per record within the
+/// batch: a coalesced flush can carry several samples for one
+/// `(user, chapter)`, and a value that oscillates back to the pre-batch
+/// state is still a real trace point. `memo` likewise learns the users
+/// rows only once they are committed.
+///
+/// On PostgreSQL the flush is bounded by the engine's `write_timeout`; a
+/// timed-out flush surfaces as an error and is safe to retry.
+#[tracing::instrument(
+    skip(engine, batch, prev_state, memo),
+    fields(event_id, main = batch.main.len(), world_bloom = batch.world_bloom.len())
+)]
+pub async fn flush_batch(
+    engine: &DatabaseEngine,
+    event_id: i64,
+    batch: FlushBatch<'_>,
+    prev_state: &mut HashMap<WorldBloomKey, PlayerState>,
+    memo: &mut UserMemo,
+) -> Result<FlushOutcome, DbErr> {
+    if batch.is_empty() {
+        return Ok(FlushOutcome::default());
+    }
+    let input = FlushInput {
+        event_id,
+        batch,
         prev_state,
         memo,
     };
@@ -930,6 +1028,29 @@ async fn commit_and_read_lsn(session: &PgSession) -> Result<Option<String>, DbEr
         .transpose()
 }
 
+/// Users offered with a profile, and keys of the memoized rest.
+type SplitUsers<'a> = (HashMap<i64, &'a UserDimRow>, HashMap<i64, i64>);
+
+/// Partition the users a batch references: those with a profile offered
+/// go through the users table (the memo may still short-circuit them),
+/// the rest must be memoized and are answered from memory.
+fn split_users<'a>(batch: &FlushBatch<'a>, memo: &UserMemo) -> Result<SplitUsers<'a>, DbErr> {
+    let mut offered = HashMap::new();
+    let mut keys = HashMap::new();
+    for uid in batch.uids() {
+        if let Some(info) = batch.profiles.get(&uid) {
+            offered.insert(uid, info);
+        } else if let Some(key) = memo.user_id_key(uid) {
+            keys.insert(uid, key);
+        } else {
+            return Err(DbErr::Custom(format!(
+                "user {uid} has neither a profile in the batch nor a memo entry"
+            )));
+        }
+    }
+    Ok((offered, keys))
+}
+
 /// Every statement of one flush, in order, on `conn` — sea-orm's
 /// transaction handle or the PostgreSQL writer session between its
 /// `BEGIN` and `COMMIT`.
@@ -945,35 +1066,25 @@ async fn write_flush<C: ConnectionTrait>(
     let event_tbl = intern(TableKind::Event, event_id);
     let wl_tbl = intern(TableKind::WorldBloom, event_id);
 
-    let users = collect_users(
-        input.server,
-        event_id,
-        input.anonymizer,
-        input
-            .main
-            .iter()
-            .chain(input.world_bloom.iter().map(|r| &r.base)),
-    )?;
+    let batch = input.batch;
+    let (users, mut keys) = split_users(&batch, input.memo)?;
     let resolved =
         batch_get_or_create_user_id_keys(conn, backend, users_tbl, &users, input.memo).await?;
-    let user_key = |user_id: &str| {
-        parse_uid(user_id).and_then(|uid| {
-            resolved
-                .keys
-                .get(&uid)
-                .copied()
-                .ok_or_else(|| DbErr::Custom("missing user_id_key lookup".into()))
-        })
+    keys.extend(resolved.keys);
+    let user_key = |uid: i64| {
+        keys.get(&uid)
+            .copied()
+            .ok_or_else(|| DbErr::Custom("missing user_id_key lookup".into()))
     };
 
-    let mut main_rows: Vec<(i64, i64, i64, i64)> = Vec::with_capacity(input.main.len());
-    for r in input.main {
-        main_rows.push((r.timestamp, user_key(&r.user_id)?, r.score, r.rank));
+    let mut main_rows: Vec<(i64, i64, i64, i64)> = Vec::with_capacity(batch.main.len());
+    for r in batch.main {
+        main_rows.push((r.timestamp, user_key(r.uid)?, r.score, r.rank));
     }
     let mut wl_rows: Vec<(i64, i64, i64, i64, i64)> = Vec::new();
     let mut running: HashMap<WorldBloomKey, PlayerState> = HashMap::new();
-    for r in input.world_bloom {
-        let user_key = user_key(&r.base.user_id)?;
+    for r in batch.world_bloom {
+        let user_key = user_key(r.row.uid)?;
         let key = WorldBloomKey {
             user_id_key: user_key,
             character_id: r.character_id,
@@ -982,19 +1093,19 @@ async fn write_flush<C: ConnectionTrait>(
             .get(&key)
             .copied()
             .or_else(|| input.prev_state.get(&key).copied());
-        if last.is_none_or(|p| p.score != r.base.score || p.rank != r.base.rank) {
+        if last.is_none_or(|p| p.score != r.row.score || p.rank != r.row.rank) {
             wl_rows.push((
-                r.base.timestamp,
+                r.row.timestamp,
                 user_key,
                 r.character_id,
-                r.base.score,
-                r.base.rank,
+                r.row.score,
+                r.row.rank,
             ));
             running.insert(
                 key,
                 PlayerState {
-                    score: r.base.score,
-                    rank: r.base.rank,
+                    score: r.row.score,
+                    rank: r.row.rank,
                 },
             );
         }
