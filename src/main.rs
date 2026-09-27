@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::process::ExitCode;
 use std::time::Duration;
@@ -7,8 +8,10 @@ use axum_server::accept::NoDelayAcceptor;
 use axum_server::tls_rustls::{RustlsAcceptor, RustlsConfig};
 
 use haruki_event_tracker::db::engine::DatabaseEngine;
+use haruki_event_tracker::db::maintenance;
 use haruki_event_tracker::db::repair::repair_time_ids;
 use haruki_event_tracker::model::enums::SekaiServerRegion;
+use haruki_event_tracker::tracker::parser::EventDataParser;
 use haruki_event_tracker::{api, app, config, logger, shutdown};
 
 /// The release image is a musl build, whose malloc serialises allocations
@@ -21,8 +24,12 @@ const SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    if std::env::args().nth(1).as_deref() == Some(REPAIR_TIME_IDS) {
-        return repair_time_ids_cli(std::env::args().skip(2)).await;
+    match std::env::args().nth(1).as_deref() {
+        Some(REPAIR_TIME_IDS) => return repair_time_ids_cli(std::env::args().skip(2)).await,
+        Some(VACUUM_FINISHED_EVENTS) => {
+            return vacuum_finished_events_cli(std::env::args().skip(2)).await;
+        }
+        _ => {}
     }
     let cfg_location = config::config_location_from_args_env();
     let cfg = match config::load_from_location(&cfg_location).await {
@@ -231,6 +238,311 @@ async fn repair_time_ids_cli(args: impl Iterator<Item = String>) -> ExitCode {
             eprintln!("repair failed: {err}");
             ExitCode::from(1)
         }
+    }
+}
+
+const VACUUM_FINISHED_EVENTS: &str = "vacuum-finished-events";
+const VACUUM_USAGE: &str = "usage: haruki-event-tracker vacuum-finished-events [--region <jp|en|tw|kr|cn>] \
+[--event <id>] [--dry-run] [--max-events <n>] [--min-idle-days <days>] [--pause-secs <secs>] \
+[--min-xid-age <n>] [--idle-only] [--config <uri>]";
+
+/// `vacuum-finished-events`: `VACUUM (FREEZE, ANALYZE)` every table of
+/// events that are over, one event at a time (see `db::maintenance`).
+/// PostgreSQL primaries only; never scheduled by the daemon.
+async fn vacuum_finished_events_cli(args: impl Iterator<Item = String>) -> ExitCode {
+    let mut region = None;
+    let mut only_event = None;
+    let mut dry_run = false;
+    let mut max_events = usize::MAX;
+    let mut min_idle_days = 3u64;
+    let mut pause = Duration::from_secs(5);
+    let mut min_xid_age = 0i64;
+    let mut idle_only = false;
+    let mut cfg_location = None;
+    let mut args = args.peekable();
+    while let Some(arg) = args.next() {
+        let (key, inline) = match arg.split_once('=') {
+            Some((k, v)) => (k.to_owned(), Some(v.to_owned())),
+            None => (arg, None),
+        };
+        let mut value = || inline.clone().or_else(|| args.next());
+        let parsed = match key.as_str() {
+            "--region" => {
+                region = value().and_then(|v| SekaiServerRegion::parse(&v));
+                region.is_some()
+            }
+            "--event" => {
+                only_event = value().and_then(|v| v.parse::<i64>().ok());
+                only_event.is_some()
+            }
+            "--max-events" => match value().and_then(|v| v.parse::<usize>().ok()) {
+                Some(n) if n > 0 => {
+                    max_events = n;
+                    true
+                }
+                _ => false,
+            },
+            "--min-idle-days" => match value().and_then(|v| v.parse::<u64>().ok()) {
+                Some(d) => {
+                    min_idle_days = d;
+                    true
+                }
+                None => false,
+            },
+            "--pause-secs" => match value().and_then(|v| v.parse::<u64>().ok()) {
+                Some(s) => {
+                    pause = Duration::from_secs(s);
+                    true
+                }
+                None => false,
+            },
+            "--min-xid-age" => match value().and_then(|v| v.parse::<i64>().ok()) {
+                Some(n) => {
+                    min_xid_age = n;
+                    true
+                }
+                None => false,
+            },
+            "--config" => {
+                cfg_location = value();
+                cfg_location.is_some()
+            }
+            "--dry-run" => {
+                dry_run = true;
+                true
+            }
+            "--idle-only" => {
+                idle_only = true;
+                true
+            }
+            _ => {
+                eprintln!("unknown argument {key}\n{VACUUM_USAGE}");
+                return ExitCode::from(2);
+            }
+        };
+        if !parsed {
+            eprintln!("bad value for {key}\n{VACUUM_USAGE}");
+            return ExitCode::from(2);
+        }
+    }
+    let cfg_location = cfg_location.unwrap_or_else(config::config_location_from_env);
+    let cfg = match config::load_from_location(&cfg_location).await {
+        Ok(c) => c,
+        Err(err) => {
+            eprintln!("failed to load {cfg_location}: {err}");
+            return ExitCode::from(1);
+        }
+    };
+    let mut regions: Vec<SekaiServerRegion> = match region {
+        Some(region) => vec![region],
+        None => cfg
+            .servers
+            .iter()
+            .filter(|(_, server)| server.enabled)
+            .map(|(region, _)| *region)
+            .collect(),
+    };
+    regions.sort_by_key(|region| region.to_string());
+    if regions.is_empty() {
+        eprintln!("no enabled region in {cfg_location}");
+        return ExitCode::from(1);
+    }
+
+    let min_idle = Duration::from_secs(min_idle_days * 86_400);
+    let mut budget = max_events;
+    let mut failed = false;
+    for region in regions {
+        let Some(server_cfg) = cfg.servers.get(&region) else {
+            eprintln!("region {region} is not configured in {cfg_location}");
+            return ExitCode::from(1);
+        };
+        if budget == 0 {
+            println!("{region}: --max-events reached, skipping");
+            continue;
+        }
+        let closed_at_by_event = if idle_only {
+            None
+        } else {
+            let parser = EventDataParser::new(region, &server_cfg.master_data_dir)
+                .map_err(|err| err.to_string());
+            let events = match parser {
+                Ok(parser) => parser
+                    .load_event_data()
+                    .await
+                    .map_err(|err| err.to_string()),
+                Err(err) => Err(err),
+            };
+            match events {
+                Ok(events) => Some(
+                    events
+                        .iter()
+                        .map(|event| (event.id, event.closed_at))
+                        .collect::<HashMap<i64, i64>>(),
+                ),
+                Err(err) => {
+                    eprintln!(
+                        "{region}: cannot read master data ({err}); pass --idle-only to select \
+                         events by table idleness alone"
+                    );
+                    return ExitCode::from(1);
+                }
+            }
+        };
+        let engine = match DatabaseEngine::connect(&server_cfg.db).await {
+            Ok(engine) => engine,
+            Err(err) => {
+                eprintln!("{region}: failed to connect database: {err}");
+                return ExitCode::from(1);
+            }
+        };
+        let outcome = vacuum_region(
+            region,
+            &engine,
+            closed_at_by_event.as_ref(),
+            only_event,
+            dry_run,
+            &mut budget,
+            min_idle,
+            pause,
+            min_xid_age,
+        )
+        .await;
+        let _ = engine.close().await;
+        match outcome {
+            Ok(()) => {}
+            Err(err) if engine_is_not_postgres(&err) => println!("{region}: {err}"),
+            Err(err) => {
+                eprintln!("{region}: {err}");
+                failed = true;
+            }
+        }
+    }
+    if failed {
+        ExitCode::from(1)
+    } else {
+        ExitCode::SUCCESS
+    }
+}
+
+fn engine_is_not_postgres(err: &sea_orm::DbErr) -> bool {
+    err.to_string().contains("PostgreSQL only")
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn vacuum_region(
+    region: SekaiServerRegion,
+    engine: &DatabaseEngine,
+    closed_at_by_event: Option<&HashMap<i64, i64>>,
+    only_event: Option<i64>,
+    dry_run: bool,
+    budget: &mut usize,
+    min_idle: Duration,
+    pause: Duration,
+    min_xid_age: i64,
+) -> Result<(), sea_orm::DbErr> {
+    maintenance::check_vacuum_target(engine).await?;
+    let now = chrono::Utc::now().timestamp();
+    let mut candidates = Vec::new();
+    let mut skipped_unknown = 0usize;
+    for event_id in maintenance::list_event_ids(engine).await? {
+        if only_event.is_some_and(|only| only != event_id) {
+            continue;
+        }
+        let closed_at_ms = match closed_at_by_event {
+            Some(map) => match map.get(&event_id) {
+                Some(closed_at) => Some(*closed_at),
+                None => {
+                    skipped_unknown += 1;
+                    continue;
+                }
+            },
+            None => None,
+        };
+        let last_sample_at = maintenance::last_sample_at(engine, event_id).await?;
+        let Some(reason) =
+            maintenance::finished_reason(now, closed_at_ms, last_sample_at, min_idle)
+        else {
+            continue;
+        };
+        candidates.push(maintenance::FinishedEvent {
+            event_id,
+            reason,
+            last_sample_at,
+            tables: maintenance::event_tables(engine, event_id).await?,
+        });
+    }
+    println!(
+        "{region}: {} finished event(s) selected, {skipped_unknown} without a master entry skipped{}",
+        candidates.len(),
+        if dry_run { " (dry run)" } else { "" }
+    );
+    for event in candidates {
+        if *budget == 0 {
+            println!("{region}: --max-events reached, stopping");
+            break;
+        }
+        *budget -= 1;
+        let reason = match event.reason {
+            maintenance::FinishedReason::ClosedAt(at) => format!("closed_at={at}"),
+            maintenance::FinishedReason::Idle => "idle".to_owned(),
+        };
+        println!(
+            "{region} event {}: {reason} last_sample_at={} tables={}",
+            event.event_id,
+            event
+                .last_sample_at
+                .map_or_else(|| "none".to_owned(), |ts| ts.to_string()),
+            event.tables.join(",")
+        );
+        for (i, table) in event.tables.iter().enumerate() {
+            let before = maintenance::table_stats(engine, table).await?;
+            if before.xid_age < min_xid_age {
+                println!(
+                    "  {table}: xid_age={} < {min_xid_age}, skipped",
+                    before.xid_age
+                );
+                continue;
+            }
+            if dry_run {
+                println!(
+                    "  {table}: xid_age={} size={} (would VACUUM (FREEZE, ANALYZE))",
+                    before.xid_age,
+                    human_bytes(before.total_bytes)
+                );
+                continue;
+            }
+            if i > 0 && !pause.is_zero() {
+                tokio::time::sleep(pause).await;
+            }
+            let done = maintenance::vacuum_freeze_analyze(engine, table).await?;
+            println!(
+                "  {table}: xid_age {}->{} size {}->{} in {:.1?}",
+                done.before.xid_age,
+                done.after.xid_age,
+                human_bytes(done.before.total_bytes),
+                human_bytes(done.after.total_bytes),
+                done.elapsed
+            );
+        }
+        if !dry_run && *budget > 0 && !pause.is_zero() {
+            tokio::time::sleep(pause).await;
+        }
+    }
+    Ok(())
+}
+
+fn human_bytes(bytes: i64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes}{}", UNITS[unit])
+    } else {
+        format!("{value:.1}{}", UNITS[unit])
     }
 }
 
