@@ -680,9 +680,21 @@ where
 /// the suffix instead: one computation is reused for up to the trace TTL,
 /// and the bucket boundary provides the roll-over. Traces are append-only
 /// history, so a result at most one TTL old is semantically fine.
+///
+/// The boundary is offset per suffix (a deterministic hash, so every
+/// process agrees on the key) so the hot traces don't all expire on the
+/// same second and rebuild in one burst.
 fn trace_bucketed_suffix(suffix: &str, ttl_secs: u64, now_secs: i64) -> String {
-    let bucket = now_secs / i64::try_from(ttl_secs.max(1)).unwrap_or(60);
+    let ttl = i64::try_from(ttl_secs.max(1)).unwrap_or(60);
+    let jitter = i64::try_from(fnv1a_64(suffix.as_bytes()) % ttl.unsigned_abs()).unwrap_or(0);
+    let bucket = now_secs.saturating_add(jitter) / ttl;
     format!("{suffix}:b{bucket}")
+}
+
+fn fnv1a_64(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
+    })
 }
 
 async fn cached_trace_bytes<T, Fut>(
@@ -1179,10 +1191,41 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn trace_bucket_rolls_over_at_ttl_boundaries() {
-        assert_eq!(trace_bucketed_suffix("t", 60, 0), "t:b0");
-        assert_eq!(trace_bucketed_suffix("t", 60, 59), "t:b0");
-        assert_eq!(trace_bucketed_suffix("t", 60, 60), "t:b1");
+    fn trace_bucket_rolls_over_at_ttl_boundaries_offset_per_suffix() {
+        let jitter = |suffix: &str, ttl: u64| (fnv1a_64(suffix.as_bytes()) % ttl) as i64;
+        let boundary = 60 - jitter("t", 60);
+        assert!((1..=60).contains(&boundary));
+        assert_eq!(
+            trace_bucketed_suffix("t", 60, 0),
+            format!("t:b{}", jitter("t", 60) / 60)
+        );
+        assert_eq!(
+            trace_bucketed_suffix("t", 60, boundary - 1),
+            trace_bucketed_suffix("t", 60, 0)
+        );
+        assert_ne!(
+            trace_bucketed_suffix("t", 60, boundary),
+            trace_bucketed_suffix("t", 60, boundary - 1)
+        );
+        assert_eq!(
+            trace_bucketed_suffix("t", 60, boundary + 59),
+            format!("t:b{}", 1 + jitter("t", 60) / 60)
+        );
+        // Every bucket spans exactly one TTL.
+        let mut changes = 0;
+        for now in 1..=600 {
+            if trace_bucketed_suffix("x", 60, now) != trace_bucketed_suffix("x", 60, now - 1) {
+                changes += 1;
+            }
+        }
+        assert_eq!(changes, 10);
+        // The offset is a pure function of the suffix and spreads suffixes
+        // across the window.
+        let offsets: std::collections::HashSet<i64> = (0..64)
+            .map(|i| jitter(&format!("web:v2:total:subject:user:{i}:limit=None"), 60))
+            .collect();
+        assert!(offsets.len() > 16, "{offsets:?}");
+        assert_eq!(fnv1a_64(b"abc"), 0xe71f_a219_0541_574b);
         // A zero TTL must not divide by zero.
         assert_eq!(trace_bucketed_suffix("t", 0, 5), "t:b5");
     }
