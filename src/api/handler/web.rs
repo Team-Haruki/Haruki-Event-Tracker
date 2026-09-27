@@ -14,7 +14,7 @@ use crate::db::query::growth::{
     fetch_ranking_score_growths, fetch_world_bloom_ranking_score_growths,
 };
 use crate::db::query::heartbeat::fetch_latest_heartbeat_before;
-use crate::db::query::lines::{fetch_ranking_lines, fetch_world_bloom_ranking_lines};
+use crate::db::query::lines::{fetch_ranking_lines_at, fetch_world_bloom_ranking_lines_at};
 use crate::db::query::user::PublicUserIdMode;
 use crate::db::query::web::{
     RankSnapshotCut, WebRankingCursor, WebRankingFilter, WebTraceFilter, WebUserSearchFilter,
@@ -321,11 +321,11 @@ pub async fn build_overview_until(
                 .map_err(ApiError::from)
         },
         async {
-            fetch_ranking_lines(
+            fetch_ranking_lines_at(
                 engine,
                 event_id,
                 border_ranks(SEKAI_EVENT_RANKING_LINES_NORMAL),
-                at,
+                cut,
             )
             .await
             .map_err(ApiError::from)
@@ -404,12 +404,12 @@ pub async fn build_world_bloom_overview_until(
             .map_err(ApiError::from)
         },
         async {
-            fetch_world_bloom_ranking_lines(
+            fetch_world_bloom_ranking_lines_at(
                 engine,
                 event_id,
                 character_id,
                 border_ranks(SEKAI_EVENT_RANKING_LINES_WORLD_BLOOM),
-                at,
+                cut,
             )
             .await
             .map_err(ApiError::from)
