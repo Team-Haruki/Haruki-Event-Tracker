@@ -10,37 +10,64 @@ on:
 permissions:
   contents: read
 
+# PRs: one group per PR, newer pushes cancel older runs. Everything else: one group per
+# event and commit, so a queued main run is never replaced by a newer one (every commit keeps
+# its "CI OK" and :sha-<sha> image for the release gate and promote-on-tag).
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
-
-env:
-  CARGO_TERM_COLOR: always
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || format('{0}-{1}', github.event_name, github.sha) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   rust:
-    name: Rust checks
+    name: Rust
+    uses: seiunx-dev/ci-templates/.github/workflows/rust-ci.yml@v1
+    with:
+      coverage: true # tests run once, with Redis, and feed Sonar
+      redis-image: redis:7-alpine
+      env: HARUKI_COVERAGE_REDIS_URL=${CI_REDIS_URL}
+
+  sonar:
+    name: Sonar
+    needs: [rust]
+    uses: seiunx-dev/ci-templates/.github/workflows/sonar.yml@v1
+    secrets:
+      SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+
+  docker:
+    name: Docker
+    permissions:
+      contents: read
+      packages: write
+      pull-requests: read
+    uses: seiunx-dev/ci-templates/.github/workflows/docker.yml@v1
+    with:
+      defer-moving-tags: true # push :sha-* right away; :main moves after CI OK (docker-tags)
+      cache-backend: registry
+      cache-mode: max
+
+  workflows:
+    name: Workflow lint
+    uses: seiunx-dev/ci-templates/.github/workflows/actionlint.yml@v1
+
+  ci-ok:
+    name: CI OK # the only required status check
+    if: always()
+    needs: [rust, sonar, docker, workflows]
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
-      - name: Checkout
-        uses: actions/checkout@v7
+      - if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')
+        run: exit 1
 
-      - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
-        with:
-          components: rustfmt, clippy
-
-      - name: Cache Rust artifacts
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-
-      - name: Check formatting
-        run: cargo fmt --all -- --check
-
-      - name: Check build
-        run: cargo check --locked --all-targets
-
-      - name: Run Clippy
-        run: cargo clippy --locked --all-targets -- -D warnings
-
-      - name: Run tests
-        run: cargo test --locked
+  docker-tags:
+    name: Docker tags # :main follows only commits whose CI OK passed
+    needs: [docker, ci-ok]
+    if: needs.docker.outputs.deferred-tags != ''
+    permissions:
+      contents: read
+      packages: write
+    uses: seiunx-dev/ci-templates/.github/workflows/docker-retag.yml@v1
+    with:
+      image: ${{ needs.docker.outputs.image }}
+      digest: ${{ needs.docker.outputs.digest }}
+      tags: ${{ needs.docker.outputs.deferred-tags }}

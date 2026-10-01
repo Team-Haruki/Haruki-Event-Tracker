@@ -1,24 +1,23 @@
-FROM rust:1.98-alpine AS builder
-
-WORKDIR /app
+# ── Build stages (cargo-chef: dependencies are cooked in their own cached layer) ──
+FROM lukemathwalker/cargo-chef:0.1.78-rust-1.98-alpine AS chef
 
 RUN apk add --no-cache \
     musl-dev gcc g++ cmake make perl pkgconfig linux-headers
 
-COPY Cargo.toml Cargo.lock ./
-RUN mkdir -p src && \
-    echo 'fn main() {}' > src/main.rs && \
-    echo '' > src/lib.rs && \
-    cargo build --release --locked --bin haruki-event-tracker 2>/dev/null || true && \
-    rm -rf src
+WORKDIR /app
 
-COPY . .
-ARG VERSION=3.0.0-dev
-RUN if [ "$VERSION" != "3.0.0-dev" ]; then \
-        sed -i "s/^version = \".*\"/version = \"${VERSION#v}\"/" Cargo.toml; \
-    fi && \
-    find src -name '*.rs' -exec touch {} + && \
-    cargo build --release --locked --bin haruki-event-tracker && \
+FROM chef AS planner
+COPY Cargo.toml Cargo.lock ./
+COPY src ./src
+RUN cargo chef prepare --recipe-path recipe.json
+
+FROM chef AS builder
+COPY --from=planner /app/recipe.json recipe.json
+RUN cargo chef cook --release --locked --bin haruki-event-tracker --recipe-path recipe.json
+# The version comes from Cargo.toml (bumped before tagging); CI never rewrites it.
+COPY Cargo.toml Cargo.lock ./
+COPY src ./src
+RUN cargo build --release --locked --bin haruki-event-tracker && \
     strip target/release/haruki-event-tracker
 
 FROM alpine:3.24 AS runtime
