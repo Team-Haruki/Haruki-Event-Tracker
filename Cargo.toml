@@ -104,7 +104,7 @@ ahash = "0.8"
 bytes = "1"
 # In-process L1 of the API cache: byte-weighted, sharded, MIT, no new
 # transitive crates (ahash/hashbrown/parking_lot are already in the tree).
-quick_cache = "0.6"
+quick_cache = "0.7"
 chrono = { version = "0.4", default-features = false, features = [
     "clock",
     "serde",
