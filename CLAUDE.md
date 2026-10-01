@@ -17,8 +17,8 @@ The repo was rewritten from Go on `rewrite/rust`; `REWRITE_PLAN.md` is the froze
 - Run: reads `haruki-tracker-configs.yaml` from the working directory by default; override with `--config <uri>` or `HARUKI_CONFIG_URI`. Config location and `master_data_dir` go through `storage.rs` (OpenDAL), so `file://`, `http(s)://`, and `s3://` URIs all work. Redis is required only when at least one tracker daemon is enabled — API-only deployments (`tracker.enabled: false` everywhere) skip Redis, the upstream Sekai API client, and the cron scheduler.
 - Tests: `cargo test --lib` — ~100 unit tests in `#[cfg(test)]` modules across `api` (cache, access_log, ws_ticket, leaderboard services), `db` (query/web, schema, privacy), `tracker` (diff, parser, base), `storage`, and `privacy`. There is no `tests/` integration suite; HTTP/DB behaviour is validated against staging. `examples/perf_bench.rs` is a benchmark-style example target.
 - Lint: `cargo clippy --all-targets -- -D warnings`. Keep clippy clean before committing — new warnings are treated as build failures.
-- Docker: `docker build --build-arg VERSION=<ver> -t haruki-event-tracker .` (multi-stage `rust:1.98-alpine` builder → `alpine:3.24` runtime, non-root user, ~29 MB; dependabot bumps the builder tag). The image expects the config file mounted into `/app`. The builder pre-builds deps from a dummy `src/main.rs`; keep the `find src -name '*.rs' -exec touch {} +` line — Docker `COPY` preserves host mtimes and otherwise cargo skips the real rebuild.
-- Tagged releases: pushing `v*` tags triggers `.github/workflows/release.yml` (targets: linux-x64, macos-arm64, windows-x64) and `.github/workflows/docker.yml` (GHCR push).
+- Docker: `docker build -t haruki-event-tracker .` (multi-stage: cargo-chef `lukemathwalker/cargo-chef:<ver>-rust-1.98-alpine` cooks the dependencies in their own cached layer, then `alpine:3.24` runtime, non-root user, ~29 MB; dependabot bumps the builder tag). The image expects the config file mounted into `/app`. The version comes from `Cargo.toml`; there is no version build arg.
+- Tagged releases: bump `Cargo.toml`, merge, then push `v<version>`; `.github/workflows/release.yml` builds linux-x64 / macos-arm64 / windows-x64 and promotes the `main` image (see "GitHub Actions workflows").
 - Local Kubernetes smoke test: `scripts/smoke_k8s_orbstack.sh` (OrbStack; builds the image, runs API-only mode against a temp PostgreSQL, checks `/livez` + `/readyz`).
 
 ## Architecture
@@ -120,17 +120,43 @@ Examples from this repo's history:
 
 ## GitHub Actions workflows
 
-Use the standardized workflow layout in `.github/workflows`:
+CI reuses the shared templates in
+[`seiunx-dev/ci-templates`](https://github.com/seiunx-dev/ci-templates) at `@v1`.
+The files in `.github/workflows` are thin callers:
 
-- `ci.yml` runs on `main` pushes, pull requests targeting `main`, and manual dispatch.
-- Rust CI order: `cargo fmt --all -- --check`, `cargo check --locked --all-targets`, `cargo clippy --locked --all-targets -- -D warnings`, then `cargo test --locked`.
-- `release.yml` is the standard release build entrypoint. It runs on `v*` tags and manual dispatch, builds release artifacts (linux-x64, macos-arm64, windows-x64), uploads them with `actions/upload-artifact`, and publishes GitHub Release assets on tag pushes.
-- `docker.yml` is the standard Docker entrypoint. It runs on `main` pushes, `v*` tags, PRs that touch Docker/build inputs, and manual dispatch. PRs build only; non-PR runs push GHCR images with lowercase image names and Docker metadata tags.
+- `ci.yml` (`CI`) runs on `main` pushes, pull requests targeting `main`, and manual
+  dispatch: `rust-ci` (fmt, clippy `--all-targets -D warnings`, tests run once under
+  `cargo llvm-cov` with a Redis service exposed as `HARUKI_COVERAGE_REDIS_URL`) →
+  `sonar` (scans the uploaded coverage; skipped green on Dependabot/fork PRs), plus
+  `docker` and `actionlint`.
+- `docker` does not wait for the tests. PRs build only; on `main` it runs in parallel
+  with `rust-ci` and pushes the immutable
+  `ghcr.io/team-haruki/haruki-event-tracker:sha-<full sha>` and `:sha-<7 chars>` as soon
+  as the build finishes. The `Docker tags` job (`docker-retag.yml`, after `CI OK`) then
+  moves `:main` to that digest without rebuilding, so `:main` only follows commits whose
+  `CI OK` passed and lags the `:sha-*` tags until then. The Dockerfile uses cargo-chef;
+  the registry `:buildcache` keeps the cooked dependency layer.
+- The aggregate job **`CI OK`** is the only required status check.
+- `release.yml` (`Release`): bump `version` in `Cargo.toml` in a PR → merge and wait for
+  `CI OK` on `main` → push the tag `v<version>`. `release-gate` refuses a tag that
+  differs from `Cargo.toml` and waits for `CI OK` on the tagged commit; then the
+  binaries are built (tags only; `haruki-event-tracker-linux-x64.tar.gz`,
+  `-macos-arm64.tar.gz`, `-windows-x64.zip`, binary at the archive root), the `main`
+  image `:sha-<sha>` is promoted (re-tagged, not rebuilt) to `:<version>`,
+  `:<major>.<minor>` and `:latest` (production pulls `:<version>`), and the GitHub
+  Release is published with `SHA256SUMS-<tag>.txt`. Manual dispatch is a dry run: it
+  builds the binaries and publishes nothing.
 
 Workflow maintenance rules:
 
-- Keep workflow filenames and top-level names aligned: `CI`, `Release`, `Docker`, and optional package-specific names.
-- Use `actions/checkout@v7`, `actions/upload-artifact@v7`, `actions/download-artifact@v8`, `softprops/action-gh-release@v3`, and current Docker actions (`setup-buildx@v4`, `login@v4`, `metadata@v6`, `build-push@v7`).
-- Keep `permissions` minimal: `contents: read` for CI/Docker build-only work, `contents: write` for release publishing, and `packages: write` only when pushing container images.
-- Use workflow `concurrency` keyed by workflow name and ref, with release jobs using `release-${{ github.ref_name }}` and `cancel-in-progress: false`.
-- Do not reintroduce legacy workflow names such as `rust-ci.yml`, `build.yml`, `release-build.yml`, `docker-build.yml`, or `docker-release.yml` unless a package-specific workflow already exists and is intentionally preserved.
+- Use the shared templates first. Add custom jobs or steps only when a template
+  genuinely cannot meet the project's needs, keep them in the thin caller files, and
+  add a comment explaining why.
+- Template bugs and missing features are fixed upstream in `seiunx-dev/ci-templates`
+  (new `v1.x.y` tag), not worked around here.
+- Keep top-level `permissions: contents: read`; grant `packages: write` / `contents: write`
+  only on the job that needs it.
+- Do not suppress `githubactions:S7637` (full-SHA pins) in `sonar-project.properties`: the
+  template's `sonar.yml` already ignores it for the `@v1` references.
+- Third-party actions in caller-side custom steps are pinned to a full commit SHA with a
+  `# vX.Y.Z` comment; Dependabot (`github-actions`) updates them and the template refs.

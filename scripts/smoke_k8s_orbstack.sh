@@ -2,7 +2,6 @@
 set -euo pipefail
 
 IMAGE="${IMAGE:-haruki-event-tracker:local}"
-VERSION="${VERSION:-3.0.0-dev}"
 POSTGRES_IMAGE="${POSTGRES_IMAGE:-postgres:16-alpine}"
 TARGET_CONTEXT="${KUBE_CONTEXT:-$(kubectl config current-context)}"
 NAMESPACE="${NAMESPACE:-haruki-smoke-$(date +%s)}"
@@ -41,7 +40,7 @@ cleanup() {
 trap cleanup EXIT
 
 if [[ "${BUILD_IMAGE}" == "1" ]]; then
-  docker build --build-arg "VERSION=${VERSION}" -t "${IMAGE}" .
+  docker build -t "${IMAGE}" .
 fi
 
 "${KUBECTL[@]}" create namespace "${NAMESPACE}" >/dev/null
