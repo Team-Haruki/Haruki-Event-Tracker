@@ -1303,7 +1303,7 @@ dependencies = [
 
 [[package]]
 name = "haruki-event-tracker"
-version = "3.0.0-dev"
+version = "4.2.0"
 dependencies = [
  "ahash",
  "anyhow",

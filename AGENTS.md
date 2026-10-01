@@ -9,7 +9,7 @@ Haruki Event Tracker scrapes ranking data from the Haruki Sekai API for *Project
 ## Project state
 
 - Active branch: `main`. The repo was rewritten from Go on `rewrite/rust` and **the Rust port took over production traffic at 2026-04-28 05:01:54Z**; `REWRITE_PLAN.md` is the frozen historical record of that rewrite (all phases `[x]`, cutover verification, rollback handle). All cutover follow-ups (GHCR image via `v2.0.0` tag, config migration) are done.
-- The project is now on the v3 line (latest tag `v3.3.0`; `Cargo.toml` carries `3.0.0-dev` as the dev-version convention). v3 added the `/api/v2/{cloud,web}` route surface, a two-tier API cache, WebSocket realtime push, UID anonymization for public web APIs, private (raw-UID) endpoints behind Toolbox ownership checks, and OpenDAL-backed config/master-data locations. Web API surface details: `WEB_API_CAPABILITIES.md`.
+- The project is now on the v4 line (`Cargo.toml` carries the latest released version, currently `4.2.0`; bump it before tagging). v3 added the `/api/v2/{cloud,web}` route surface, a two-tier API cache, WebSocket realtime push, UID anonymization for public web APIs, private (raw-UID) endpoints behind Toolbox ownership checks, and OpenDAL-backed config/master-data locations. Web API surface details: `WEB_API_CAPABILITIES.md`.
 - No `tests/` integration suite. `cargo test --lib` runs ~100 unit tests in `#[cfg(test)]` modules; HTTP/DB behaviour is validated against staging.
 
 ## Build & run

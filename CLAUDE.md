@@ -8,7 +8,7 @@ Haruki Event Tracker is a Rust service that periodically scrapes ranking data fr
 
 The repo was rewritten from Go on `rewrite/rust`; `REWRITE_PLAN.md` is the frozen historical record of that rewrite (per-phase decisions, cutover verification, Go behaviour intentionally not ported). The Rust port took over production traffic on **2026-04-28 05:01:54Z** and all cutover follow-ups (GHCR image via `v2.0.0` tag, config migration) are long done.
 
-**Status**: the project is now on the v3 line (latest tag `v3.3.0`; `Cargo.toml` carries the `3.0.0-dev` dev-version convention — real release versions come from tags). The v3 work added the `/api/v2` route surface (cloud + web), a two-tier API cache, WebSocket realtime push, UID anonymization for public web APIs, private (raw-UID) endpoints behind Toolbox ownership checks, and OpenDAL-backed config/master-data locations.
+**Status**: the project is now on the v4 line (`Cargo.toml` carries the latest released version, currently `4.2.0`; bump it before tagging). The v3 work added the `/api/v2` route surface (cloud + web), a two-tier API cache, WebSocket realtime push, UID anonymization for public web APIs, private (raw-UID) endpoints behind Toolbox ownership checks, and OpenDAL-backed config/master-data locations.
 
 ## Build & Run
 
