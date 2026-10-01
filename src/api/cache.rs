@@ -1735,8 +1735,6 @@ struct L1Lifecycle;
 impl Lifecycle<String, L1Value> for L1Lifecycle {
     type RequestState = ();
 
-    fn begin_request(&self) {}
-
     fn on_evict(&self, _state: &mut (), _key: String, _value: L1Value) {
         incr(&CACHE_STATS.l1_evicted);
     }
