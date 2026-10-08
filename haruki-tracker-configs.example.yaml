@@ -64,6 +64,27 @@ api_query:
   batch_trace_fill_concurrency: 4
 
 # ============================================================================
+# 隐私配置（UID 匿名化）
+# ============================================================================
+# 用途：为每个玩家生成对外的 unique_id = SHA-256("<server>-event-<event_id>-<uid>-<salt>")，
+#      Web 组（/api/v2/web/*）只接受/返回 unique_id，不暴露其他玩家的原始 UID；例外是调用方显式给出
+#      原始 UID 的 check-room?userId= 与 details/user/{uid}?idType=uid（只对被查者本人回显），
+#      以及需登录并经 Toolbox 校验绑定的 .../private/... 接口。
+# 注意：
+#   - enabled: false（默认）时，除 .../status 心跳接口和 .../private/... 接口外，所有返回玩家数据的 Web 接口都会返回
+#     400 "web API requires privacy.uid_anonymization.enabled"，且 cluster.role: writer 拒绝启动。
+#     要对外提供 Web 组或运行 writer，请改为 true。
+#   - enabled: true 时 salt 必须非空（为空则启动失败）。请用足够长的随机字符串并妥善保密：
+#     盐值泄露后 unique_id 可被逐个 UID 穷举还原。
+#   - 库里已存的 unique_id 由盐值算出；writer 与所有 reader 必须使用同一个盐值，
+#     更换盐值后需重算各赛事 _users 表的 unique_id。
+#   - Cloud 组（/api/v2/cloud/*）始终使用原始 UID，不受该开关影响。
+privacy:
+  uid_anonymization:
+    enabled: false
+    salt: ""                 # 例如 openssl rand -hex 32 的输出；切勿提交到仓库
+
+# ============================================================================
 # Toolbox 私有查询校验配置
 # ============================================================================
 # 用途：/event/.../private/... raw UID 查询会先调用 Toolbox 当前用户接口，
@@ -97,6 +118,9 @@ backend:
   # 访问日志配置
   access_log: "${time} | ${status} | ${latency} | ${ip} | ${method} ${path}\n"  # 访问日志格式
   access_log_path: logs/access.log  # 访问日志文件路径（留空则输出到 stdout）
+  access_log_sample_rate: 1.0       # 正常请求（状态码 < 400 且未超过慢请求阈值）的访问日志采样率，0.0~1.0；
+                                    # 1.0 记录全部（默认），0.1 约记录十分之一，0 只记录错误与慢请求
+  access_log_slow_threshold_ms: 1000  # 慢请求阈值（毫秒，默认 1000）；状态码 >= 400 或耗时达到该值的请求始终记录，不参与采样
 
   # 可信代理配置（如使用反向代理请根据实际情况调整）
   enable_trust_proxy: true  # 是否启用可信代理
@@ -134,7 +158,7 @@ cluster:
   token: ""                 # /internal/* 的 bearer；writer 与所有 reader 必须一致；非空时同时开放
                             # POST /internal/master-updated 供 master registry 的 subscribers 回调
                             # （各区 master_data_dir 建议指向 registry：http://<registry>:9998/v1/master/<region>/files/）
-  writer_url: ""            # reader 必填，例如 http://100.76.159.97:8777（只支持 http）
+  writer_url: ""            # reader 必填，例如 http://<writer-host>:8777（只支持 http）
   replica_wait_ms: 1500     # reader：等待本机热备回放到通知里 LSN 的上限；读主库时设 0
   reconnect_min_secs: 1     # reader：断线重连退避下限
   reconnect_max_secs: 30    # reader：断线重连退避上限

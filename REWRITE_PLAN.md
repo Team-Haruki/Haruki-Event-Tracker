@@ -212,7 +212,7 @@ src/
 - 切换时间:**2026-04-28 05:01:54Z**(用户低峰期)
 - 镜像:`haruki-event-tracker:rust-cutover`(本地 load,未推 GHCR;稳定后会打 `v2.0.0` tag 走 `docker.yml` 工作流推官方镜像)
 - 配置文件:`haruki-tracker-configs.rust.yaml`(DSN 由 GORM `tcp(...)` 形式翻成 sqlx `mysql://` URL 形式)
-- 回滚命令:`cd /data/HarukiServices && cp compose.yml.bak.20260427-170146 compose.yml && docker compose up -d event-tracker`(Go 镜像仍在本地缓存,~2s downtime)
+- 回滚命令:`cd <compose-dir> && cp compose.yml.bak.20260427-170146 compose.yml && docker compose up -d event-tracker`(Go 镜像仍在本地缓存,~2s downtime)
 - 资源占用:CPU 0.02% / RSS 6.7 MiB(Go 版 50 MiB+),0 重启 / 0 OOM / 0 panic
 - 后续运营 follow-up:(1) 24h 观察 (2) 打 `v2.0.0` tag 推 GHCR 把 compose 换回官方镜像 (3) 旧 `haruki-tracker-configs.yaml` 稳定后清理
 
