@@ -8,16 +8,18 @@
 + Rust 1.88+ (only for building from source — releases ship pre-built binaries)
 
 ## How to Use
-1. Go to release page to download `HarukiEventTracker`
+1. Go to the release page and download the archive for your platform (`haruki-event-tracker-linux-x64.tar.gz`, `haruki-event-tracker-macos-arm64.tar.gz` or `haruki-event-tracker-windows-x64.zip`); it contains the `haruki-event-tracker` binary
 2. Rename `haruki-tracker-configs.example.yaml` to `haruki-tracker-configs.yaml` and then edit it. For more details, see the `haruki-tracker-configs.example.yaml` comments.
+   The example has no `privacy` section yet: the public web API (`/api/v2/web/...`) and the cluster `writer` role need
+   `privacy.uid_anonymization.enabled: true` plus a non-empty `privacy.uid_anonymization.salt`, so add them yourself.
 3. Make a new directory or use an exists directory
-4. Put `HarukiEventTracker` and `haruki-tracker-configs.yaml` in the same directory
+4. Put `haruki-event-tracker` and `haruki-tracker-configs.yaml` in the same directory
 5. Open Terminal, and `cd` to the directory
-6. Run `HarukiEventTracker`
+6. Run `./haruki-event-tracker` (`haruki-event-tracker.exe` on Windows)
 
 The Rust build reads `haruki-tracker-configs.yaml` from the current directory by
 default. You can override it with `HARUKI_CONFIG_URI=/path/to/config.yaml` or
-`./HarukiEventTracker --config /path/to/config.yaml`. Config and
+`./haruki-event-tracker --config /path/to/config.yaml`. Config and
 `master_data_dir` can also point at OpenDAL locations such as `file:///app/config`
 or `s3://bucket/path/master?region=ap-northeast-1`.
 

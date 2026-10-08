@@ -1,5 +1,8 @@
 # Event Tracker 集群化改造方案（草案，2026-09-12）
 
+> 状态：已实施。集群角色（standalone / writer / reader）随 `v4.0.0`（2026-09-15）发布，当前版本见 `Cargo.toml`；
+> 现行行为以代码和 `AGENTS.md` 为准。下文保留 2026-09-12 草案时的方案与 §7 实施清单，作为历史记录。
+
 目标：一个写入端、多个只读 API 端、一套数据库；cloud 与 web 两组 API 在同一实例上
 并存，cloud 组加 token 鉴权，web 组新增按精确 UID 查房。
 
