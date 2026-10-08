@@ -10,8 +10,8 @@
 ## How to Use
 1. Go to the release page and download the archive for your platform (`haruki-event-tracker-linux-x64.tar.gz`, `haruki-event-tracker-macos-arm64.tar.gz` or `haruki-event-tracker-windows-x64.zip`); it contains the `haruki-event-tracker` binary
 2. Rename `haruki-tracker-configs.example.yaml` to `haruki-tracker-configs.yaml` and then edit it. For more details, see the `haruki-tracker-configs.example.yaml` comments.
-   The example has no `privacy` section yet: the public web API (`/api/v2/web/...`) and the cluster `writer` role need
-   `privacy.uid_anonymization.enabled: true` plus a non-empty `privacy.uid_anonymization.salt`, so add them yourself.
+   The example ships `privacy.uid_anonymization.enabled: false`. The public web API (`/api/v2/web/...`) and the cluster
+   `writer` role need `enabled: true` plus a long, random, secret `salt` (an empty salt with `enabled: true` fails at startup).
 3. Make a new directory or use an exists directory
 4. Put `haruki-event-tracker` and `haruki-tracker-configs.yaml` in the same directory
 5. Open Terminal, and `cd` to the directory
