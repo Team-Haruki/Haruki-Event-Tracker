@@ -4,7 +4,7 @@
 # and surfaces any value mismatches that aren't simply timestamps.
 
 set -u
-GO=${GO:-http://100.66.113.74:8777}
+GO=${GO:?set GO to the Go tracker base URL, e.g. http://<go-tracker-host>:8777}
 RS=${RS:-http://127.0.0.1:8777}
 
 # Each line: label<TAB>path<TAB>shape-jq<TAB>value-jq

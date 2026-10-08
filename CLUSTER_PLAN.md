@@ -2,6 +2,7 @@
 
 > 状态：已实施。集群角色（standalone / writer / reader）随 `v4.0.0`（2026-09-15）发布，当前版本见 `Cargo.toml`；
 > 现行行为以代码和 `AGENTS.md` 为准。下文保留 2026-09-12 草案时的方案与 §7 实施清单，作为历史记录。
+> 公开版本中具体节点名、内网地址与部署路径已替换为角色名（writer 节点 / 主库节点 / 热备节点 / 旧 cloud 节点）或占位符。
 
 目标：一个写入端、多个只读 API 端、一套数据库；cloud 与 web 两组 API 在同一实例上
 并存，cloud 组加 token 鉴权，web 组新增按精确 UID 查房。
@@ -10,7 +11,7 @@
 
 两套完全相同的 tracker 各自采集、各自落库，唯一差别是一个开关：
 
-| | CN02 `haruki-toolbox-event-tracker` | VM105 `haruki-event-tracker` |
+| | 热备节点（Toolbox 所在节点）`haruki-toolbox-event-tracker` | 旧 cloud 节点 `haruki-event-tracker` |
 |---|---|---|
 | `privacy.uid_anonymization.enabled` | `true`（web 用 unique_id） | `false`（cloud 用原始 UID） |
 | 数据库 | `haruki_tracker_*` 7.65 GB，事件 170-179 | `haruki_event_*` 10.2 GB，事件 164-179 |
@@ -23,7 +24,7 @@ UID、对网页给 unique_id。这也是"以开关区分 cloud/web"的来源，�
 ## 2. 目标拓扑
 
 ```
-CN05 (writer)                       CN08 (primary + reader)             CN02 (replica + reader)
+writer 节点                         主库节点 (primary + reader)          热备节点 (replica + reader)
 ┌────────────────────┐   写入(5432)  ┌──────────────────────────┐  流复制  ┌──────────────────────────┐
 │ event-tracker      │──────────────▶│ haruki-tracker-postgres  │─────────▶│ haruki-tracker-replica   │
 │  role: writer      │               │  (PG18 primary, slot)    │          │  (PG18 hot standby, RO)  │
@@ -36,23 +37,23 @@ CN05 (writer)                       CN08 (primary + reader)             CN02 (re
                                      └──────────────────────────┘
 ```
 
-- **CN05 只写**：五个区的采集 daemon 全开，DSN 指向 CN08 主库；Redis 用 CN05 本机
+- **writer 节点只写**：五个区的采集 daemon 全开，DSN 指向主库节点；Redis 用 writer 节点本机
   （只存 `rank_state`/`ended` 与 border 指纹）。HTTP 只暴露 `/livez`、`/readyz` 和
   `/internal/updates`，不挂 cloud/web 路由。
-- **CN08**：新起 PostgreSQL 18 主库（`wal_level=replica`，为 CN02 建物理复制槽）+ Redis +
-  reader tracker。Haruki-Cloud 指向 CN08 reader。
-- **CN02**：新起第二个 PostgreSQL 实例做热备（现有 toolbox PG 不能整库变只读），reader
+- **主库节点**：新起 PostgreSQL 18 主库（`wal_level=replica`，为热备节点建物理复制槽）+ Redis +
+  reader tracker。Haruki-Cloud 指向主库节点的 reader。
+- **热备节点**：新起第二个 PostgreSQL 实例做热备（现有 toolbox PG 不能整库变只读），reader
   tracker 读本机热备。Oathkeeper 上游名 `haruki-toolbox-event-tracker:8777` 不变。
-- **VM105 tracker 与 CN02 旧 `haruki_tracker_*`**：切换后冻结，观察期后删除。
+- **旧 cloud 节点的 tracker 与热备节点旧 `haruki_tracker_*`**：切换后冻结，观察期后删除。
 
-CN05 不承载数据库的原因见前一轮分析：1.6 GB 内存、26 GB 磁盘、且是唯一的游戏 API
-上游，复制槽积压 WAL 会把它写满。实测 tailnet 全部直连：CN05→CN08 29 ms、CN05→CN02
-12 ms、CN02↔CN08 26 ms。
+writer 节点不承载数据库的原因见前一轮分析：1.6 GB 内存、26 GB 磁盘、且是唯一的游戏 API
+上游，复制槽积压 WAL 会把它写满。实测节点间内网全部直连：writer→主库 29 ms、writer→热备
+12 ms、热备↔主库 26 ms。
 
-### 为什么读端各自读本机副本而不是都连 CN08
+### 为什么读端各自读本机副本而不是都连主库
 
-Toolbox 对 Cloud 板块不产生运行时依赖：复制中断只影响 CN02 数据的新鲜度，不影响可用性。
-若两个 reader 都直连 CN08 主库，实现最简单，但 CN02 的 web 查询会随 CN08 一起不可用。
+Toolbox 对 Cloud 板块不产生运行时依赖：复制中断只影响热备节点数据的新鲜度，不影响可用性。
+若两个 reader 都直连主库，实现最简单，但热备节点上的 web 查询会随主库节点一起不可用。
 
 ### 复制方式
 
@@ -67,7 +68,7 @@ Toolbox 对 Cloud 板块不产生运行时依赖：复制中断只影响 CN02 �
 cluster:
   role: standalone        # standalone | writer | reader
   token: ""               # /internal/* 的 bearer；reader 订阅 writer 时携带
-  writer_url: ""          # reader 必填，例如 http://100.76.159.97:8777
+  writer_url: ""          # reader 必填，例如 http://<writer-host>:8777
   replica_wait_ms: 1500   # reader 收到更新后等待本机回放到该 LSN 的上限；0 关闭
 ```
 
@@ -102,7 +103,7 @@ writer 侧接入点：`EventTrackerBase` 现在直接持有 `api_cache_redis: Op
 reader 侧处理 `updated`：
 
 1. 若 `replica_wait_ms > 0`，对该区 engine 轮询 `pg_last_wal_replay_lsn() >= lsn`，最多等
-   `replica_wait_ms`（CN08 reader 读的就是主库，配置为 0）。
+   `replica_wait_ms`（主库节点的 reader 读的就是主库，配置为 0）。
 2. 对本机 api_cache Redis 调 `finish_event_update`（bump epoch）。
 3. `RealtimeHub::notify_update`，浏览器 WS 订阅者收到 `updated`。
 
@@ -115,13 +116,13 @@ reader 侧处理 `updated`：
 - **匿名 uid 强制开启**：`privacy.uid_anonymization.enabled` 在新拓扑下必须为 `true`，
   writer 启动时拒绝关闭状态；`batch_upsert_event_users` 已在写入时为每个用户算好
   `unique_id`，所以库里每个人都有匿名 id，reader 不需要 backfill。
-- **web 默认匿名**：web 链固定 `PublicUserIdMode::Unique`，与今天 CN02 的行为一致。
+- **web 默认匿名**：web 链固定 `PublicUserIdMode::Unique`，与今天 Toolbox 侧部署的行为一致。
 - **显式用真实 uid 查询时回显真实 uid**：仅限调用方在请求里明确给出原始 UID 的入口
   （3.5 的 check-room，以及 `details/user/{id}?idType=uid`）。响应中**被查者本人**的
   `userId` 为原始 UID 并附 `uniqueId`；相邻名次、trace 里出现的其他玩家仍是 unique_id。
 - **cloud 保持原行为**：新增 `prepare_cloud_user_id_mode` 恒返回 `Raw`，cloud 处理链
   （`service/cloud.rs`、`snapshot.rs`、`trace.rs`、`round_metrics.rs`）改走它，不再受
-  匿名化开关影响。请求参数、响应字段与今天 VM105 上的 cloud 部署完全一致。
+  匿名化开关影响。请求参数、响应字段与今天旧 cloud 节点上的 cloud 部署完全一致。
 - 缓存键已由 `cache_prefix`（`cloud:v2` / web 前缀）区分，两组结果不会串。cloud trace 的
   缓存键目前直接拼 `subject`（原始 UID），改为拼 `sha256(subject)` 前 16 位，避免原始
   UID 进入 Redis 键空间。
@@ -174,47 +175,47 @@ GET /api/v2/web/events/{server}/{event_id}/leaderboards/total/details/user/{id}?
 
 ## 4. 基础设施与迁移
 
-### 4.1 CN08
+### 4.1 主库节点
 
 - `haruki-tracker-postgres`（postgres:18-alpine，`mem_limit 2g`，`shared_buffers=512MB`，
   `wal_level=replica`，`max_wal_senders=4`，`max_slot_wal_keep_size=20GB`），端口
-  `127.0.0.1:5432` + `100.125.86.24:5432`；`pg_hba` 只放行 CN05 与 CN02 的 tailnet 地址。
-  `max_slot_wal_keep_size` 是必须的：CN02 热备长时间离线时主库丢弃复制槽而不是把 53 GB
-  写满（按 VM105 实测 9.3 GB/天 WAL，不设上限约 5 天写满）。
+  `127.0.0.1:5432` + `<primary-db-host>:5432`；`pg_hba` 只放行 writer 节点与热备节点的内网地址。
+  `max_slot_wal_keep_size` 是必须的：热备长时间离线时主库丢弃复制槽而不是把 53 GB
+  写满（按旧 cloud 节点实测 9.3 GB/天 WAL，不设上限约 5 天写满）。
 - `haruki-tracker-redis`（`127.0.0.1` only，`mem_limit 128m`）。
-- `haruki-event-tracker`（reader，`127.0.0.1:8777` + `100.125.86.24:8777`）。
-- 镜像经 mihomo 拉取（CN08 已有）。
+- `haruki-event-tracker`（reader，`127.0.0.1:8777` + `<primary-db-host>:8777`）。
+- 镜像经出网代理拉取（该节点已有）。
 
-### 4.2 CN02
+### 4.2 热备节点
 
-- `haruki-tracker-replica`（postgres:18-alpine，`pg_basebackup -R` 自 CN08，`hot_standby=on`），
+- `haruki-tracker-replica`（postgres:18-alpine，`pg_basebackup -R` 自主库节点，`hot_standby=on`），
   只发布 `127.0.0.1:5433`。磁盘：当前可用 16 GB，热备初始 10.2 GB，删除旧
   `haruki_tracker_*` 后回收 7.65 GB；每个五区赛事周期增长约 0.8 GB，需要在几个月内定
   保留策略（按赛事删旧表）或扩盘。
 - 现有 `haruki-toolbox-event-tracker` 改为 reader 配置，DSN 指向本机热备。
 
-### 4.3 CN05
+### 4.3 writer 节点
 
-- `haruki-event-tracker`（writer，`127.0.0.1:8777` + `100.76.159.97:8777`），DSN 指向
-  CN08，Redis 用本机 `redis`，`sekai_api.api_endpoint` 走 compose 服务名回环。
-- 内存：VM105 上同配置的 tracker 实测 RSS 需先量一次（`docker stats`），CN05 可用 ~860 MB。
+- `haruki-event-tracker`（writer，`127.0.0.1:8777` + `<writer-host>:8777`），DSN 指向
+  主库节点，Redis 用本机 `redis`，`sekai_api.api_endpoint` 走 compose 服务名回环。
+- 内存：旧 cloud 节点上同配置的 tracker 实测 RSS 需先量一次（`docker stats`），writer 节点可用 ~860 MB。
 
 ### 4.4 数据迁移与切换
 
-1. 以 VM105 `haruki_event_*` 为基准（比 CN02 多 164-169 五个赛事）。历史赛事先
-   `pg_dump -Fc` 经 CN05 中转导入 CN08（VM105↔CN08 无直连，经 CN05 两跳都是直连）。
-2. CN02 `pg_basebackup` 自 CN08，起热备，验证 `pg_stat_replication`。
-3. 切换窗口：停 VM105 tracker → 只导当前赛事的四张表增量 → 起 CN05 writer → 起两个
+1. 以旧 cloud 节点 `haruki_event_*` 为基准（比热备节点旧库多 164-169 五个赛事）。历史赛事先
+   `pg_dump -Fc` 经 writer 节点中转导入主库节点（旧 cloud 节点↔主库节点无直连，经 writer 节点两跳都是直连）。
+2. 热备节点 `pg_basebackup` 自主库节点，起热备，验证 `pg_stat_replication`。
+3. 切换窗口：停旧 cloud 节点的 tracker → 只导当前赛事的四张表增量 → 起 writer → 起两个
    reader → Haruki-Cloud 改 `tracker.base_url` + token → Oathkeeper 规则加 check-room 并重启。
    采集空窗约等于当前赛事表导入时间（分钟级）。writer 首个 tick 因 Redis 无 rank_state
    会把全部名次当作变化写一次全量快照，属预期。
-4. 观察 24 h：writer 日志、两端 `/readyz`、复制延迟、Kuma（46 号改指 CN08 reader，新增
-   CN02 reader、writer、复制延迟三个监控）。
-5. 冻结 VM105 tracker 与 CN02 旧库，一周后删除。
+4. 观察 24 h：writer 日志、两端 `/readyz`、复制延迟、可用性监控（原 tracker 监控改指主库节点 reader，新增
+   热备节点 reader、writer、复制延迟三个监控）。
+5. 冻结旧 cloud 节点的 tracker 与热备节点旧库，一周后删除。
 
 ## 5. 风险与边界
 
-- writer 仍是采集单点（与今天相同）。CN05↔CN08 掉到 DERP 时写入变慢但不丢：
+- writer 仍是采集单点（与今天相同）。writer↔主库链路退化为中继转发时写入变慢但不丢：
   `flush_interval_secs: 15` 攒批，cron 的 `try_lock` 跳过堆积的 tick。
 - 每次 flush 事务跨 29 ms 链路做若干次往返，估算 100~200 ms，秒级采集下可接受；
   `flush_hot_ranks: 10` 的即时落库同样受此延迟。writer 角色的 flush 在同一条连接上完成
@@ -228,7 +229,7 @@ GET /api/v2/web/events/{server}/{event_id}/leaderboards/total/details/user/{id}?
 
 ## 6. 已定决策（2026-09-12）
 
-1. 主库放 CN08，CN02 起第二个 PG 做热备。
+1. 主库单独放一个节点，Toolbox 所在节点起第二个 PG 做热备。
 2. 更新流由 reader 拨号 writer。
 3. web 精确 UID 查房公开，不要求登录；被查者回显原始 UID，其他人匿名。
 4. cloud token 用 `tokens` 列表，每个消费方一枚。
@@ -244,14 +245,14 @@ GET /api/v2/web/events/{server}/{event_id}/leaderboards/total/details/user/{id}?
 - [x] Haruki-Cloud：`tracker.token` / `HARUKI_TRACKER_TOKEN` → `Authorization: Bearer`。
       分支 `feat/tracker-token`。
 - [ ] 发版 `v4.0.0`、Haruki-Cloud 发版。
-- [ ] 基础设施：CN08 主库 + Redis + reader；CN02 热备 + reader；CN05 writer。
-- [ ] 数据迁移与切换、Oathkeeper 规则加 `check-room`、Kuma 监控、skill 文档。
-- [ ] 清理旧库与 VM105 tracker。
+- [ ] 基础设施：主库节点主库 + Redis + reader；热备节点热备 + reader；writer 节点 writer。
+- [ ] 数据迁移与切换、Oathkeeper 规则加 `check-room`、可用性监控、运维文档。
+- [ ] 清理旧库与旧 cloud 节点的 tracker。
 
 ## 8. 实施顺序
 
 1. Tracker 代码：角色/更新流/cloud token/reader DDL 保护/web check-room，发 `v4.0.0`。
 2. Haruki-Cloud 加 token 支持并发版。
-3. CN08 主库 + Redis + reader；CN02 热备 + reader 改配；CN05 writer。
+3. 主库节点主库 + Redis + reader；热备节点热备 + reader 改配；writer 节点 writer。
 4. 迁移与切换、监控、文档（cluster-ops skill 的 migrations 记录）。
-5. 清理旧库与 VM105 tracker。
+5. 清理旧库与旧 cloud 节点的 tracker。

@@ -190,7 +190,7 @@ pub struct ClusterConfig {
     /// Bearer token for `/internal/*`; readers present it when dialing the
     /// writer's update stream.
     pub token: String,
-    /// Reader only: base URL of the writer, e.g. `http://100.76.159.97:8777`.
+    /// Reader only: base URL of the writer, e.g. `http://<writer-host>:8777`.
     pub writer_url: String,
     /// Reader only: how long to wait for the local replica to replay the
     /// LSN carried by an update before invalidating caches. `0` disables the

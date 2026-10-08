@@ -248,15 +248,15 @@ The default stays `0`. The recommendation is **2–5 for CN** on the process tha
 
 Recorded from `Team-Haruki/Haruki-Toolbox-Backend` (`external/oathkeeper/*.yml`, `docker-compose.yml`) and the frontend `.env`. The live edge was not probed.
 
-1. The frontend uses `VITE_HARUKI_EVENT_TRACKER_URL=https://toolbox-api-direct.haruki.seiunx.com/event-tracker`. That is a different origin from the Toolbox site, so every call is a CORS request.
-2. A TLS edge for `toolbox-api-direct` (not in the repo; presumably on the Toolbox host CN02) forwards to Oathkeeper's proxy (`:4455`).
+1. The frontend uses `VITE_HARUKI_EVENT_TRACKER_URL=https://<toolbox-api-host>/event-tracker`. That is a different origin from the Toolbox site, so every call is a CORS request.
+2. A TLS edge for the Toolbox API host (not in the repo; presumably on the Toolbox host) forwards to Oathkeeper's proxy (`:4455`).
 3. Oathkeeper matches `/event-tracker/...` and proxies to `http://haruki-toolbox-event-tracker:8777` with `strip_path: /event-tracker`:
    - `ws-ticket`, `ws`, `api/v2/web/events/.../private/...`: `cookie_session` authenticator plus the `header` mutator (subject headers).
    - Public web rule (`noop`): `total|world-bloom/{c}` × `overview`, `replay/overview`, `details/rank/*`, `details/user/*`, `users/search`. **`check-room` has no public rule**, so it is reachable only through WS request frames. **The new `top100|borders|growth|status` endpoints have no rule yet**: until the regex gains them, Oathkeeper answers `404 Requested url does not match any rules` (WS request frames still reach them).
    - Rules match the path, so `?v=` and `_t` pass through.
 4. **CORS** is Oathkeeper's (`serve.proxy.cors`, origin from `FRONTEND_PUBLIC_URL`, credentials allowed). `exposed_headers` is only `Content-Type`, and `allowed_headers` doesn't include `If-None-Match`. That is fine as long as the frontend lets the browser HTTP cache do the revalidation: the browser adds `If-None-Match` itself, turns a `304` into a `200` from cache, and JS never needs to read `ETag`. Only if the frontend sets `If-None-Match` by hand (which forces a preflight) or reads `ETag` must those be added to `allowed_headers` / `exposed_headers`.
 5. **304 / ETag through the proxies:** Oathkeeper is a Go `httputil.ReverseProxy` and passes `ETag`, `Cache-Control` and `304` through unchanged. If the TLS edge is Caddy, `encode` skips responses that already carry `Content-Encoding`. The tracker compresses anything over 1 KiB for gzip/br clients, so the edge shouldn't re-encode (and so shouldn't rewrite the `ETag`). Verify once on the live edge with `curl -sI -H 'Accept-Encoding: gzip' …overview` and then again with `If-None-Match`.
-6. There is no shared cache on this path (the `-cdn` EdgeOne host isn't used for the tracker). `public` lets one be added later, and the browser cache benefits immediately.
+6. There is no shared cache on this path (the Toolbox CDN host isn't used for the tracker). `public` lets one be added later, and the browser cache benefits immediately.
 
 ## Rollout
 
