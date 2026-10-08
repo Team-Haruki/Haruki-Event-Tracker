@@ -67,9 +67,11 @@ api_query:
 # 隐私配置（UID 匿名化）
 # ============================================================================
 # 用途：为每个玩家生成对外的 unique_id = SHA-256("<server>-event-<event_id>-<uid>-<salt>")，
-#      Web 组（/api/v2/web/*）只接受/返回 unique_id，不暴露原始 UID。
+#      Web 组（/api/v2/web/*）只接受/返回 unique_id，不暴露其他玩家的原始 UID；例外是调用方显式给出
+#      原始 UID 的 check-room?userId= 与 details/user/{uid}?idType=uid（只对被查者本人回显），
+#      以及需登录并经 Toolbox 校验绑定的 .../private/... 接口。
 # 注意：
-#   - enabled: false（默认）时，除 .../status 心跳接口外，所有返回玩家数据的 Web 接口都会返回
+#   - enabled: false（默认）时，除 .../status 心跳接口和 .../private/... 接口外，所有返回玩家数据的 Web 接口都会返回
 #     400 "web API requires privacy.uid_anonymization.enabled"，且 cluster.role: writer 拒绝启动。
 #     要对外提供 Web 组或运行 writer，请改为 true。
 #   - enabled: true 时 salt 必须非空（为空则启动失败）。请用足够长的随机字符串并妥善保密：
