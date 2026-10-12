@@ -1,5 +1,5 @@
 # ── Build stages (cargo-chef: dependencies are cooked in their own cached layer) ──
-FROM lukemathwalker/cargo-chef:0.1.78-rust-1.98-alpine AS chef
+FROM lukemathwalker/cargo-chef:0.1.78-rust-1.99-alpine AS chef
 
 RUN apk add --no-cache \
     musl-dev gcc g++ cmake make perl pkgconfig linux-headers
